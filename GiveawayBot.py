@@ -1478,6 +1478,7 @@ async def chest(
     amount: int = 1
 ):
 
+    await interaction.response.defer()
     if amount <= 0:
 
         await interaction.response.send_message(
@@ -1556,7 +1557,7 @@ async def chest(
         text=f"Opened {amount} chest(s)"
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=embed
     )
 
