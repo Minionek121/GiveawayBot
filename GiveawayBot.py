@@ -21,6 +21,7 @@ intents.guilds = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+bot.tree.add_command(item_group)
 
 async def is_allowed_to_giveaway(
     interaction: discord.Interaction
@@ -628,8 +629,7 @@ async def on_ready():
 
     try:
 
-        synced = await bot.tree.sync(
-        )
+        synced = await bot.tree.sync(guild=None)
 
         print(f"Synced {len(synced)} commands")
 
@@ -1297,7 +1297,7 @@ async def addtickets(
         interaction.guild.id,
         user.id,
         amount
-    )
+    
 
     await interaction.response.send_message(
         f"✅ Added {amount} tickets to {user.mention}"
@@ -1663,7 +1663,7 @@ async def chest(
     await interaction.response.defer()
     if amount <= 0:
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Amount must be greater than 0."
         )
     
@@ -1928,8 +1928,6 @@ item_group = app_commands.Group(
     name="item",
     description="Item store commands"
 )
-
-bot.tree.add_command(item_group)
 
 # ---------------- /item add ---------------- #
 
