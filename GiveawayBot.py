@@ -116,6 +116,15 @@ async def setup_database():
         except:
             pass
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spent_exp (
+                user_id INTEGER PRIMARY KEY,
+                amount INTEGER
+            )
+            """
+        )
+
         await db.commit()
 
 # ---------------- TEMPLATES ---------------- #
@@ -172,11 +181,59 @@ async def add_balance(user_id, amount):
 
         await db.commit()
 
+@bot.tree.command(
+    name="gift",
+    description="Gift balance to another user",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def gift(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    amount: int
+):
+
+    if amount <= 0:
+
+        await interaction.response.send_message(
+            "❌ Amount must be greater than 0.",
+            ephemeral=True
+        )
+
+        return
+
+    if user.id == interaction.user.id:
+
+        await interaction.response.send_message(
+            "❌ You cannot gift yourself.",
+            ephemeral=True
+        )
+
+        return
+
+    balance = await get_balance(interaction.user.id)
+
+    if balance < amount:
+
+        await interaction.response.send_message(
+            "❌ You don't have enough balance.",
+            ephemeral=True
+        )
+
+        return
+
+    await add_balance(interaction.user.id, -amount)
+
+    await add_balance(user.id, amount)
+
+    await interaction.response.send_message(
+        f"💸 You gifted {amount:,} coins to {user.mention}!"
+    )
+
 # ---------------- EXP SYSTEM ---------------- #
 
-MESSAGE_EXP_MIN = 15
-MESSAGE_EXP_MAX = 30
-LEVEL_DIVISOR = 100
+MESSAGE_EXP_MIN = 30
+MESSAGE_EXP_MAX = 50
+LEVEL_DIVISOR = 700
 
 last_message_exp = {}
 
@@ -218,15 +275,87 @@ async def get_exp(user_id):
 
             data = await cursor.fetchone()
 
+    gained_exp = max(data[0] or 0, 0)
+
+    spent_exp = await get_spent_exp(user_id)
+
+    return max(gained_exp - spent_exp, 0)
+
+async def get_level_exp(user_id):
+
+    week_ago = int(
+        (datetime.now(UTC) - timedelta(days=7)).timestamp()
+    )
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT SUM(amount)
+            FROM exp_history
+            WHERE user_id = ?
+            AND timestamp >= ?
+            """,
+            (user_id, week_ago)
+        ) as cursor:
+
+            data = await cursor.fetchone()
+
     return max(data[0] or 0, 0)
 
 async def get_level(user_id):
 
-    exp = await get_exp(user_id)
+    exp = await get_level_exp(user_id)
 
     level = (exp // LEVEL_DIVISOR) + 1
 
     return min(level, 100)
+
+async def get_spent_exp(user_id):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT amount
+            FROM spent_exp
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        ) as cursor:
+
+            data = await cursor.fetchone()
+
+        if not data:
+
+            await db.execute(
+                "INSERT INTO spent_exp VALUES (?, ?)",
+                (user_id, 0)
+            )
+
+            await db.commit()
+
+            return 0
+
+        return data[0]
+
+
+async def add_spent_exp(user_id, amount):
+
+    current = await get_spent_exp(user_id)
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            UPDATE spent_exp
+            SET amount = ?
+            WHERE user_id = ?
+            """,
+            (current + amount, user_id)
+        )
+
+        await db.commit()
 
 # ---------------- AUTO GIVEAWAYS ---------------- #
 
@@ -316,10 +445,24 @@ async def on_message(message):
 
     if now - last_time >= 30:
 
-        gained = random.randint(
-            MESSAGE_EXP_MIN,
-            MESSAGE_EXP_MAX
+        content_length = len(message.content.strip())
+
+        # Minimum EXP
+        exp_gain = 30
+
+        # Bonus EXP from message length
+        # Caps at +20 EXP around 200 characters
+        bonus = min(20, content_length // 10)
+
+        # Randomness based on length
+        randomness = random.randint(
+            0,
+            max(1, bonus)
         )
+
+        gained = exp_gain + randomness
+
+        gained = min(50, gained)
 
         await add_exp(
             message.author.id,
@@ -620,19 +763,26 @@ async def end_giveaway(message_id, reroll=False):
 
 @bot.tree.command(
     name="balance",
-    description="Check your balance",
+    description="Check a balance",
     guild=discord.Object(id=GUILD_ID)
 )
 async def balance(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    user: discord.Member = None
 ):
 
-    bal = await get_balance(
-        interaction.user.id
+    user = user or interaction.user
+
+    bal = await get_balance(user.id)
+
+    embed = discord.Embed(
+        title=f"💰 {user.display_name}'s Balance",
+        description=f"{bal:,} coins",
+        color=discord.Color.green()
     )
 
     await interaction.response.send_message(
-        f"💰 You have {bal} coins."
+        embed=embed
     )
 
 # ---------------- ADD BALANCE ---------------- #
@@ -1324,48 +1474,86 @@ async def stopgiveaways(
     guild=discord.Object(id=GUILD_ID)
 )
 async def chest(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    amount: int = 1
 ):
 
-    exp = await get_exp(interaction.user.id)
-
-    if exp < CHEST_COST:
+    if amount <= 0:
 
         await interaction.response.send_message(
-            f"❌ You need {CHEST_COST} EXP."
+            "❌ Amount must be greater than 0."
+        )
+    
+        return
+    
+    exp = await get_exp(interaction.user.id)
+
+    if exp >= 20000:
+
+        max_chests = exp // CHEST_COST
+
+        amount = min(amount, max_chests)
+
+    else:
+
+        amount = 1
+
+    total_cost = CHEST_COST * amount
+
+    if exp < total_cost:
+
+        await interaction.response.send_message(
+            f"❌ You need {total_cost:,} EXP."
         )
 
         return
-
-    await add_exp(
+    
+    await add_spent_exp(
         interaction.user.id,
-        -CHEST_COST
+        total_cost
     )
 
-    prize = random.choices(
-        CHEST_PRIZES,
-        weights=[p["chance"] for p in CHEST_PRIZES],
-        k=1
-    )[0]
+    results = {}
 
-    if prize["balance"] > 0:
+    for _ in range(amount):
 
-        await add_balance(
-            interaction.user.id,
-            prize["balance"]
-        )
+        prize = random.choices(
+            CHEST_PRIZES,
+            weights=[p["chance"] for p in CHEST_PRIZES],
+            k=1
+        )[0]
 
-    if prize["exp"] > 0:
+        name = prize["name"]
 
-        await add_exp(
-            interaction.user.id,
-            prize["exp"]
-        )
+        results[name] = results.get(name, 0) + 1
+
+        if prize["balance"] > 0:
+
+            await add_balance(
+                interaction.user.id,
+                prize["balance"]
+            )
+
+        if prize["exp"] > 0:
+
+            await add_exp(
+                interaction.user.id,
+                prize["exp"]
+            )
+
+    result_text = "\n".join(
+        f"• {count}x {name}"
+        for name, count in results.items()
+    )
 
     embed = discord.Embed(
-        title="📦 Chest Opened!",
-        description=f"You got: **{prize['name']}**",
+        title="📦 Chest Results",
+        description=result_text,
         color=discord.Color.purple()
+    )
+
+    embed.set_footer(
+        text=f"Opened {amount} chest(s)"
     )
 
     await interaction.response.send_message(
@@ -1376,16 +1564,47 @@ async def chest(
 
 @bot.tree.command(
     name="level",
-    description="Check your level",
+    description="Check a level",
     guild=discord.Object(id=GUILD_ID)
 )
-async def level(interaction: discord.Interaction):
+async def level(
+    interaction: discord.Interaction,
+    user: discord.Member = None
+):
 
-    exp = await get_exp(interaction.user.id)
-    lvl = await get_level(interaction.user.id)
+    user = user or interaction.user
+
+    exp = await get_level_exp(user.id)
+
+    usable_exp = await get_exp(user.id)
+
+    lvl = await get_level(user.id)
+
+    embed = discord.Embed(
+        title=f"⭐ {user.display_name}'s Level",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="Level",
+        value=str(lvl),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Total EXP (7d)",
+        value=f"{exp:,}",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Usable EXP",
+        value=f"{usable_exp:,}",
+        inline=False
+    )
 
     await interaction.response.send_message(
-        f"⭐ Level: {lvl}\n📘 EXP: {exp}"
+        embed=embed
     )
 
 
