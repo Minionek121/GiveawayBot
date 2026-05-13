@@ -1297,7 +1297,7 @@ async def addtickets(
         interaction.guild.id,
         user.id,
         amount
-    
+    )
 
     await interaction.response.send_message(
         f"✅ Added {amount} tickets to {user.mention}"
