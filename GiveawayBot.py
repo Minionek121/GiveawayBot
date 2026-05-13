@@ -9,6 +9,9 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
+GUILD_ID = 1504182403684503694
+MY_GUILD = discord.Object(id=GUILD_ID)
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -179,7 +182,8 @@ TEMPLATES = {
 
 @bot.tree.command(
     name="addgiveawayrole",
-    description="Allow a role to manage giveaways"
+    description="Allow a role to manage giveaways",
+    guild=MY_GUILD
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -210,7 +214,8 @@ async def addgiveawayrole(
 
 @bot.tree.command(
     name="removegiveawayrole",
-    description="Remove giveaway permissions from a role"
+    description="Remove giveaway permissions from a role",
+    guild=MY_GUILD
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -242,7 +247,8 @@ async def removegiveawayrole(
 
 @bot.tree.command(
     name="giveawayroles",
-    description="View giveaway manager roles"
+    description="View giveaway manager roles",
+    guild=MY_GUILD
 )
 async def giveawayroles(
     interaction: discord.Interaction
