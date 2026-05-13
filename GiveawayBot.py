@@ -28,9 +28,13 @@ def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
 
     if isinstance(member, discord.Member):
 
+        if member.guild_permissions.administrator:
+            return True
+
         allowed_role_ids = [
-            1503431960360386710,
-            1494449905635299428
+            123456789012345678,
+            987654321098765432,
+            1503794587326484751
         ]
 
         return any(role.id in allowed_role_ids for role in member.roles)
@@ -117,6 +121,17 @@ async def setup_database():
             CREATE TABLE IF NOT EXISTS spent_exp (
                 user_id INTEGER PRIMARY KEY,
                 amount INTEGER
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS item_store (
+                item_name TEXT PRIMARY KEY,
+                price INTEGER,
+                role_id INTEGER,
+                description TEXT
             )
             """
         )
@@ -1652,6 +1667,334 @@ async def removeexp(
 
     await interaction.response.send_message(
         f"❌ Removed {amount} EXP from {user.mention}"
+    )
+
+# ---------------- ITEM STORE SYSTEM ---------------- #
+
+# DATABASE TABLE
+# Add this inside setup_database()
+
+"""
+# ITEM STORE
+await db.execute(
+    '''
+    CREATE TABLE IF NOT EXISTS item_store (
+        item_name TEXT PRIMARY KEY,
+        price INTEGER,
+        role_id INTEGER,
+        description TEXT
+    )
+    '''
+)
+"""
+
+# ---------------- ITEM FUNCTIONS ---------------- #
+
+async def add_item(item_name, price, role_id, description):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO item_store
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                item_name,
+                price,
+                role_id,
+                description
+            )
+        )
+
+        await db.commit()
+
+
+async def remove_item(item_name):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            DELETE FROM item_store
+            WHERE item_name = ?
+            """,
+            (item_name,)
+        )
+
+        await db.commit()
+
+
+async def get_item(item_name):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT *
+            FROM item_store
+            WHERE LOWER(item_name) = LOWER(?)
+            """,
+            (item_name,)
+        ) as cursor:
+
+            return await cursor.fetchone()
+
+
+async def get_all_items():
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT *
+            FROM item_store
+            """
+        ) as cursor:
+
+            return await cursor.fetchall()
+
+# ---------------- ITEM STORE COMMAND ---------------- #
+
+item_group = app_commands.Group(
+    name="item",
+    description="Item store commands",
+    guild_ids=[GUILD_ID]
+)
+
+bot.tree.add_command(item_group)
+
+# ---------------- /item add ---------------- #
+
+@item_group.command(
+    name="add",
+    description="Add item to store"
+)
+async def item_add(
+    interaction: discord.Interaction,
+    name: str,
+    price: int,
+    role: discord.Role,
+    description: str
+):
+
+    if not is_allowed_to_giveaway(interaction):
+
+        await interaction.response.send_message(
+            "❌ No permission.",
+            ephemeral=True
+        )
+
+        return
+
+    await add_item(
+        name,
+        price,
+        role.id,
+        description
+    )
+
+    await interaction.response.send_message(
+        f"✅ Added item **{name}** to the store."
+    )
+
+# ---------------- /item remove ---------------- #
+
+@item_group.command(
+    name="remove",
+    description="Remove item from store"
+)
+async def item_remove(
+    interaction: discord.Interaction,
+    name: str
+):
+
+    if not is_allowed_to_giveaway(interaction):
+
+        await interaction.response.send_message(
+            "❌ No permission.",
+            ephemeral=True
+        )
+
+        return
+
+    item = await get_item(name)
+
+    if not item:
+
+        await interaction.response.send_message(
+            "❌ Item not found."
+        )
+
+        return
+
+    await remove_item(name)
+
+    await interaction.response.send_message(
+        f"🗑 Removed **{name}** from the store."
+    )
+
+# ---------------- /item info ---------------- #
+
+@item_group.command(
+    name="info",
+    description="View item info"
+)
+async def item_info(
+    interaction: discord.Interaction,
+    name: str
+):
+
+    item = await get_item(name)
+
+    if not item:
+
+        await interaction.response.send_message(
+            "❌ Item not found."
+        )
+
+        return
+
+    item_name, price, role_id, description = item
+
+    role = interaction.guild.get_role(role_id)
+
+    embed = discord.Embed(
+        title=f"🛒 {item_name}",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="Price",
+        value=f"{price:,} coins",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Role",
+        value=role.mention if role else "Unknown Role",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Description",
+        value=description,
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+# ---------------- /item store ---------------- #
+
+@item_group.command(
+    name="store",
+    description="View item store"
+)
+async def item_store(
+    interaction: discord.Interaction
+):
+
+    items = await get_all_items()
+
+    if not items:
+
+        await interaction.response.send_message(
+            "❌ Store is empty."
+        )
+
+        return
+
+    embed = discord.Embed(
+        title="🛒 Item Store",
+        color=discord.Color.green()
+    )
+
+    for item_name, price, role_id, description in items:
+
+        role = interaction.guild.get_role(role_id)
+
+        embed.add_field(
+            name=item_name,
+            value=(
+                f"💰 {price:,} coins\n"
+                f"🎭 {role.mention if role else 'Unknown Role'}"
+            ),
+            inline=False
+        )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+# ---------------- /item buy ---------------- #
+
+@item_group.command(
+    name="buy",
+    description="Buy an item"
+)
+async def item_buy(
+    interaction: discord.Interaction,
+    name: str
+):
+
+    item = await get_item(name)
+
+    if not item:
+
+        await interaction.response.send_message(
+            "❌ Item not found."
+        )
+
+        return
+
+    item_name, price, role_id, description = item
+
+    balance = await get_balance(
+        interaction.user.id
+    )
+
+    if balance < price:
+
+        await interaction.response.send_message(
+            "❌ Not enough balance."
+        )
+
+        return
+
+    role = interaction.guild.get_role(role_id)
+
+    if not role:
+
+        await interaction.response.send_message(
+            "❌ Role no longer exists."
+        )
+
+        return
+
+    member = interaction.guild.get_member(
+        interaction.user.id
+    )
+
+    if role in member.roles:
+
+        await interaction.response.send_message(
+            "❌ You already own this item."
+        )
+
+        return
+
+    await add_balance(
+        interaction.user.id,
+        -price
+    )
+
+    await member.add_roles(role)
+
+    await interaction.response.send_message(
+        f"✅ You bought **{item_name}** "
+        f"for {price:,} coins."
     )
 
 # ---------------- RUN BOT ---------------- #
