@@ -21,7 +21,6 @@ intents.guilds = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-bot.tree.add_command(item_group)
 
 async def is_allowed_to_giveaway(
     interaction: discord.Interaction
@@ -1928,6 +1927,8 @@ item_group = app_commands.Group(
     name="item",
     description="Item store commands"
 )
+
+bot.tree.add_command(item_group)
 
 # ---------------- /item add ---------------- #
 
