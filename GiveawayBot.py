@@ -30,7 +30,8 @@ def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
 
         allowed_role_ids = [
             1503431960360386710,
-            1494449905635299428
+            1494449905635299428,
+            1504182403684503694
         ]
 
         return any(role.id in allowed_role_ids for role in member.roles)
