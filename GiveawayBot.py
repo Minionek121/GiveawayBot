@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))
 
 DATABASE = "giveaways.db"
 
@@ -23,20 +22,41 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
+async def is_allowed_to_giveaway(
+    interaction: discord.Interaction
+) -> bool:
+
     member = interaction.user
 
-    if isinstance(member, discord.Member):
+    if not isinstance(member, discord.Member):
+        return False
 
-        allowed_role_ids = [
-            1503431960360386710,
-            1494449905635299428,
-            1504182403684503694
-        ]
+    # Server admins always allowed
+    if member.guild_permissions.administrator:
+        return True
 
-        return any(role.id in allowed_role_ids for role in member.roles)
+    async with aiosqlite.connect(DATABASE) as db:
 
-    return False
+        async with db.execute(
+            """
+            SELECT role_id
+            FROM giveaway_roles
+            WHERE guild_id = ?
+            """,
+            (interaction.guild.id,)
+        ) as cursor:
+
+            rows = await cursor.fetchall()
+
+    allowed_roles = {
+        row[0]
+        for row in rows
+    }
+
+    return any(
+        role.id in allowed_roles
+        for role in member.roles
+    )
 
 # ---------------- DATABASE ---------------- #
 
@@ -44,6 +64,15 @@ async def setup_database():
 
     async with aiosqlite.connect(DATABASE) as db:
 
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS giveaway_roles (
+                guild_id INTEGER,
+                role_id INTEGER
+            )
+            """
+        )
         # Giveaways table
         await db.execute(
             """
@@ -85,8 +114,10 @@ async def setup_database():
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS raffle (
-                user_id INTEGER PRIMARY KEY,
-                tickets INTEGER
+                guild_id INTEGER,
+                user_id INTEGER,
+                tickets INTEGER,
+                PRIMARY KEY (guild_id, user_id)
             )
             """
         )
@@ -144,6 +175,114 @@ TEMPLATES = {
     "green": discord.Color.green(),
 }
 
+# ---------------- GIVEAWAY ROLES ---------------- #
+
+@bot.tree.command(
+    name="addgiveawayrole",
+    description="Allow a role to manage giveaways"
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def addgiveawayrole(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            INSERT INTO giveaway_roles
+            VALUES (?, ?)
+            """,
+            (
+                interaction.guild.id,
+                role.id
+            )
+        )
+
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"✅ {role.mention} can now manage giveaways."
+    )
+
+@bot.tree.command(
+    name="removegiveawayrole",
+    description="Remove giveaway permissions from a role"
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def removegiveawayrole(
+    interaction: discord.Interaction,
+    role: discord.Role
+):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            DELETE FROM giveaway_roles
+            WHERE guild_id = ?
+            AND role_id = ?
+            """,
+            (
+                interaction.guild.id,
+                role.id
+            )
+        )
+
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🗑 Removed giveaway permissions from {role.mention}"
+    )
+
+@bot.tree.command(
+    name="giveawayroles",
+    description="View giveaway manager roles"
+)
+async def giveawayroles(
+    interaction: discord.Interaction
+):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT role_id
+            FROM giveaway_roles
+            WHERE guild_id = ?
+            """,
+            (interaction.guild.id,)
+        ) as cursor:
+
+            rows = await cursor.fetchall()
+
+    if not rows:
+
+        await interaction.response.send_message(
+            "❌ No giveaway roles configured."
+        )
+
+        return
+
+    mentions = []
+
+    for row in rows:
+
+        role = interaction.guild.get_role(row[0])
+
+        if role:
+            mentions.append(role.mention)
+
+    await interaction.response.send_message(
+        "🎉 Giveaway Roles:\n" +
+        "\n".join(mentions)
+    )
+
 # ---------------- BALANCE FUNCTIONS ---------------- #
 
 async def get_balance(user_id):
@@ -191,8 +330,7 @@ async def add_balance(user_id, amount):
 
 @bot.tree.command(
     name="gift",
-    description="Gift balance to another user",
-    guild=discord.Object(id=GUILD_ID)
+    description="Gift balance to another user"
 )
 async def gift(
     interaction: discord.Interaction,
@@ -491,7 +629,6 @@ async def on_ready():
     try:
 
         synced = await bot.tree.sync(
-            guild=discord.Object(id=GUILD_ID)
         )
 
         print(f"Synced {len(synced)} commands")
@@ -506,8 +643,7 @@ async def on_ready():
 
 @bot.tree.command(
     name="giveaway",
-    description="Create a giveaway",
-    guild=discord.Object(id=GUILD_ID)
+    description="Create a giveaway"
 )
 @app_commands.describe(
     prize="Prize name",
@@ -527,7 +663,7 @@ async def giveaway(
     template: str = "gold"
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ You don’t have permission to use this command.",
             ephemeral=True
@@ -771,8 +907,7 @@ async def end_giveaway(message_id, reroll=False):
 
 @bot.tree.command(
     name="balance",
-    description="Check a balance",
-    guild=discord.Object(id=GUILD_ID)
+    description="Check a balance"
 )
 async def balance(
     interaction: discord.Interaction,
@@ -797,15 +932,14 @@ async def balance(
 
 @bot.tree.command(
     name="addbalance",
-    description="Add balance to a user",
-    guild=discord.Object(id=GUILD_ID)
+    description="Add balance to a user"
 )
 async def addbalance(
     interaction: discord.Interaction,
     user: discord.Member,
     amount: int
 ):
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
@@ -821,15 +955,14 @@ async def addbalance(
 
 @bot.tree.command(
     name="removebalance",
-    description="Remove balance from a user",
-    guild=discord.Object(id=GUILD_ID)
+    description="Remove balance from a user"
 )
 async def removebalance(
     interaction: discord.Interaction,
     user: discord.Member,
     amount: int
 ):
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
@@ -845,15 +978,14 @@ async def removebalance(
 
 @bot.tree.command(
     name="reroll",
-    description="Reroll a giveaway",
-    guild=discord.Object(id=GUILD_ID)
+    description="Reroll a giveaway"
 )
 async def reroll(
     interaction: discord.Interaction,
     message_id: str
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
@@ -1020,7 +1152,7 @@ AUTO_GIVEAWAY_POOL = []
 RAFFLE_TICKET_PRICE = 100
 RAFFLE_PRIZE = 10000
 
-async def get_tickets(user_id):
+async def get_tickets(guild_id, user_id):
 
     async with aiosqlite.connect(DATABASE) as db:
 
@@ -1028,9 +1160,13 @@ async def get_tickets(user_id):
             """
             SELECT tickets
             FROM raffle
-            WHERE user_id = ?
+            WHERE guild_id = ?
+            AND user_id = ?
             """,
-            (user_id,)
+            (
+                guild_id,
+                user_id
+            )
         ) as cursor:
 
             data = await cursor.fetchone()
@@ -1038,8 +1174,15 @@ async def get_tickets(user_id):
         if not data:
 
             await db.execute(
-                "INSERT INTO raffle VALUES (?, ?)",
-                (user_id, 0)
+                """
+                INSERT INTO raffle
+                VALUES (?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    0
+                )
             )
 
             await db.commit()
@@ -1047,12 +1190,22 @@ async def get_tickets(user_id):
             return 0
 
         return data[0]
+    
+async def add_tickets(
+    guild_id,
+    user_id,
+    amount
+):
 
-async def add_tickets(user_id, amount):
+    tickets = await get_tickets(
+        guild_id,
+        user_id
+    )
 
-    tickets = await get_tickets(user_id)
-
-    new_tickets = max(0, tickets + amount)
+    new_tickets = max(
+        0,
+        tickets + amount
+    )
 
     async with aiosqlite.connect(DATABASE) as db:
 
@@ -1060,9 +1213,14 @@ async def add_tickets(user_id, amount):
             """
             UPDATE raffle
             SET tickets = ?
-            WHERE user_id = ?
+            WHERE guild_id = ?
+            AND user_id = ?
             """,
-            (new_tickets, user_id)
+            (
+                new_tickets,
+                guild_id,
+                user_id
+            )
         )
 
         await db.commit()
@@ -1070,8 +1228,7 @@ async def add_tickets(user_id, amount):
 
 @bot.tree.command(
     name="buytickets",
-    description="Buy raffle tickets",
-    guild=discord.Object(id=GUILD_ID)
+    description="Buy raffle tickets"
 )
 async def buytickets(
     interaction: discord.Interaction,
@@ -1092,7 +1249,11 @@ async def buytickets(
 
     await add_balance(interaction.user.id, -price)
 
-    await add_tickets(interaction.user.id, amount)
+    await add_tickets(
+        interaction.guild.id,
+        interaction.user.id,
+        amount
+    )
 
     await interaction.response.send_message(
         f"🎟 Bought {amount} tickets."
@@ -1101,12 +1262,14 @@ async def buytickets(
 
 @bot.tree.command(
     name="tickets",
-    description="Check tickets",
-    guild=discord.Object(id=GUILD_ID)
+    description="Check tickets"
 )
 async def tickets(interaction: discord.Interaction):
 
-    amount = await get_tickets(interaction.user.id)
+    amount = await get_tickets(
+        interaction.guild.id,
+        interaction.user.id
+    )
 
     await interaction.response.send_message(
         f"🎟 You have {amount} tickets."
@@ -1115,8 +1278,7 @@ async def tickets(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="addtickets",
-    description="Add raffle tickets",
-    guild=discord.Object(id=GUILD_ID)
+    description="Add raffle tickets"
 )
 async def addtickets(
     interaction: discord.Interaction,
@@ -1124,14 +1286,18 @@ async def addtickets(
     amount: int
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
         )
         return
 
-    await add_tickets(user.id, amount)
+    await add_tickets(
+        interaction.guild.id,
+        user.id,
+        amount
+    
 
     await interaction.response.send_message(
         f"✅ Added {amount} tickets to {user.mention}"
@@ -1142,8 +1308,7 @@ async def addtickets(
 
 @bot.tree.command(
     name="removetickets",
-    description="Remove raffle tickets",
-    guild=discord.Object(id=GUILD_ID)
+    description="Remove raffle tickets"
 )
 async def removetickets(
     interaction: discord.Interaction,
@@ -1151,14 +1316,18 @@ async def removetickets(
     amount: int
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
         )
         return
 
-    await add_tickets(user.id, -amount)
+    await add_tickets(
+        interaction.guild.id,
+        user.id,
+        -amount
+    )
 
     await interaction.response.send_message(
         f"❌ Removed {amount} tickets from {user.mention}"
@@ -1173,30 +1342,36 @@ async def raffle_loop():
 
         await asyncio.sleep(86400)
 
-        async with aiosqlite.connect(DATABASE) as db:
-
-            async with db.execute(
-                "SELECT user_id, tickets FROM raffle"
-            ) as cursor:
-
-                entries = await cursor.fetchall()
-
-        pool = []
-
-        for user_id, tickets in entries:
-            pool.extend([user_id] * tickets)
-
-        if not pool:
-            continue
-
-        winner_id = random.choice(pool)
-
-        await add_balance(
-            winner_id,
-            RAFFLE_PRIZE
-        )
-
         for guild in bot.guilds:
+
+            async with aiosqlite.connect(DATABASE) as db:
+
+                async with db.execute(
+                    """
+                    SELECT user_id, tickets
+                    FROM raffle
+                    WHERE guild_id = ?
+                    """,
+                    (guild.id,)
+                ) as cursor:
+
+                    entries = await cursor.fetchall()
+
+            pool = []
+
+            for user_id, tickets in entries:
+
+                pool.extend([user_id] * tickets)
+
+            if not pool:
+                continue
+
+            winner_id = random.choice(pool)
+
+            await add_balance(
+                winner_id,
+                RAFFLE_PRIZE
+            )
 
             channel = guild.system_channel
 
@@ -1204,16 +1379,20 @@ async def raffle_loop():
 
                 await channel.send(
                     f"🎉 <@{winner_id}> won the daily raffle "
-                    f"and received {RAFFLE_PRIZE} coins!"
+                    f"and received {RAFFLE_PRIZE:,} coins!"
                 )
 
-        async with aiosqlite.connect(DATABASE) as db:
+            async with aiosqlite.connect(DATABASE) as db:
 
-            await db.execute(
-                "DELETE FROM raffle"
-            )
+                await db.execute(
+                    """
+                    DELETE FROM raffle
+                    WHERE guild_id = ?
+                    """,
+                    (guild.id,)
+                )
 
-            await db.commit()
+                await db.commit()
 
 # ---------------- CHEST SYSTEM ---------------- #
 
@@ -1262,8 +1441,7 @@ CHEST_PRIZES = [
 
 @bot.tree.command(
     name="addautogiveaway",
-    description="Add a giveaway to the auto pool",
-    guild=discord.Object(id=GUILD_ID)
+    description="Add a giveaway to the auto pool"
 )
 async def addautogiveaway(
     interaction: discord.Interaction,
@@ -1271,7 +1449,7 @@ async def addautogiveaway(
     reward: int,
     winners: int
 ):
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ You don’t have permission to use this command.",
             ephemeral=True
@@ -1295,14 +1473,13 @@ async def addautogiveaway(
 
 @bot.tree.command(
     name="removeautogiveaway",
-    description="Remove auto giveaway by prize name",
-    guild=discord.Object(id=GUILD_ID)
+    description="Remove auto giveaway by prize name"
 )
 async def removeautogiveaway(
     interaction: discord.Interaction,
     prize: str
 ):
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ You don’t have permission to use this command.",
             ephemeral=True
@@ -1336,8 +1513,7 @@ async def removeautogiveaway(
 
 @bot.tree.command(
     name="startgiveaways",
-    description="Start automatic giveaways",
-    guild=discord.Object(id=GUILD_ID)
+    description="Start automatic giveaways"
 )
 async def startgiveaways(
     interaction: discord.Interaction,
@@ -1345,7 +1521,7 @@ async def startgiveaways(
     giveaway_duration_seconds: int
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ You don’t have permission to use this command.",
             ephemeral=True
@@ -1452,14 +1628,13 @@ async def startgiveaways(
 
 @bot.tree.command(
     name="stopgiveaways",
-    description="Stop automatic giveaways",
-    guild=discord.Object(id=GUILD_ID)
+    description="Stop automatic giveaways"
 )
 async def stopgiveaways(
     interaction: discord.Interaction
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ You don’t have permission to use this command.",
             ephemeral=True
@@ -1478,8 +1653,7 @@ async def stopgiveaways(
 
 @bot.tree.command(
     name="chest",
-    description="Open an EXP chest",
-    guild=discord.Object(id=GUILD_ID)
+    description="Open an EXP chest"
 )
 async def chest(
     interaction: discord.Interaction,
@@ -1573,8 +1747,7 @@ async def chest(
 
 @bot.tree.command(
     name="level",
-    description="Check a level",
-    guild=discord.Object(id=GUILD_ID)
+    description="Check a level"
 )
 async def level(
     interaction: discord.Interaction,
@@ -1619,8 +1792,7 @@ async def level(
 
 @bot.tree.command(
     name="addexp",
-    description="Add EXP",
-    guild=discord.Object(id=GUILD_ID)
+    description="Add EXP"
 )
 async def addexp(
     interaction: discord.Interaction,
@@ -1628,7 +1800,7 @@ async def addexp(
     amount: int
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
@@ -1644,8 +1816,7 @@ async def addexp(
 
 @bot.tree.command(
     name="removeexp",
-    description="Remove EXP",
-    guild=discord.Object(id=GUILD_ID)
+    description="Remove EXP"
 )
 async def removeexp(
     interaction: discord.Interaction,
@@ -1653,7 +1824,7 @@ async def removeexp(
     amount: int
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message(
             "❌ No permission.",
             ephemeral=True
@@ -1755,8 +1926,7 @@ async def get_all_items():
 
 item_group = app_commands.Group(
     name="item",
-    description="Item store commands",
-    guild_ids=[GUILD_ID]
+    description="Item store commands"
 )
 
 bot.tree.add_command(item_group)
@@ -1775,7 +1945,7 @@ async def item_add(
     description: str
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
 
         await interaction.response.send_message(
             "❌ No permission.",
@@ -1806,7 +1976,7 @@ async def item_remove(
     name: str
 ):
 
-    if not is_allowed_to_giveaway(interaction):
+    if not await is_allowed_to_giveaway(interaction):
 
         await interaction.response.send_message(
             "❌ No permission.",
