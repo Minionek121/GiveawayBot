@@ -633,15 +633,19 @@ async def on_ready():
     await setup_database()
 
     try:
+        # Sync ONLY to your test guild
+        synced = await bot.tree.sync(guild=MY_GUILD)
 
-        synced = await bot.tree.sync(guild=None)
+        print(f"Synced {len(synced)} commands to guild.")
 
-        print(f"Synced {len(synced)} commands")
+        for cmd in synced:
+            print(f"- {cmd.name}")
 
     except Exception as e:
-        print(e)
+        print(f"Sync error: {e}")
 
     print(f"Logged in as {bot.user}")
+
     bot.loop.create_task(raffle_loop())
 
 # ---------------- CREATE GIVEAWAY ---------------- #
@@ -1934,7 +1938,7 @@ item_group = app_commands.Group(
     description="Item store commands"
 )
 
-bot.tree.add_command(item_group)
+bot.tree.add_command(item_group, guild = MY_GUILD)
 
 # ---------------- /item add ---------------- #
 
