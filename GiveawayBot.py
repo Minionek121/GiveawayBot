@@ -28,13 +28,9 @@ def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
 
     if isinstance(member, discord.Member):
 
-        if member.guild_permissions.administrator:
-            return True
-
         allowed_role_ids = [
-            123456789012345678,
-            987654321098765432,
-            1503794587326484751
+            1503431960360386710,
+            1494449905635299428
         ]
 
         return any(role.id in allowed_role_ids for role in member.roles)
