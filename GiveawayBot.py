@@ -15,6 +15,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 DATABASE = "giveaways.db"
 
+db_lock = asyncio.Lock()
+
 intents = discord.Intents.default()
 intents.members = True
 intents.guilds = True
@@ -35,7 +37,7 @@ async def is_allowed_to_giveaway(
     if any(role.name.lower() == "bot developer" for role in member.roles):
         return True
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -60,9 +62,18 @@ async def is_allowed_to_giveaway(
 
 # ---------------- DATABASE ---------------- #
 
+async def get_db():
+    db = await aiosqlite.connect(DATABASE)
+
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA busy_timeout = 30000")
+
+    return db
+
 async def setup_database():
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
         
         await db.execute(
             """
@@ -199,7 +210,7 @@ async def addgiveawayrole(
     role: discord.Role
 ):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -228,7 +239,7 @@ async def removegiveawayrole(
     role: discord.Role
 ):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -256,7 +267,7 @@ async def giveawayroles(
     interaction: discord.Interaction
 ):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -295,60 +306,64 @@ async def giveawayroles(
 
 async def get_balance(user_id):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        async with db.execute(
-            "SELECT balance FROM balances WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
+        async with await get_db() as db:
 
-            data = await cursor.fetchone()
+            async with db.execute(
+                "SELECT balance FROM balances WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
 
-        if data is None:
+                data = await cursor.fetchone()
 
-            await db.execute(
-                "INSERT INTO balances VALUES (?, ?)",
-                (user_id, 0)
-            )
+            if data is None:
 
-            await db.commit()
+                await db.execute(
+                    "INSERT INTO balances VALUES (?, ?)",
+                    (user_id, 0)
+                )
 
-            return 0
+                await db.commit()
 
-        return data[0]
+                return 0
+
+            return data[0]
 
 async def add_balance(user_id, amount):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO balances
-            VALUES (?, ?)
-            """,
-            (user_id, 0)
-        )
+        async with await get_db() as db:
 
-        await db.execute(
-            """
-            UPDATE balances
-            SET balance = balance + ?
-            WHERE user_id = ?
-            """,
-            (amount, user_id)
-        )
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO balances
+                VALUES (?, ?)
+                """,
+                (user_id, 0)
+            )
 
-        await db.execute(
-            """
-            UPDATE balances
-            SET balance = 0
-            WHERE user_id = ?
-            AND balance < 0
-            """,
-            (user_id,)
-        )
+            await db.execute(
+                """
+                UPDATE balances
+                SET balance = balance + ?
+                WHERE user_id = ?
+                """,
+                (amount, user_id)
+            )
 
-        await db.commit()
+            await db.execute(
+                """
+                UPDATE balances
+                SET balance = 0
+                WHERE user_id = ?
+                AND balance < 0
+                """,
+                (user_id,)
+            )
+
+            await db.commit()
 
 @bot.tree.command(
     name="gift",
@@ -405,35 +420,39 @@ async def gift(
 
 async def ensure_stats(user_id):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO user_stats (user_id)
-            VALUES (?)
-            """,
-            (user_id,)
-        )
+        async with await get_db() as db:
 
-        await db.commit()
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO user_stats (user_id)
+                VALUES (?)
+                """,
+                (user_id,)
+            )
+
+            await db.commit()
 
 
 async def add_stat(user_id, column, amount):
 
     await ensure_stats(user_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            f"""
-            UPDATE user_stats
-            SET {column} = {column} + ?
-            WHERE user_id = ?
-            """,
-            (amount, user_id)
-        )
+        async with await get_db() as db:
 
-        await db.commit()
+            await db.execute(
+                f"""
+                UPDATE user_stats
+                SET {column} = {column} + ?
+                WHERE user_id = ?
+                """,
+                (amount, user_id)
+            )
+
+            await db.commit()
 
 # ---------------- EXP SYSTEM ---------------- #
 
@@ -448,21 +467,23 @@ async def add_exp(user_id, amount):
     if amount > 0:
         await add_stat(user_id, "total_exp", amount)
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            INSERT INTO exp_history
-            VALUES (?, ?, ?)
-            """,
-            (
-                user_id,
-                amount,
-                int(datetime.now(UTC).timestamp())
+        async with await get_db() as db:
+
+            await db.execute(
+                """
+                INSERT INTO exp_history
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    amount,
+                    int(datetime.now(UTC).timestamp())
+                )
             )
-        )
 
-        await db.commit()
+            await db.commit()
 
 async def get_exp(user_id):
 
@@ -470,7 +491,7 @@ async def get_exp(user_id):
         (datetime.now(UTC) - timedelta(days=7)).timestamp()
     )
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -496,7 +517,7 @@ async def get_level_exp(user_id):
         (datetime.now(UTC) - timedelta(days=7)).timestamp()
     )
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -522,7 +543,7 @@ async def get_level(user_id):
 
 async def get_spent_exp(user_id):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -553,18 +574,20 @@ async def add_spent_exp(user_id, amount):
 
     current = await get_spent_exp(user_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            UPDATE spent_exp
-            SET amount = ?
-            WHERE user_id = ?
-            """,
-            (current + amount, user_id)
-        )
+        async with await get_db() as db:
 
-        await db.commit()
+            await db.execute(
+                """
+                UPDATE spent_exp
+                SET amount = ?
+                WHERE user_id = ?
+                """,
+                (current + amount, user_id)
+            )
+
+            await db.commit()
 
 # ---------------- AUTO GIVEAWAYS ---------------- #
 
@@ -607,7 +630,7 @@ async def auto_giveaway_loop(channel):
 
         await message.add_reaction("🎉")
 
-        async with aiosqlite.connect(DATABASE) as db:
+        async with await get_db() as db:
 
             await db.execute(
                 """
@@ -765,7 +788,7 @@ async def giveaway(
 
     await message.add_reaction("🎉")
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -800,7 +823,7 @@ async def giveaway(
 
 async def end_giveaway(message_id, reroll=False):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -891,7 +914,7 @@ async def end_giveaway(message_id, reroll=False):
 
     winner_mentions = []
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         if reroll:
 
@@ -1056,7 +1079,7 @@ async def reroll(
 
     message_id = int(message_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -1164,7 +1187,7 @@ async def reroll(
     )
 
     # Save new winner
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -1216,7 +1239,7 @@ RAFFLE_PRIZE = 0
 
 async def get_tickets(guild_id, user_id):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -1269,24 +1292,25 @@ async def add_tickets(
         tickets + amount
     )
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            UPDATE raffle
-            SET tickets = ?
-            WHERE guild_id = ?
-            AND user_id = ?
-            """,
-            (
-                new_tickets,
-                guild_id,
-                user_id
+        async with await get_db() as db:
+
+            await db.execute(
+                """
+                UPDATE raffle
+                SET tickets = ?
+                WHERE guild_id = ?
+                AND user_id = ?
+                """,
+                (
+                    new_tickets,
+                    guild_id,
+                    user_id
+                )
             )
-        )
 
-        await db.commit()
-
+            await db.commit()
 
 @bot.tree.command(
     name="buytickets",
@@ -1332,7 +1356,7 @@ async def buytickets(
     )
 
     # Get total tickets in raffle
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -1437,7 +1461,7 @@ async def rafflechance(
         user.id
     )
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -1500,7 +1524,7 @@ async def raffle_loop():
 
         for guild in bot.guilds:
 
-            async with aiosqlite.connect(DATABASE) as db:
+            async with await get_db() as db:
 
                 async with db.execute(
                     """
@@ -1538,7 +1562,7 @@ async def raffle_loop():
                     f"and will receive a huge pet!"
                 )
 
-            async with aiosqlite.connect(DATABASE) as db:
+            async with await get_db() as db:
 
                 await db.execute(
                     """
@@ -1742,7 +1766,7 @@ async def startgiveaways(
 
             await message.add_reaction("🎉")
 
-            async with aiosqlite.connect(DATABASE) as db:
+            async with await get_db() as db:
 
                 await db.execute(
                     """
@@ -2022,7 +2046,7 @@ await db.execute(
 
 async def add_item(item_name, price, role_id, description):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -2042,7 +2066,7 @@ async def add_item(item_name, price, role_id, description):
 
 async def remove_item(item_name):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         await db.execute(
             """
@@ -2057,7 +2081,7 @@ async def remove_item(item_name):
 
 async def get_item(item_name):
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -2073,7 +2097,7 @@ async def get_item(item_name):
 
 async def get_all_items():
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         async with db.execute(
             """
@@ -2352,7 +2376,7 @@ async def leaderboard(
 
     leaderboard_data = []
 
-    async with aiosqlite.connect(DATABASE) as db:
+    async with await get_db() as db:
 
         # CURRENT EXP
         if value == "current_exp":
