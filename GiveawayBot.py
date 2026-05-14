@@ -448,12 +448,6 @@ async def gift(interaction: discord.Interaction, user: discord.Member, amount: i
         f"💸 You gifted {amount:,} coins to {user.mention}!"
     )
 
-    await add_stat(
-        interaction.user.id,
-        "gifted_balance",
-        amount
-    )   
-
 async def ensure_stats(user_id):
 
     async with db_lock:
