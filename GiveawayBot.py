@@ -60,6 +60,31 @@ async def is_allowed_to_giveaway(
         for role in member.roles
     )
 
+async def giveaway_watcher():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        now = int(datetime.now(UTC).timestamp())
+
+        async with get_db() as db:
+            async with db.execute(
+                """
+                SELECT message_id
+                FROM giveaways
+                WHERE ended = 0 AND end_time <= ?
+                """,
+                (now,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        for (message_id,) in rows:
+            try:
+                await end_giveaway(message_id)
+            except Exception as e:
+                print(f"[Watcher Error] {message_id}: {e}")
+
+        await asyncio.sleep(15)
+
 # ---------------- DATABASE ---------------- #
 
 from contextlib import asynccontextmanager
@@ -208,8 +233,11 @@ TEMPLATES = {
 # ---------------- SOME RANDOM FIX ---------------- #
 
 async def giveaway_timer(message_id: int, delay: int):
-    await asyncio.sleep(delay)
-    await end_giveaway(message_id)
+    try:
+        await asyncio.sleep(delay)
+        await end_giveaway(message_id)
+    except Exception as e:
+        print(f"[Giveaway Timer Error] message_id={message_id} error={e}")
 
 # ---------------- GIVEAWAY ROLES ---------------- #
 
@@ -669,6 +697,7 @@ async def on_ready():
 
     print(f"Logged in as {bot.user}")
     bot.loop.create_task(raffle_loop())
+    bot.loop.create_task(giveaway_watcher())
 
 # ---------------- CREATE GIVEAWAY ---------------- #
 
@@ -738,7 +767,10 @@ async def giveaway(
 
         await db.execute(
             """
-            INSERT INTO giveaways
+            INSERT INTO giveaways (
+                message_id, channel_id, prize, winners, reward,
+                end_time, required_role, template, ended
+              )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1694,7 +1726,10 @@ async def startgiveaways(
 
                 await db.execute(
                     """
-                    INSERT INTO giveaways
+                    INSERT INTO giveaways (
+                        message_id, channel_id, prize, winners, reward,
+                        end_time, required_role, template, ended
+                    )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
