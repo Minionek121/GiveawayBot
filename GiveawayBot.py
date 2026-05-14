@@ -9,9 +9,6 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
-GUILD_ID = 1504182403684503694
-MY_GUILD = discord.Object(id=GUILD_ID)
-
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -182,8 +179,7 @@ TEMPLATES = {
 
 @bot.tree.command(
     name="addgiveawayrole",
-    description="Allow a role to manage giveaways",
-    guild=MY_GUILD
+    description="Allow a role to manage giveaways"
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -214,8 +210,7 @@ async def addgiveawayrole(
 
 @bot.tree.command(
     name="removegiveawayrole",
-    description="Remove giveaway permissions from a role",
-    guild=MY_GUILD
+    description="Remove giveaway permissions from a role"
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -247,8 +242,7 @@ async def removegiveawayrole(
 
 @bot.tree.command(
     name="giveawayroles",
-    description="View giveaway manager roles",
-    guild=MY_GUILD
+    description="View giveaway manager roles"
 )
 async def giveawayroles(
     interaction: discord.Interaction
@@ -633,19 +627,15 @@ async def on_ready():
     await setup_database()
 
     try:
-        # Sync ONLY to your test guild
-        synced = await bot.tree.sync(guild=MY_GUILD)
 
-        print(f"Synced {len(synced)} commands to guild.")
+        synced = await bot.tree.sync(guild=None)
 
-        for cmd in synced:
-            print(f"- {cmd.name}")
+        print(f"Synced {len(synced)} commands")
 
     except Exception as e:
-        print(f"Sync error: {e}")
+        print(e)
 
     print(f"Logged in as {bot.user}")
-
     bot.loop.create_task(raffle_loop())
 
 # ---------------- CREATE GIVEAWAY ---------------- #
@@ -1938,7 +1928,7 @@ item_group = app_commands.Group(
     description="Item store commands"
 )
 
-bot.tree.add_command(item_group, guild = MY_GUILD)
+bot.tree.add_command(item_group)
 
 # ---------------- /item add ---------------- #
 
