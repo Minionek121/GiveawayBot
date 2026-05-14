@@ -64,7 +64,16 @@ async def setup_database():
 
     async with aiosqlite.connect(DATABASE) as db:
 
-
+        await db.execute("DROP TABLE IF EXISTS raffle")
+        await db.execute("DROP TABLE IF EXISTS giveaway_roles")
+        await db.execute("DROP TABLE IF EXISTS giveaways")
+        await db.execute("DROP TABLE IF EXISTS balances")
+        await db.execute("DROP TABLE IF EXISTS exp_history")
+        await db.execute("DROP TABLE IF EXISTS giveaway_winners")
+        await db.execute("DROP TABLE IF EXISTS spent_exp")
+        await db.execute("DROP TABLE IF EXISTS item_store")
+        await db.execute("DROP TABLE IF EXISTS user_stats")
+        
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS giveaway_roles (
@@ -1846,7 +1855,7 @@ async def chest(
 
     if exp < total_cost:
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ You need {total_cost:,} EXP."
         )
 
