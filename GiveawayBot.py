@@ -141,7 +141,7 @@ async def setup_database():
                 """
             )
 
-        except:
+        except aiosqlite.OperationalError:
             pass
 
         await db.execute(
@@ -160,6 +160,19 @@ async def setup_database():
                 price INTEGER,
                 role_id INTEGER,
                 description TEXT
+            )
+            """
+        )
+
+        # Lifetime stats
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                total_exp INTEGER DEFAULT 0,
+                gifted_balance INTEGER DEFAULT 0,
+                chests_opened INTEGER DEFAULT 0,
+                raffle_tickets_bought INTEGER DEFAULT 0
             )
             """
         )
@@ -311,19 +324,33 @@ async def get_balance(user_id):
 
 async def add_balance(user_id, amount):
 
-    balance = await get_balance(user_id)
-
-    new_balance = max(0, balance + amount)
-
     async with aiosqlite.connect(DATABASE) as db:
 
         await db.execute(
             """
+            INSERT OR IGNORE INTO balances
+            VALUES (?, ?)
+            """,
+            (user_id, 0)
+        )
+
+        await db.execute(
+            """
             UPDATE balances
-            SET balance = ?
+            SET balance = balance + ?
             WHERE user_id = ?
             """,
-            (new_balance, user_id)
+            (amount, user_id)
+        )
+
+        await db.execute(
+            """
+            UPDATE balances
+            SET balance = 0
+            WHERE user_id = ?
+            AND balance < 0
+            """,
+            (user_id,)
         )
 
         await db.commit()
@@ -375,6 +402,44 @@ async def gift(
         f"💸 You gifted {amount:,} coins to {user.mention}!"
     )
 
+    await add_stat(
+        interaction.user.id,
+        "gifted_balance",
+        amount
+    )   
+
+async def ensure_stats(user_id):
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO user_stats (user_id)
+            VALUES (?)
+            """,
+            (user_id,)
+        )
+
+        await db.commit()
+
+
+async def add_stat(user_id, column, amount):
+
+    await ensure_stats(user_id)
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        await db.execute(
+            f"""
+            UPDATE user_stats
+            SET {column} = {column} + ?
+            WHERE user_id = ?
+            """,
+            (amount, user_id)
+        )
+
+        await db.commit()
+
 # ---------------- EXP SYSTEM ---------------- #
 
 MESSAGE_EXP_MIN = 30
@@ -384,6 +449,9 @@ LEVEL_DIVISOR = 700
 last_message_exp = {}
 
 async def add_exp(user_id, amount):
+
+    if amount > 0:
+        await add_stat(user_id, "total_exp", amount)
 
     async with aiosqlite.connect(DATABASE) as db:
 
@@ -1234,6 +1302,14 @@ async def buytickets(
     amount: int
 ):
 
+    if amount <= 0:
+
+        await interaction.response.send_message(
+            "❌ Amount must be greater than 0."
+        )
+
+        return
+
     price = amount * RAFFLE_TICKET_PRICE
 
     balance = await get_balance(interaction.user.id)
@@ -1254,26 +1330,44 @@ async def buytickets(
         amount
     )
 
-    await interaction.response.send_message(
-        f"🎟 Bought {amount} tickets."
-    )
-
-
-@bot.tree.command(
-    name="tickets",
-    description="Check tickets"
-)
-async def tickets(interaction: discord.Interaction):
-
-    amount = await get_tickets(
+    # Get updated ticket count
+    user_tickets = await get_tickets(
         interaction.guild.id,
         interaction.user.id
     )
 
-    await interaction.response.send_message(
-        f"🎟 You have {amount} tickets."
+    # Get total tickets in raffle
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT SUM(tickets)
+            FROM raffle
+            WHERE guild_id = ?
+            """,
+            (interaction.guild.id,)
+        ) as cursor:
+
+            total_data = await cursor.fetchone()
+
+    total_tickets = total_data[0] or 0
+
+    chance = (
+        (user_tickets / total_tickets) * 100
+        if total_tickets > 0 else 0
     )
 
+    await interaction.response.send_message(
+        f"🎟 Bought {amount} tickets.\n"
+        f"You now have **{user_tickets}** tickets.\n"
+        f"Current win chance: **{chance:.2f}%**"
+    )
+
+    await add_stat(
+        interaction.user.id,
+        "raffle_tickets_bought",
+        amount
+    )
 
 @bot.tree.command(
     name="addtickets",
@@ -1332,6 +1426,74 @@ async def removetickets(
         f"❌ Removed {amount} tickets from {user.mention}"
     )
 
+@bot.tree.command(
+    name="rafflechance",
+    description="Check raffle tickets and win chance"
+)
+async def rafflechance(
+    interaction: discord.Interaction,
+    user: discord.Member = None
+):
+
+    user = user or interaction.user
+
+    tickets = await get_tickets(
+        interaction.guild.id,
+        user.id
+    )
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        async with db.execute(
+            """
+            SELECT SUM(tickets)
+            FROM raffle
+            WHERE guild_id = ?
+            """,
+            (interaction.guild.id,)
+        ) as cursor:
+
+            total_data = await cursor.fetchone()
+
+    total_tickets = total_data[0] or 0
+
+    chance = (
+        (tickets / total_tickets) * 100
+        if total_tickets > 0 else 0
+    )
+
+    embed = discord.Embed(
+        title="🎟 Raffle Stats",
+        color=discord.Color.gold()
+    )
+
+    embed.add_field(
+        name="User",
+        value=user.mention,
+        inline=False
+    )
+
+    embed.add_field(
+        name="Tickets",
+        value=f"{tickets:,}",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Winning Chance",
+        value=f"{chance:.2f}%",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Total Tickets",
+        value=f"{total_tickets:,}",
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
 
 async def raffle_loop():
 
@@ -1740,6 +1902,12 @@ async def chest(
 
     await interaction.followup.send(
         embed=embed
+    )
+
+    await add_stat(
+        interaction.user.id,
+        "chests_opened",
+        amount
     )
 
 # ---------------- EXP COMMANDS ---------------- #
@@ -2161,6 +2329,161 @@ async def item_buy(
     await interaction.response.send_message(
         f"✅ You bought **{item_name}** "
         f"for {price:,} coins."
+    )
+
+# ---------------- LEADERBOARD ----------------- #
+
+# ---------------- LEADERBOARD ----------------- #
+
+@bot.tree.command(
+    name="leaderboard",
+    description="View leaderboards"
+)
+@app_commands.choices(
+    category=[
+        app_commands.Choice(name="Total EXP", value="total_exp"),
+        app_commands.Choice(name="Current EXP", value="current_exp"),
+        app_commands.Choice(name="Balance", value="balance"),
+        app_commands.Choice(name="Lifetime Tickets", value="raffle_tickets_bought"),
+        app_commands.Choice(name="Current Raffle Tickets", value="current_tickets"),
+        app_commands.Choice(name="Chests Opened", value="chests_opened"),
+        app_commands.Choice(name="Gifted Balance", value="gifted_balance"),
+    ]
+)
+async def leaderboard(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str]
+):
+
+    value = category.value
+
+    leaderboard_data = []
+
+    async with aiosqlite.connect(DATABASE) as db:
+
+        # CURRENT EXP
+        if value == "current_exp":
+
+            async with db.execute(
+                """
+                SELECT DISTINCT user_id
+                FROM exp_history
+                """
+            ) as cursor:
+
+                users = await cursor.fetchall()
+
+            for (user_id,) in users:
+
+                exp = await get_exp(user_id)
+
+                leaderboard_data.append(
+                    (user_id, exp)
+                )
+
+        # CURRENT RAFFLE TICKETS
+        elif value == "current_tickets":
+
+            async with db.execute(
+                """
+                SELECT user_id, tickets
+                FROM raffle
+                WHERE guild_id = ?
+                ORDER BY tickets DESC
+                LIMIT 10
+                """,
+                (interaction.guild.id,)
+            ) as cursor:
+
+                leaderboard_data = await cursor.fetchall()
+
+        # BALANCE
+        elif value == "balance":
+
+            async with db.execute(
+                """
+                SELECT user_id, balance
+                FROM balances
+                ORDER BY balance DESC
+                LIMIT 10
+                """
+            ) as cursor:
+
+                leaderboard_data = await cursor.fetchall()
+
+        # USER STATS TABLE
+        else:
+
+            async with db.execute(
+                f"""
+                SELECT user_id, {value}
+                FROM user_stats
+                ORDER BY {value} DESC
+                LIMIT 10
+                """
+            ) as cursor:
+
+                leaderboard_data = await cursor.fetchall()
+
+    # Sort current exp manually
+    if value == "current_exp":
+
+        leaderboard_data.sort(
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        leaderboard_data = leaderboard_data[:10]
+
+    if not leaderboard_data:
+
+        await interaction.response.send_message(
+            "❌ No leaderboard data found."
+        )
+
+        return
+
+    title_map = {
+        "total_exp": "🏆 Total EXP Leaderboard",
+        "current_exp": "⭐ Current EXP Leaderboard",
+        "balance": "💰 Balance Leaderboard",
+        "raffle_tickets_bought": "🎟 Lifetime Tickets Leaderboard",
+        "current_tickets": "🎫 Current Raffle Tickets Leaderboard",
+        "chests_opened": "📦 Chests Opened Leaderboard",
+        "gifted_balance": "💸 Gifted Balance Leaderboard"
+    }
+
+    embed = discord.Embed(
+        title=title_map[value],
+        color=discord.Color.gold()
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for index, (user_id, amount) in enumerate(
+        leaderboard_data,
+        start=1
+    ):
+
+        user = interaction.guild.get_member(user_id)
+
+        if not user:
+            continue
+
+        medal = (
+            medals[index - 1]
+            if index <= 3
+            else f"#{index}"
+        )
+
+        embed.add_field(
+            name=f"{medal} {user.display_name}",
+            value=f"{amount:,}",
+            inline=False
+        )
+
+    await interaction.response.send_message(
+        embed=embed
     )
 
 # ---------------- RUN BOT ---------------- #
