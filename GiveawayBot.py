@@ -193,9 +193,7 @@ TEMPLATES = {
     name="addgiveawayrole",
     description="Allow a role to manage giveaways"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@app_commands.check(is_allowed_to_giveaway)
 async def addgiveawayrole(
     interaction: discord.Interaction,
     role: discord.Role
@@ -224,9 +222,7 @@ async def addgiveawayrole(
     name="removegiveawayrole",
     description="Remove giveaway permissions from a role"
 )
-@app_commands.checks.has_permissions(
-    administrator=True
-)
+@app_commands.check(is_allowed_to_giveaway)
 async def removegiveawayrole(
     interaction: discord.Interaction,
     role: discord.Role
