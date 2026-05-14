@@ -399,48 +399,50 @@ async def add_balance(user_id, amount):
 
             await db.commit()
 
-@bot.tree.command(
-    name="gift",
-    description="Gift balance to another user"
-)
-async def gift(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    amount: int
-):
+@bot.tree.command(name="gift", description="Gift balance to another user")
+async def gift(interaction: discord.Interaction, user: discord.Member, amount: int):
 
     if amount <= 0:
-
-        await interaction.response.send_message(
-            "❌ Amount must be greater than 0.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
         return
 
     if user.id == interaction.user.id:
-
-        await interaction.response.send_message(
-            "❌ You cannot gift yourself.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("❌ You cannot gift yourself.", ephemeral=True)
         return
 
-    balance = await get_balance(interaction.user.id)
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT balance FROM balances WHERE user_id = ?", (interaction.user.id,)
+            ) as cursor:
+                data = await cursor.fetchone()
 
-    if balance < amount:
+            if data is None or data[0] < amount:
+                await interaction.response.send_message("❌ You don't have enough balance.", ephemeral=True)
+                return
 
-        await interaction.response.send_message(
-            "❌ You don't have enough balance.",
-            ephemeral=True
-        )
-
-        return
-
-    await add_balance(interaction.user.id, -amount)
-
-    await add_balance(user.id, amount)
+            # Deduct from sender
+            await db.execute(
+                "UPDATE balances SET balance = balance - ? WHERE user_id = ?",
+                (amount, interaction.user.id)
+            )
+            # Add to recipient
+            await db.execute(
+                "INSERT OR IGNORE INTO balances VALUES (?, 0)", (user.id,)
+            )
+            await db.execute(
+                "UPDATE balances SET balance = balance + ? WHERE user_id = ?",
+                (amount, user.id)
+            )
+            # Update gifted_balance stat inline
+            await db.execute(
+                "INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (interaction.user.id,)
+            )
+            await db.execute(
+                "UPDATE user_stats SET gifted_balance = gifted_balance + ? WHERE user_id = ?",
+                (amount, interaction.user.id)
+            )
+            await db.commit()
 
     await interaction.response.send_message(
         f"💸 You gifted {amount:,} coins to {user.mention}!"
@@ -801,15 +803,14 @@ async def giveaway(
 
 async def end_giveaway(message_id, reroll=False):
 
+    # --- 1. Read giveaway data & mark ended (one lock) ---
     async with db_lock:
         async with get_db() as db:
-
             async with db.execute(
                 """
                 SELECT message_id, channel_id, prize, winners, reward,
                        end_time, required_role, template, ended
-                FROM giveaways
-                WHERE message_id = ?
+                FROM giveaways WHERE message_id = ?
                 """,
                 (message_id,)
             ) as cursor:
@@ -820,33 +821,22 @@ async def end_giveaway(message_id, reroll=False):
                 return
 
             (
-                message_id,
-                channel_id,
-                prize,
-                winner_count,
-                reward,
-                end_time,
-                required_role,
-                template,
-                ended
+                message_id, channel_id, prize, winner_count, reward,
+                end_time, required_role, template, ended
             ) = data
 
-            # Prevent double-ending (unless reroll)
             if ended and not reroll:
                 print(f"[Giveaway] Already ended: {message_id}")
                 return
 
             if not reroll:
                 await db.execute(
-                    """
-                    UPDATE giveaways
-                    SET ended = 1
-                    WHERE message_id = ?
-                    """,
+                    "UPDATE giveaways SET ended = 1 WHERE message_id = ?",
                     (message_id,)
                 )
                 await db.commit()
 
+    # --- 2. Fetch message & collect participants (no lock needed) ---
     channel = bot.get_channel(channel_id)
     if channel is None:
         print(f"[Giveaway] Channel not found: {channel_id}")
@@ -859,29 +849,22 @@ async def end_giveaway(message_id, reroll=False):
         return
 
     reaction = next(
-        (r for r in message.reactions if str(r.emoji) == "🎉"),
-        None
+        (r for r in message.reactions if str(r.emoji) == "🎉"), None
     )
-
     if reaction is None:
         await channel.send("❌ Giveaway reaction was missing.")
         return
 
     users = []
-
     async for user in reaction.users():
         if user.bot:
             continue
-
         member = channel.guild.get_member(user.id)
         if member is None:
             continue
-
         if required_role:
-            role_ids = {role.id for role in member.roles}
-            if required_role not in role_ids:
+            if required_role not in {role.id for role in member.roles}:
                 continue
-
         users.append(user)
 
     if not users:
@@ -895,44 +878,47 @@ async def end_giveaway(message_id, reroll=False):
         weighted_users.extend([user] * weight)
 
     winners = []
-
     while len(winners) < min(winner_count, len(users)) and weighted_users:
         selected = random.choice(weighted_users)
         if selected not in winners:
             winners.append(selected)
 
+    # --- 3. All DB writes in ONE lock acquisition (no nested locking) ---
     winner_mentions = []
-
     async with db_lock:
         async with get_db() as db:
 
-            # Handle reroll refund
             if reroll:
                 async with db.execute(
-                    """
-                    SELECT winner_id, reward
-                    FROM giveaway_winners
-                    WHERE message_id = ?
-                    """,
+                    "SELECT winner_id, reward FROM giveaway_winners WHERE message_id = ?",
                     (message_id,)
                 ) as cursor:
                     old_data = await cursor.fetchone()
 
                 if old_data:
-                    old_winner, old_reward = old_data
-                    await add_balance(old_winner, -old_reward)
+                    old_winner_id, old_reward = old_data
+                    # Inline balance deduction (no add_balance wrapper — avoids re-locking)
+                    await db.execute(
+                        "INSERT OR IGNORE INTO balances VALUES (?, 0)", (old_winner_id,)
+                    )
+                    await db.execute(
+                        "UPDATE balances SET balance = MAX(0, balance - ?) WHERE user_id = ?",
+                        (old_reward, old_winner_id)
+                    )
 
             for winner in winners:
-                await add_balance(winner.id, reward)
-
+                # Inline balance addition
                 await db.execute(
-                    """
-                    INSERT OR REPLACE INTO giveaway_winners
-                    VALUES (?, ?, ?)
-                    """,
+                    "INSERT OR IGNORE INTO balances VALUES (?, 0)", (winner.id,)
+                )
+                await db.execute(
+                    "UPDATE balances SET balance = balance + ? WHERE user_id = ?",
+                    (reward, winner.id)
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO giveaway_winners VALUES (?, ?, ?)",
                     (message_id, winner.id, reward)
                 )
-
                 winner_mentions.append(winner.mention)
 
             await db.commit()
@@ -946,7 +932,6 @@ async def end_giveaway(message_id, reroll=False):
         ),
         color=discord.Color.green()
     )
-
     await channel.send(embed=embed)
 
 # ---------------- BALANCE COMMAND ---------------- #
@@ -1022,161 +1007,98 @@ async def removebalance(
 
 # ---------------- REROLL ---------------- #
 
-@bot.tree.command(
-    name="reroll",
-    description="Reroll a giveaway"
-)
-async def reroll(
-    interaction: discord.Interaction,
-    message_id: str
-):
+@bot.tree.command(name="reroll", description="Reroll a giveaway")
+async def reroll(interaction: discord.Interaction, message_id: str):
 
     if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message(
-            "❌ No permission.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
 
     message_id = int(message_id)
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT * FROM giveaways WHERE message_id = ?", (message_id,)
+            ) as cursor:
+                data = await cursor.fetchone()
 
-        async with db.execute(
-            """
-            SELECT *
-            FROM giveaways
-            WHERE message_id = ?
-            """,
-            (message_id,)
-        ) as cursor:
+            if not data:
+                await interaction.response.send_message("❌ Giveaway not found.")
+                return
 
-            data = await cursor.fetchone()
+            (
+                _message_id, channel_id, prize, winner_count, reward,
+                end_time, required_role, template, ended
+            ) = data
 
-        if not data:
-
-            await interaction.response.send_message(
-                "❌ Giveaway not found."
-            )
-
-            return
-
-        (
-            _message_id,
-            channel_id,
-            prize,
-            winner_count,
-            reward,
-            end_time,
-            required_role,
-            template,
-            ended
-        ) = data
-
-        async with db.execute(
-            """
-            SELECT winner_id, reward
-            FROM giveaway_winners
-            WHERE message_id = ?
-            """,
-            (message_id,)
-        ) as cursor:
-
-            old_data = await cursor.fetchone()
+            async with db.execute(
+                "SELECT winner_id, reward FROM giveaway_winners WHERE message_id = ?",
+                (message_id,)
+            ) as cursor:
+                old_data = await cursor.fetchone()
 
     channel = bot.get_channel(channel_id)
-    
     if channel is None:
         print(f"Channel {channel_id} not found")
         return
 
     try:
-
-        message = await channel.fetch_message(
-            message_id
-        )
-
+        message = await channel.fetch_message(message_id)
     except discord.NotFound:
-
         print(f"Message {message_id} not found")
-
         return
 
-    reaction = discord.utils.get(
-        message.reactions,
-        emoji="🎉"
-    )
+    reaction = discord.utils.get(message.reactions, emoji="🎉")
 
     users = []
-
     async for user in reaction.users():
-
         if user.bot:
             continue
-
         member = channel.guild.get_member(user.id)
-
         if required_role:
-
             role_ids = [role.id for role in member.roles]
-
             if required_role not in role_ids:
                 continue
-
         users.append(user)
 
     if not users:
-
-        await interaction.response.send_message(
-            "❌ No participants."
-        )
-
+        await interaction.response.send_message("❌ No participants.")
         return
 
     weighted_users = []
-
     for user in users:
-
         level = await get_level(user.id)
-
         weight = min(100, max(1, level))
-
         weighted_users.extend([user] * weight)
 
     new_winner = random.choice(weighted_users)
 
-    # Remove old reward
-    if old_data:
+    # All DB writes in one lock
+    async with db_lock:
+        async with get_db() as db:
+            if old_data:
+                old_winner_id, old_reward = old_data
+                await db.execute(
+                    "INSERT OR IGNORE INTO balances VALUES (?, 0)", (old_winner_id,)
+                )
+                await db.execute(
+                    "UPDATE balances SET balance = MAX(0, balance - ?) WHERE user_id = ?",
+                    (old_reward, old_winner_id)
+                )
 
-        old_winner, old_reward = old_data
-
-        await add_balance(
-            old_winner,
-            -old_reward
-        )
-
-    # Give new reward
-    await add_balance(
-        new_winner.id,
-        reward
-    )
-
-    # Save new winner
-    async with get_db() as db:
-
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO giveaway_winners
-            VALUES (?, ?, ?)
-            """,
-            (
-                message_id,
-                new_winner.id,
-                reward
+            await db.execute(
+                "INSERT OR IGNORE INTO balances VALUES (?, 0)", (new_winner.id,)
             )
-        )
-
-        await db.commit()
+            await db.execute(
+                "UPDATE balances SET balance = balance + ? WHERE user_id = ?",
+                (reward, new_winner.id)
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO giveaway_winners VALUES (?, ?, ?)",
+                (message_id, new_winner.id, reward)
+            )
+            await db.commit()
 
     embed = discord.Embed(
         title="🔄 Giveaway Rerolled",
@@ -1187,12 +1109,8 @@ async def reroll(
         ),
         color=discord.Color.orange()
     )
-
     await channel.send(embed=embed)
-
-    await interaction.response.send_message(
-        "✅ Giveaway rerolled."
-    )
+    await interaction.response.send_message("✅ Giveaway rerolled.")
 
 # ---------------- AUTO GIVEAWAY POOL ---------------- #
 
@@ -1793,55 +1711,35 @@ async def stopgiveaways(
 
 # ---------------- CHEST COMMAND ---------------- #
 
-@bot.tree.command(
-    name="chest",
-    description="Open an EXP chest"
-)
-async def chest(
-    interaction: discord.Interaction,
-    amount: int = 1
-):
+@bot.tree.command(name="chest", description="Open an EXP chest")
+async def chest(interaction: discord.Interaction, amount: int = 1):
 
     await interaction.response.defer()
-    if amount <= 0:
 
-        await interaction.followup.send(
-            "❌ Amount must be greater than 0."
-        )
-    
+    if amount <= 0:
+        await interaction.followup.send("❌ Amount must be greater than 0.")
         return
-    
+
     exp = await get_exp(interaction.user.id)
 
     if exp >= 20000:
-
         max_chests = exp // CHEST_COST
-
         amount = min(amount, max_chests)
-
     else:
-
         amount = 1
 
     total_cost = CHEST_COST * amount
 
     if exp < total_cost:
-
-        await interaction.followup.send(
-            f"❌ You need {total_cost:,} EXP."
-        )
-
+        await interaction.followup.send(f"❌ You need {total_cost:,} EXP.")
         return
-    
-    await add_spent_exp(
-        interaction.user.id,
-        total_cost
-    )
 
+    # Roll all prizes first, no DB calls in the loop
     results = {}
+    total_balance = 0
+    total_exp = 0
 
     for _ in range(amount):
-
         prize = random.choices(
             CHEST_PRIZES,
             weights=[p["chance"] for p in CHEST_PRIZES],
@@ -1849,26 +1747,60 @@ async def chest(
         )[0]
 
         name = prize["name"]
-
         results[name] = results.get(name, 0) + 1
 
-        if prize["balance"] > 0:
+        total_balance += prize["balance"]
+        total_exp += prize["exp"]
 
-            await add_balance(
-                interaction.user.id,
-                prize["balance"]
+    # All DB writes in one lock
+    async with db_lock:
+        async with get_db() as db:
+            # Deduct EXP cost
+            await db.execute(
+                "INSERT OR IGNORE INTO spent_exp VALUES (?, 0)", (interaction.user.id,)
+            )
+            await db.execute(
+                "UPDATE spent_exp SET amount = amount + ? WHERE user_id = ?",
+                (total_cost, interaction.user.id)
             )
 
-        if prize["exp"] > 0:
+            # Add balance winnings
+            if total_balance > 0:
+                await db.execute(
+                    "INSERT OR IGNORE INTO balances VALUES (?, 0)", (interaction.user.id,)
+                )
+                await db.execute(
+                    "UPDATE balances SET balance = balance + ? WHERE user_id = ?",
+                    (total_balance, interaction.user.id)
+                )
 
-            await add_exp(
-                interaction.user.id,
-                prize["exp"]
+            # Add exp winnings
+            if total_exp > 0:
+                await db.execute(
+                    "INSERT INTO exp_history VALUES (?, ?, ?)",
+                    (interaction.user.id, total_exp, int(datetime.now(UTC).timestamp()))
+                )
+                await db.execute(
+                    "INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (interaction.user.id,)
+                )
+                await db.execute(
+                    "UPDATE user_stats SET total_exp = total_exp + ? WHERE user_id = ?",
+                    (total_exp, interaction.user.id)
+                )
+
+            # Update chests_opened stat
+            await db.execute(
+                "INSERT OR IGNORE INTO user_stats (user_id) VALUES (?)", (interaction.user.id,)
             )
+            await db.execute(
+                "UPDATE user_stats SET chests_opened = chests_opened + ? WHERE user_id = ?",
+                (amount, interaction.user.id)
+            )
+
+            await db.commit()
 
     result_text = "\n".join(
-        f"• {count}x {name}"
-        for name, count in results.items()
+        f"• {count}x {name}" for name, count in results.items()
     )
 
     embed = discord.Embed(
@@ -1876,14 +1808,9 @@ async def chest(
         description=result_text,
         color=discord.Color.purple()
     )
+    embed.set_footer(text=f"Opened {amount} chest(s)")
 
-    embed.set_footer(
-        text=f"Opened {amount} chest(s)"
-    )
-
-    await interaction.followup.send(
-        embed=embed
-    )
+    await interaction.followup.send(embed=embed)
 
     await add_stat(
         interaction.user.id,
