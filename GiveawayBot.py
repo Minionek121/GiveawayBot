@@ -1216,7 +1216,7 @@ AUTO_GIVEAWAY_POOL = []
 # ---------------- RAFFLE SYSTEM ---------------- #
 
 RAFFLE_TICKET_PRICE = 100
-RAFFLE_PRIZE = 10000
+RAFFLE_PRIZE = 0
 
 async def get_tickets(guild_id, user_id):
 
@@ -1539,7 +1539,7 @@ async def raffle_loop():
 
                 await channel.send(
                     f"🎉 <@{winner_id}> won the daily raffle "
-                    f"and received {RAFFLE_PRIZE:,} coins!"
+                    f"and will receive a huge pet!"
                 )
 
             async with aiosqlite.connect(DATABASE) as db:
