@@ -37,7 +37,7 @@ async def is_allowed_to_giveaway(
     if any(role.name.lower() == "bot developer" for role in member.roles):
         return True
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -62,6 +62,9 @@ async def is_allowed_to_giveaway(
 
 # ---------------- DATABASE ---------------- #
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
 async def get_db():
     db = await aiosqlite.connect(DATABASE)
 
@@ -69,11 +72,14 @@ async def get_db():
     await db.execute("PRAGMA synchronous=NORMAL")
     await db.execute("PRAGMA busy_timeout = 30000")
 
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 async def setup_database():
 
-    async with await get_db() as db:
+    async with get_db() as db:
         
         await db.execute(
             """
@@ -210,7 +216,7 @@ async def addgiveawayrole(
     role: discord.Role
 ):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -239,7 +245,7 @@ async def removegiveawayrole(
     role: discord.Role
 ):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -267,7 +273,7 @@ async def giveawayroles(
     interaction: discord.Interaction
 ):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -308,7 +314,7 @@ async def get_balance(user_id):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             async with db.execute(
                 "SELECT balance FROM balances WHERE user_id = ?",
@@ -334,7 +340,7 @@ async def add_balance(user_id, amount):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -422,7 +428,7 @@ async def ensure_stats(user_id):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -441,7 +447,7 @@ async def add_stat(user_id, column, amount):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 f"""
@@ -469,7 +475,7 @@ async def add_exp(user_id, amount):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -491,7 +497,7 @@ async def get_exp(user_id):
         (datetime.now(UTC) - timedelta(days=7)).timestamp()
     )
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -517,7 +523,7 @@ async def get_level_exp(user_id):
         (datetime.now(UTC) - timedelta(days=7)).timestamp()
     )
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -543,7 +549,7 @@ async def get_level(user_id):
 
 async def get_spent_exp(user_id):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -576,7 +582,7 @@ async def add_spent_exp(user_id, amount):
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -593,6 +599,7 @@ async def add_spent_exp(user_id, amount):
 
 AUTO_GIVEAWAY_ENABLED = False
 AUTO_GIVEAWAY_INTERVAL_SECONDS = 60
+auto_giveaway_task = None
 
 AUTO_PRIZES = [
     ("500 bal", 500),
@@ -630,7 +637,7 @@ async def auto_giveaway_loop(channel):
 
         await message.add_reaction("🎉")
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -788,7 +795,7 @@ async def giveaway(
 
     await message.add_reaction("🎉")
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -823,7 +830,7 @@ async def giveaway(
 
 async def end_giveaway(message_id, reroll=False):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -914,7 +921,7 @@ async def end_giveaway(message_id, reroll=False):
 
     winner_mentions = []
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         if reroll:
 
@@ -1079,7 +1086,7 @@ async def reroll(
 
     message_id = int(message_id)
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -1187,7 +1194,7 @@ async def reroll(
     )
 
     # Save new winner
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -1239,7 +1246,7 @@ RAFFLE_PRIZE = 0
 
 async def get_tickets(guild_id, user_id):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -1294,7 +1301,7 @@ async def add_tickets(
 
     async with db_lock:
 
-        async with await get_db() as db:
+        async with get_db() as db:
 
             await db.execute(
                 """
@@ -1356,7 +1363,7 @@ async def buytickets(
     )
 
     # Get total tickets in raffle
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -1461,7 +1468,7 @@ async def rafflechance(
         user.id
     )
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -1524,7 +1531,7 @@ async def raffle_loop():
 
         for guild in bot.guilds:
 
-            async with await get_db() as db:
+            async with get_db() as db:
 
                 async with db.execute(
                     """
@@ -1562,7 +1569,7 @@ async def raffle_loop():
                     f"and will receive a huge pet!"
                 )
 
-            async with await get_db() as db:
+            async with get_db() as db:
 
                 await db.execute(
                     """
@@ -1709,8 +1716,12 @@ async def startgiveaways(
         return
     
     global AUTO_GIVEAWAY_ENABLED
+    global auto_giveaway_task
 
-    if AUTO_GIVEAWAY_ENABLED:
+    if (
+        auto_giveaway_task
+        and not auto_giveaway_task.done()
+    ):
 
         await interaction.response.send_message(
             "Automatic giveaways are already running.",
@@ -1766,7 +1777,7 @@ async def startgiveaways(
 
             await message.add_reaction("🎉")
 
-            async with await get_db() as db:
+            async with get_db() as db:
 
                 await db.execute(
                     """
@@ -1798,7 +1809,9 @@ async def startgiveaways(
                 interval_seconds
             )
 
-    asyncio.create_task(auto_loop())
+    auto_giveaway_task = asyncio.create_task(
+        auto_loop()
+    )
 
     await interaction.response.send_message(
         "✅ Automatic giveaways started."
@@ -1822,8 +1835,13 @@ async def stopgiveaways(
         return
     
     global AUTO_GIVEAWAY_ENABLED
+    global auto_giveaway_task
 
     AUTO_GIVEAWAY_ENABLED = False
+    
+    if auto_giveaway_task:
+        auto_giveaway_task.cancel()
+        auto_giveaway_task = None
 
     await interaction.response.send_message(
         "🛑 Automatic giveaways stopped."
@@ -2046,7 +2064,7 @@ await db.execute(
 
 async def add_item(item_name, price, role_id, description):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -2066,7 +2084,7 @@ async def add_item(item_name, price, role_id, description):
 
 async def remove_item(item_name):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         await db.execute(
             """
@@ -2081,7 +2099,7 @@ async def remove_item(item_name):
 
 async def get_item(item_name):
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -2097,7 +2115,7 @@ async def get_item(item_name):
 
 async def get_all_items():
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         async with db.execute(
             """
@@ -2376,7 +2394,7 @@ async def leaderboard(
 
     leaderboard_data = []
 
-    async with await get_db() as db:
+    async with get_db() as db:
 
         # CURRENT EXP
         if value == "current_exp":
