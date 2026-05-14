@@ -36,19 +36,19 @@ async def is_allowed_to_giveaway(
     # Bot devs always allowed
     if any(role.name.lower() == "bot developer" for role in member.roles):
         return True
+    async with db_lock:
+        async with get_db() as db:
 
-    async with get_db() as db:
+            async with db.execute(
+                """
+                SELECT role_id
+                FROM giveaway_roles
+                WHERE guild_id = ?
+                """,
+                (interaction.guild.id,)
+            ) as cursor:
 
-        async with db.execute(
-            """
-            SELECT role_id
-            FROM giveaway_roles
-            WHERE guild_id = ?
-            """,
-            (interaction.guild.id,)
-        ) as cursor:
-
-            rows = await cursor.fetchall()
+                rows = await cursor.fetchall()
 
     allowed_roles = {
         row[0]
@@ -78,122 +78,123 @@ async def get_db():
         await db.close()
 
 async def setup_database():
-
-    async with get_db() as db:
+    
+    async with db_lock:
+        async with get_db() as db:
         
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS giveaway_roles (
-                guild_id INTEGER,
-                role_id INTEGER
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS giveaway_roles (
+                    guild_id INTEGER,
+                    role_id INTEGER
+                )
+                """
             )
-            """
-        )
-        # Giveaways table
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS giveaways (
-                message_id INTEGER,
-                channel_id INTEGER,
-                prize TEXT,
-                winners INTEGER,
-                reward INTEGER,
-                end_time INTEGER,
-                required_role INTEGER,
-                template TEXT
+            # Giveaways table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS giveaways (
+                    message_id INTEGER,
+                    channel_id INTEGER,
+                    prize TEXT,
+                    winners INTEGER,
+                    reward INTEGER,
+                    end_time INTEGER,
+                    required_role INTEGER,
+                    template TEXT
+                )
+                """
             )
-            """
-        )
 
-        # User balances
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS balances (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER
+            # User balances
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS balances (
+                    user_id INTEGER PRIMARY KEY,
+                    balance INTEGER
+                )
+                """
             )
-            """
-        )
 
-        # EXP HISTORY
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS exp_history (
-                user_id INTEGER,
-                amount INTEGER,
-                timestamp INTEGER
+            # EXP HISTORY
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exp_history (
+                    user_id INTEGER,
+                    amount INTEGER,
+                    timestamp INTEGER
+                )
+                """
             )
-            """
-        )
+    
+            # RAFFLE
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raffle (
+                    guild_id INTEGER,
+                    user_id INTEGER,
+                    tickets INTEGER,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+                """
+            )
 
-        # RAFFLE
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS raffle (
-                guild_id INTEGER,
-                user_id INTEGER,
-                tickets INTEGER,
-                PRIMARY KEY (guild_id, user_id)
+            # GIVEAWAY WINNERS
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS giveaway_winners (
+                    message_id INTEGER PRIMARY KEY,
+                    winner_id INTEGER,
+                    reward INTEGER
+                )
+                """
             )
-            """
-        )
+            try:
 
-        # GIVEAWAY WINNERS
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS giveaway_winners (
-                message_id INTEGER PRIMARY KEY,
-                winner_id INTEGER,
-                reward INTEGER
-            )
-            """
-        )
-        try:
+                await db.execute(
+                    """
+                    ALTER TABLE giveaways
+                    ADD COLUMN ended INTEGER DEFAULT 0
+                    """
+                )
+
+            except aiosqlite.OperationalError:
+                pass
 
             await db.execute(
                 """
-                ALTER TABLE giveaways
-                ADD COLUMN ended INTEGER DEFAULT 0
+                CREATE TABLE IF NOT EXISTS spent_exp (
+                    user_id INTEGER PRIMARY KEY,
+                    amount INTEGER
+                )
                 """
             )
 
-        except aiosqlite.OperationalError:
-            pass
-
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS spent_exp (
-                user_id INTEGER PRIMARY KEY,
-                amount INTEGER
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_store (
+                    item_name TEXT PRIMARY KEY,
+                    price INTEGER,
+                    role_id INTEGER,
+                    description TEXT
+                )
+                """
             )
-            """
-        )
 
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS item_store (
-                item_name TEXT PRIMARY KEY,
-                price INTEGER,
-                role_id INTEGER,
-                description TEXT
+            # Lifetime stats
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    user_id INTEGER PRIMARY KEY,
+                    total_exp INTEGER DEFAULT 0,
+                    gifted_balance INTEGER DEFAULT 0,
+                    chests_opened INTEGER DEFAULT 0,
+                    raffle_tickets_bought INTEGER DEFAULT 0
+                )
+                """
             )
-            """
-        )
 
-        # Lifetime stats
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_stats (
-                user_id INTEGER PRIMARY KEY,
-                total_exp INTEGER DEFAULT 0,
-                gifted_balance INTEGER DEFAULT 0,
-                chests_opened INTEGER DEFAULT 0,
-                raffle_tickets_bought INTEGER DEFAULT 0
-            )
-            """
-        )
-
-        await db.commit()
+            await db.commit()
 
 # ---------------- TEMPLATES ---------------- #
 
@@ -216,20 +217,21 @@ async def addgiveawayrole(
     role: discord.Role
 ):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        await db.execute(
-            """
-            INSERT INTO giveaway_roles
-            VALUES (?, ?)
-            """,
-            (
-                interaction.guild.id,
-                role.id
+            await db.execute(
+                """
+                INSERT INTO giveaway_roles
+                VALUES (?, ?)
+                """,
+                (
+                    interaction.guild.id,
+                    role.id
+                )
             )
-        )
 
-        await db.commit()
+            await db.commit()
 
     await interaction.response.send_message(
         f"✅ {role.mention} can now manage giveaways."
@@ -245,21 +247,22 @@ async def removegiveawayrole(
     role: discord.Role
 ):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        await db.execute(
-            """
-            DELETE FROM giveaway_roles
-            WHERE guild_id = ?
-            AND role_id = ?
-            """,
-            (
-                interaction.guild.id,
-                role.id
+            await db.execute(
+                """
+                DELETE FROM giveaway_roles
+                WHERE guild_id = ?
+                AND role_id = ?
+                """,
+                (
+                    interaction.guild.id,
+                    role.id
+                )
             )
-        )
 
-        await db.commit()
+            await db.commit()
 
     await interaction.response.send_message(
         f"🗑 Removed giveaway permissions from {role.mention}"
@@ -313,25 +316,20 @@ async def giveawayroles(
 async def get_balance(user_id):
 
     async with db_lock:
-
         async with get_db() as db:
 
             async with db.execute(
                 "SELECT balance FROM balances WHERE user_id = ?",
                 (user_id,)
             ) as cursor:
-
                 data = await cursor.fetchone()
 
             if data is None:
-
                 await db.execute(
                     "INSERT INTO balances VALUES (?, ?)",
                     (user_id, 0)
                 )
-
                 await db.commit()
-
                 return 0
 
             return data[0]
@@ -339,14 +337,10 @@ async def get_balance(user_id):
 async def add_balance(user_id, amount):
 
     async with db_lock:
-
         async with get_db() as db:
 
             await db.execute(
-                """
-                INSERT OR IGNORE INTO balances
-                VALUES (?, ?)
-                """,
+                "INSERT OR IGNORE INTO balances VALUES (?, ?)",
                 (user_id, 0)
             )
 
@@ -474,7 +468,6 @@ async def add_exp(user_id, amount):
         await add_stat(user_id, "total_exp", amount)
 
     async with db_lock:
-
         async with get_db() as db:
 
             await db.execute(
@@ -581,7 +574,6 @@ async def add_spent_exp(user_id, amount):
     current = await get_spent_exp(user_id)
 
     async with db_lock:
-
         async with get_db() as db:
 
             await db.execute(
@@ -771,163 +763,117 @@ async def giveaway(
 
 async def end_giveaway(message_id, reroll=False):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        async with db.execute(
-            """
-            SELECT * FROM giveaways
-            WHERE message_id = ?
-            AND ended = 0
-            """,
-            (message_id,)
-        ) as cursor:
+            async with db.execute(
+                """
+                SELECT * FROM giveaways
+                WHERE message_id = ?
+                AND ended = 0
+                """,
+                (message_id,)
+            ) as cursor:
+                data = await cursor.fetchone()
 
-            data = await cursor.fetchone()
+            if not data:
+                return
 
-        if not data:
-            return
-
-        (
-            message_id,
-            channel_id,
-            prize,
-            winner_count,
-            reward,
-            end_time,
-            required_role,
-            template,
-            ended
-        ) = data
+    (
+        message_id,
+        channel_id,
+        prize,
+        winner_count,
+        reward,
+        end_time,
+        required_role,
+        template,
+        ended
+    ) = data
 
     channel = bot.get_channel(channel_id)
+    message = await channel.fetch_message(message_id)
 
-    message = await channel.fetch_message(
-        message_id
-    )
-
-    reaction = discord.utils.get(
-        message.reactions,
-        emoji="🎉"
-    )
+    reaction = discord.utils.get(message.reactions, emoji="🎉")
     if reaction is None:
-
-        await channel.send(
-            "❌ Giveaway reaction was missing."
-        )
-
+        await channel.send("❌ Giveaway reaction was missing.")
         return
 
     users = []
 
     async for user in reaction.users():
-
         if user.bot:
             continue
 
         member = channel.guild.get_member(user.id)
 
         if required_role:
-
-            role_ids = [
-                role.id for role in member.roles
-            ]
-
+            role_ids = [role.id for role in member.roles]
             if required_role not in role_ids:
                 continue
 
         users.append(user)
 
     if not users:
-
-        await channel.send(
-            "No valid participants."
-        )
-
+        await channel.send("No valid participants.")
         return
 
     weighted_users = []
-
     for user in users:
-
         level = await get_level(user.id)
-
         weight = min(100, max(1, level))
-
         weighted_users.extend([user] * weight)
 
     winners = []
 
-    while (
-        len(winners) < min(winner_count, len(users))
-        and weighted_users
-    ):
-
+    while len(winners) < min(winner_count, len(users)) and weighted_users:
         selected = random.choice(weighted_users)
-
         if selected not in winners:
             winners.append(selected)
 
     winner_mentions = []
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        if reroll:
+            if reroll:
+                async with db.execute(
+                    """
+                    SELECT winner_id, reward
+                    FROM giveaway_winners
+                    WHERE message_id = ?
+                    """,
+                    (message_id,)
+                ) as cursor:
+                    old_data = await cursor.fetchone()
 
-            async with db.execute(
-                """
-                SELECT winner_id, reward
-                FROM giveaway_winners
-                WHERE message_id = ?
-                """,
-                (message_id,)
-            ) as cursor:
+                if old_data:
+                    old_winner, old_reward = old_data
+                    await add_balance(old_winner, -old_reward)
 
-                old_data = await cursor.fetchone()
+            for winner in winners:
 
-            if old_data:
+                await add_balance(winner.id, reward)
 
-                old_winner, old_reward = old_data
-
-                await add_balance(
-                    old_winner,
-                    -old_reward
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO giveaway_winners
+                    VALUES (?, ?, ?)
+                    """,
+                    (message_id, winner.id, reward)
                 )
 
-        for winner in winners:
+                winner_mentions.append(winner.mention)
 
-            await add_balance(
-                winner.id,
-                reward
-            )
-
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO giveaway_winners
-                VALUES (?, ?, ?)
-                """,
-                (
-                    message_id,
-                    winner.id,
-                    reward
+            if not reroll:
+                await db.execute(
+                    """
+                    UPDATE giveaways
+                    SET ended = 1
+                    WHERE message_id = ?
+                    """,
+                    (message_id,)
                 )
-            )
-
-            winner_mentions.append(
-                winner.mention
-            )
-
-        await db.commit()
-
-        if not reroll:
-
-            await db.execute(
-                """
-                UPDATE giveaways
-                SET ended = 1
-                WHERE message_id = ?
-                """,
-                (message_id,)
-            )
 
             await db.commit()
 
@@ -1208,61 +1154,42 @@ RAFFLE_PRIZE = 0
 
 async def get_tickets(guild_id, user_id):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        async with db.execute(
-            """
-            SELECT tickets
-            FROM raffle
-            WHERE guild_id = ?
-            AND user_id = ?
-            """,
-            (
-                guild_id,
-                user_id
-            )
-        ) as cursor:
-
-            data = await cursor.fetchone()
-
-        if not data:
-
-            await db.execute(
+            async with db.execute(
                 """
-                INSERT INTO raffle
-                VALUES (?, ?, ?)
+                SELECT tickets
+                FROM raffle
+                WHERE guild_id = ?
+                AND user_id = ?
                 """,
-                (
-                    guild_id,
-                    user_id,
-                    0
+                (guild_id, user_id)
+            ) as cursor:
+                data = await cursor.fetchone()
+
+            if not data:
+
+                await db.execute(
+                    """
+                    INSERT INTO raffle
+                    VALUES (?, ?, ?)
+                    """,
+                    (guild_id, user_id, 0)
                 )
-            )
 
-            await db.commit()
+                await db.commit()
+                return 0
 
-            return 0
-
-        return data[0]
+            return data[0]
     
-async def add_tickets(
-    guild_id,
-    user_id,
-    amount
-):
+async def add_tickets(guild_id, user_id, amount):
 
-    tickets = await get_tickets(
-        guild_id,
-        user_id
-    )
+    tickets = await get_tickets(guild_id, user_id)
 
-    new_tickets = max(
-        0,
-        tickets + amount
-    )
+    new_tickets = max(0, tickets + amount)
 
     async with db_lock:
-
         async with get_db() as db:
 
             await db.execute(
@@ -1272,11 +1199,7 @@ async def add_tickets(
                 WHERE guild_id = ?
                 AND user_id = ?
                 """,
-                (
-                    new_tickets,
-                    guild_id,
-                    user_id
-                )
+                (new_tickets, guild_id, user_id)
             )
 
             await db.commit()
@@ -2036,37 +1959,34 @@ await db.execute(
 
 async def add_item(item_name, price, role_id, description):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO item_store
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                item_name,
-                price,
-                role_id,
-                description
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO item_store
+                VALUES (?, ?, ?, ?)
+                """,
+                (item_name, price, role_id, description)
             )
-        )
 
-        await db.commit()
+            await db.commit()
 
 
 async def remove_item(item_name):
 
-    async with get_db() as db:
+    async with db_lock:
+        async with get_db() as db:
 
-        await db.execute(
-            """
-            DELETE FROM item_store
-            WHERE item_name = ?
-            """,
-            (item_name,)
-        )
+            await db.execute(
+                """
+                DELETE FROM item_store
+                WHERE item_name = ?
+                """,
+                (item_name,)
+            )
 
-        await db.commit()
+            await db.commit()
 
 
 async def get_item(item_name):
