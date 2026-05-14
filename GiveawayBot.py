@@ -2342,8 +2342,6 @@ async def item_buy(
 
 # ---------------- LEADERBOARD ----------------- #
 
-# ---------------- LEADERBOARD ----------------- #
-
 @bot.tree.command(
     name="leaderboard",
     description="View leaderboards"
