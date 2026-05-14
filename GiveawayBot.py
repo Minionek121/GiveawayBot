@@ -205,6 +205,12 @@ TEMPLATES = {
     "green": discord.Color.green(),
 }
 
+# ---------------- SOME RANDOM FIX ---------------- #
+
+async def giveaway_timer(message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    await end_giveaway(message_id)
+
 # ---------------- GIVEAWAY ROLES ---------------- #
 
 @bot.tree.command(
@@ -755,9 +761,9 @@ async def giveaway(
         ephemeral=True
     )
 
-    await asyncio.sleep(minutes * 60)
-
-    await end_giveaway(message.id)
+    asyncio.create_task(
+        giveaway_timer(message.id, minutes * 60)
+    )
 
 # ---------------- END GIVEAWAY ---------------- #
 
@@ -768,33 +774,63 @@ async def end_giveaway(message_id, reroll=False):
 
             async with db.execute(
                 """
-                SELECT * FROM giveaways
+                SELECT message_id, channel_id, prize, winners, reward,
+                       end_time, required_role, template, ended
+                FROM giveaways
                 WHERE message_id = ?
-                AND ended = 0
                 """,
                 (message_id,)
             ) as cursor:
                 data = await cursor.fetchone()
 
             if not data:
+                print(f"[Giveaway] No giveaway found for {message_id}")
                 return
 
-    (
-        message_id,
-        channel_id,
-        prize,
-        winner_count,
-        reward,
-        end_time,
-        required_role,
-        template,
-        ended
-    ) = data
+            (
+                message_id,
+                channel_id,
+                prize,
+                winner_count,
+                reward,
+                end_time,
+                required_role,
+                template,
+                ended
+            ) = data
+
+            # Prevent double-ending (unless reroll)
+            if ended and not reroll:
+                print(f"[Giveaway] Already ended: {message_id}")
+                return
+
+            if not reroll:
+                await db.execute(
+                    """
+                    UPDATE giveaways
+                    SET ended = 1
+                    WHERE message_id = ?
+                    """,
+                    (message_id,)
+                )
+                await db.commit()
 
     channel = bot.get_channel(channel_id)
-    message = await channel.fetch_message(message_id)
+    if channel is None:
+        print(f"[Giveaway] Channel not found: {channel_id}")
+        return
 
-    reaction = discord.utils.get(message.reactions, emoji="🎉")
+    try:
+        message = await channel.fetch_message(message_id)
+    except Exception as e:
+        print(f"[Giveaway] Failed to fetch message {message_id}: {e}")
+        return
+
+    reaction = next(
+        (r for r in message.reactions if str(r.emoji) == "🎉"),
+        None
+    )
+
     if reaction is None:
         await channel.send("❌ Giveaway reaction was missing.")
         return
@@ -806,9 +842,11 @@ async def end_giveaway(message_id, reroll=False):
             continue
 
         member = channel.guild.get_member(user.id)
+        if member is None:
+            continue
 
         if required_role:
-            role_ids = [role.id for role in member.roles]
+            role_ids = {role.id for role in member.roles}
             if required_role not in role_ids:
                 continue
 
@@ -836,6 +874,7 @@ async def end_giveaway(message_id, reroll=False):
     async with db_lock:
         async with get_db() as db:
 
+            # Handle reroll refund
             if reroll:
                 async with db.execute(
                     """
@@ -852,7 +891,6 @@ async def end_giveaway(message_id, reroll=False):
                     await add_balance(old_winner, -old_reward)
 
             for winner in winners:
-
                 await add_balance(winner.id, reward)
 
                 await db.execute(
@@ -864,16 +902,6 @@ async def end_giveaway(message_id, reroll=False):
                 )
 
                 winner_mentions.append(winner.mention)
-
-            if not reroll:
-                await db.execute(
-                    """
-                    UPDATE giveaways
-                    SET ended = 1
-                    WHERE message_id = ?
-                    """,
-                    (message_id,)
-                )
 
             await db.commit()
 
@@ -1684,25 +1712,11 @@ async def startgiveaways(
 
                 await db.commit()
 
-            await asyncio.sleep(
-                giveaway_duration_seconds
+            asyncio.create_task(
+                giveaway_timer(message.id, giveaway_duration_seconds)
             )
 
-            try:
-
-                print(f"Ending giveaway {message.id}")
-
-                await end_giveaway(message.id)
-    
-                print(f"Ended giveaway {message.id}")
-
-            except Exception as e:
-
-                print(f"Auto giveaway error: {e}")
-        
-            await asyncio.sleep(
-                interval_seconds
-            )
+            await asyncio.sleep(interval_seconds)
 
     auto_giveaway_task = asyncio.create_task(
         auto_loop()
