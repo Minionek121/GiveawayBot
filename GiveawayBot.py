@@ -608,65 +608,6 @@ AUTO_PRIZES = [
     ("100 bal", 100)
 ]
 
-async def auto_giveaway_loop(channel):
-
-    global AUTO_GIVEAWAY_ENABLED
-
-    while AUTO_GIVEAWAY_ENABLED:
-
-        prize, reward = random.choice(AUTO_PRIZES)
-
-        duration_seconds = 30
-
-        end_time = datetime.now(UTC) + timedelta(
-            seconds=duration_seconds
-        )
-
-        embed = discord.Embed(
-            title="🎉 AUTOMATIC GIVEAWAY 🎉",
-            description=(
-                f"React with 🎉 to enter\n\n"
-                f"Prize: **{prize}**\n"
-                f"Reward: **{reward} coins**\n"
-                f"Ends: <t:{int(end_time.timestamp())}:R>"
-            ),
-            color=discord.Color.gold()
-        )
-
-        message = await channel.send(embed=embed)
-
-        await message.add_reaction("🎉")
-
-        async with get_db() as db:
-
-            await db.execute(
-                """
-                INSERT INTO giveaways
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    message.id,
-                    channel.id,
-                    prize,
-                    1,
-                    reward,
-                    int(end_time.timestamp()),
-                    0,
-                    "gold",
-                    0
-                )
-            )
-
-            await db.commit()
-
-        await asyncio.sleep(duration_seconds)
-
-        await end_giveaway(message.id)
-
-        await asyncio.sleep(
-            AUTO_GIVEAWAY_INTERVAL_SECONDS
-        )
-
 # ----------------- MESSAGE EXP ----------------- #
 
 @bot.event
@@ -868,6 +809,13 @@ async def end_giveaway(message_id, reroll=False):
         message.reactions,
         emoji="🎉"
     )
+    if reaction is None:
+
+        await channel.send(
+            "❌ Giveaway reaction was missing."
+        )
+
+        return
 
     users = []
 
@@ -1131,8 +1079,22 @@ async def reroll(
             old_data = await cursor.fetchone()
 
     channel = bot.get_channel(channel_id)
+    
+    if channel is None:
+        print(f"Channel {channel_id} not found")
+        return
 
-    message = await channel.fetch_message(message_id)
+    try:
+
+        message = await channel.fetch_message(
+            message_id
+        )
+
+    except discord.NotFound:
+
+        print(f"Message {message_id} not found")
+
+        return
 
     reaction = discord.utils.get(
         message.reactions,
@@ -1803,8 +1765,18 @@ async def startgiveaways(
                 giveaway_duration_seconds
             )
 
-            await end_giveaway(message.id)
+            try:
 
+                print(f"Ending giveaway {message.id}")
+
+                await end_giveaway(message.id)
+    
+                print(f"Ended giveaway {message.id}")
+
+            except Exception as e:
+
+                print(f"Auto giveaway error: {e}")
+        
             await asyncio.sleep(
                 interval_seconds
             )
