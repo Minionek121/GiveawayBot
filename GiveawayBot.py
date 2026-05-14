@@ -13,7 +13,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-DATABASE = "giveaways.db"
+DATABASE = "/app/data/giveaways.db"
 
 db_lock = asyncio.Lock()
 
