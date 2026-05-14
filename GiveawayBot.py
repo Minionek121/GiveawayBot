@@ -31,8 +31,8 @@ async def is_allowed_to_giveaway(
     if not isinstance(member, discord.Member):
         return False
 
-    # Server admins always allowed
-    if member.guild_permissions.administrator:
+    # Bot devs always allowed
+    if any(role.name.lower() == "bot developer" for role in member.roles):
         return True
 
     async with aiosqlite.connect(DATABASE) as db:
