@@ -178,6 +178,16 @@ async def setup_database():
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exp_boosts (
+                    guild_id INTEGER,
+                    role_id INTEGER,
+                    boost_percent INTEGER,
+                    PRIMARY KEY (guild_id, role_id)
+                )
+                """
+            )
             try:
                 await db.execute(
                     "ALTER TABLE giveaways ADD COLUMN ended INTEGER DEFAULT 0"
@@ -459,18 +469,40 @@ async def on_message(message):
         bonus = min(20, content_length // 10)
         randomness = random.randint(0, max(1, bonus))
         gained = min(50, exp_gain + randomness)
+
+        # Apply role exp boost if the member has a boosted role
+        if message.guild and isinstance(message.author, discord.Member):
+            member_role_ids = {role.id for role in message.author.roles}
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT boost_percent FROM exp_boosts WHERE guild_id = ? AND role_id IN ({})".format(
+                        ",".join("?" * len(member_role_ids))
+                    ),
+                    (message.guild.id, *member_role_ids)
+                ) as cursor:
+                    boost_rows = await cursor.fetchall()
+            if boost_rows:
+                # Use the highest boost the member qualifies for
+                best_boost = max(row[0] for row in boost_rows)
+                gained = int(gained * (1 + best_boost / 100))
+
         await add_exp(message.author.id, gained)
         last_message_exp[message.author.id] = now
     await bot.process_commands(message)
 
 # ---------------- READY EVENT ---------------- #
 
+GUILD_ID = 1494356360241090661  # Only guild — commands sync here instantly
+TARGET_GUILD = discord.Object(id=GUILD_ID)
+
 @bot.event
 async def on_ready():
     await setup_database()
     try:
-        synced = await bot.tree.sync(guild=None)
-        print(f"Synced {len(synced)} commands")
+        # Copy global commands into the guild tree so they register instantly
+        bot.tree.copy_global_to(guild=TARGET_GUILD)
+        synced = await bot.tree.sync(guild=TARGET_GUILD)
+        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
     except Exception as e:
         print(e)
     print(f"Logged in as {bot.user}")
@@ -1572,6 +1604,66 @@ async def raffle_info_loop():
                 print(f"[RaffleInfoLoop] guild={guild_id}: {e}")
 
         await asyncio.sleep(60)
+
+# ---------------- EXP BOOST ---------------- #
+
+@bot.tree.command(name="expboost", description="Set an EXP boost for a role (percentage)")
+@app_commands.describe(
+    role="Role to boost",
+    boost="Boost percentage (e.g. 50 = +50% EXP per message)"
+)
+@command_enabled()
+async def expboost(interaction: discord.Interaction, role: discord.Role, boost: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    if boost <= 0:
+        await interaction.response.send_message("❌ Boost must be greater than 0%.", ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO exp_boosts VALUES (?, ?, ?)",
+                (interaction.guild.id, role.id, boost)
+            )
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Members with {role.mention} now earn **+{boost}% EXP** per message."
+    )
+
+@bot.tree.command(name="removeexpboost", description="Remove an EXP boost from a role")
+@command_enabled()
+async def removeexpboost(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM exp_boosts WHERE guild_id = ? AND role_id = ?",
+                (interaction.guild.id, role.id)
+            )
+            await db.commit()
+    await interaction.response.send_message(f"🗑 Removed EXP boost from {role.mention}.")
+
+@bot.tree.command(name="listexpboosts", description="List all active EXP boosts")
+@command_enabled()
+async def listexpboosts(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id, boost_percent FROM exp_boosts WHERE guild_id = ? ORDER BY boost_percent DESC",
+            (interaction.guild.id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    if not rows:
+        await interaction.response.send_message("❌ No EXP boosts configured.")
+        return
+    embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
+    for role_id, boost in rows:
+        role = interaction.guild.get_role(role_id)
+        name = role.mention if role else f"<deleted role {role_id}>"
+        embed.add_field(name=name, value=f"+{boost}%", inline=False)
+    await interaction.response.send_message(embed=embed)
 
 # ---------------- LEADERBOARD ---------------- #
 
