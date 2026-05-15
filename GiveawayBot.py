@@ -492,18 +492,13 @@ async def on_message(message):
 
 # ---------------- READY EVENT ---------------- #
 
-
-GUILD_ID = 1494356360241090661  # Only guild — commands sync here instantly
-TARGET_GUILD = discord.Object(id=GUILD_ID)
-
 @bot.event
 async def on_ready():
     await setup_database()
     try:
         # Copy global commands into the guild tree so they register instantly
-        bot.tree.copy_global_to(guild=TARGET_GUILD)
-        synced = await bot.tree.sync(guild=TARGET_GUILD)
-        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+        synced = await bot.tree.sync(guild=None)
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
         print(e)
     print(f"Logged in as {bot.user}")
