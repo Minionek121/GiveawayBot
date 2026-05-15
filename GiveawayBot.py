@@ -474,7 +474,58 @@ async def add_spent_exp(user_id, amount):
             )
             await db.commit()
 
-# ---------------- AUTO GIVEAWAYS ---------------- #
+# ---------------- INVENTORY HELPERS ---------------- #
+
+async def inventory_add(user_id: int, item_name: str, quantity: int = 1):
+    """Add quantity of an item to a user's inventory."""
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                """
+                INSERT INTO inventory (user_id, item_name, quantity)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, item_name)
+                DO UPDATE SET quantity = quantity + excluded.quantity
+                """,
+                (user_id, item_name, quantity)
+            )
+            await db.commit()
+
+async def inventory_remove(user_id: int, item_name: str, quantity: int = 1) -> bool:
+    """Remove quantity from a user's inventory. Returns True on success."""
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?",
+                (user_id, item_name)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row or row[0] < quantity:
+                return False
+            new_qty = row[0] - quantity
+            if new_qty == 0:
+                await db.execute(
+                    "DELETE FROM inventory WHERE user_id = ? AND item_name = ?",
+                    (user_id, item_name)
+                )
+            else:
+                await db.execute(
+                    "UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?",
+                    (new_qty, user_id, item_name)
+                )
+            await db.commit()
+    return True
+
+async def inventory_get(user_id: int) -> list[tuple[str, int]]:
+    """Return [(item_name, quantity), ...] for a user, ordered by name."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT item_name, quantity FROM inventory WHERE user_id = ? ORDER BY item_name",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchall()
+
+
 
 AUTO_GIVEAWAY_ENABLED = False
 AUTO_GIVEAWAY_INTERVAL_SECONDS = 60
