@@ -152,7 +152,6 @@ async def setup_database():
                 )
                 """
             )
-            # Change 4: raffle channel per guild
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS raffle_config (
@@ -220,6 +219,17 @@ async def setup_database():
                     gifted_balance INTEGER DEFAULT 0,
                     chests_opened INTEGER DEFAULT 0,
                     raffle_tickets_bought INTEGER DEFAULT 0
+                )
+                """
+            )
+            # Inventory: one row per (user, item), quantity tracked
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inventory (
+                    user_id INTEGER,
+                    item_name TEXT,
+                    quantity INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, item_name)
                 )
                 """
             )
@@ -470,21 +480,19 @@ async def on_message(message):
         randomness = random.randint(0, max(1, bonus))
         gained = min(50, exp_gain + randomness)
 
-        # Apply role exp boost if the member has a boosted role
         if message.guild and isinstance(message.author, discord.Member):
             member_role_ids = {role.id for role in message.author.roles}
-            async with get_db() as db:
-                async with db.execute(
-                    "SELECT boost_percent FROM exp_boosts WHERE guild_id = ? AND role_id IN ({})".format(
-                        ",".join("?" * len(member_role_ids))
-                    ),
-                    (message.guild.id, *member_role_ids)
-                ) as cursor:
-                    boost_rows = await cursor.fetchall()
-            if boost_rows:
-                # Use the highest boost the member qualifies for
-                best_boost = max(row[0] for row in boost_rows)
-                gained = int(gained * (1 + best_boost / 100))
+            if member_role_ids:
+                placeholders = ",".join("?" * len(member_role_ids))
+                async with get_db() as db:
+                    async with db.execute(
+                        f"SELECT boost_percent FROM exp_boosts WHERE guild_id = ? AND role_id IN ({placeholders})",
+                        (message.guild.id, *member_role_ids)
+                    ) as cursor:
+                        boost_rows = await cursor.fetchall()
+                if boost_rows:
+                    best_boost = max(row[0] for row in boost_rows)
+                    gained = int(gained * (1 + best_boost / 100))
 
         await add_exp(message.author.id, gained)
         last_message_exp[message.author.id] = now
@@ -495,10 +503,20 @@ async def on_message(message):
 @bot.event
 async def on_ready():
     await setup_database()
+
+    # ----------------------------------------------------------------
+    # ONE-TIME DUPLICATE FIX:
+    # If commands show twice, paste your guild ID below, deploy once,
+    # then delete these 4 lines and deploy again.
+    guild_to_clear = discord.Object(id=1494356360241090661)
+    bot.tree.clear_commands(guild=guild_to_clear)
+    await bot.tree.sync(guild=guild_to_clear)
+    print("Cleared guild-scoped commands.")
+    # ----------------------------------------------------------------
+
     try:
-        # Copy global commands into the guild tree so they register instantly
         synced = await bot.tree.sync(guild=None)
-        print(f"Synced {len(synced)} commands")
+        print(f"Synced {len(synced)} commands globally")
     except Exception as e:
         print(e)
     print(f"Logged in as {bot.user}")
@@ -507,7 +525,6 @@ async def on_ready():
     bot.loop.create_task(raffle_info_loop())
 
 # ---------------- CREATE GIVEAWAY ---------------- #
-# Change 1: added optional `channel` parameter
 
 @bot.tree.command(name="giveaway", description="Create a giveaway")
 @app_commands.describe(
@@ -930,8 +947,6 @@ async def rafflechance(interaction: discord.Interaction, user: discord.Member = 
     embed.add_field(name="Total Tickets", value=f"{total_tickets:,}", inline=False)
     await interaction.response.send_message(embed=embed)
 
-# Change 4: /setrafflechannel command
-
 @bot.tree.command(name="setrafflechannel", description="Set the channel where raffle winners are announced")
 @command_enabled()
 async def setrafflechannel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -949,17 +964,14 @@ async def setrafflechannel(interaction: discord.Interaction, channel: discord.Te
         f"✅ Raffle announcements will now be sent to {channel.mention}"
     )
 
-# Change 2: raffle fires at 18:00 UTC+2 (16:00 UTC) daily
+# ---------------- RAFFLE LOOP ---------------- #
 
 async def raffle_loop():
     await bot.wait_until_ready()
-
     while not bot.is_closed():
         now = datetime.now(UTC)
-        # Target: 16:00 UTC = 18:00 UTC+2
         target = now.replace(hour=16, minute=0, second=0, microsecond=0)
         if now >= target:
-            # Already past today's 16:00 UTC, schedule for tomorrow
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         print(f"[Raffle] Next draw in {wait_seconds:.0f}s at {target} UTC")
@@ -982,7 +994,6 @@ async def raffle_loop():
             winner_id = random.choice(pool)
             await add_balance(winner_id, RAFFLE_PRIZE)
 
-            # Change 4: use configured raffle channel, fall back to system channel
             announce_channel = None
             async with get_db() as db:
                 async with db.execute(
@@ -1007,18 +1018,16 @@ async def raffle_loop():
 
 CHEST_COST = 750
 
-# Change 5: Huge 4%, new 1k EXP 6%, totals still 100%
 CHEST_PRIZES = [
-    {"name": "250 EXP",    "exp": 250,   "balance": 0,     "chance": 40},
-    {"name": "450 EXP",    "exp": 450,   "balance": 0,     "chance": 30},
-    {"name": "1k EXP",     "exp": 1000,  "balance": 0,     "chance": 6},
-    {"name": "1k Balance", "exp": 0,     "balance": 1000,  "chance": 15},
-    {"name": "1 Huge",     "exp": 0,     "balance": 0,     "chance": 4},
-    {"name": "25m Gems",   "exp": 0,     "balance": 0,     "chance": 4},
-    {"name": "40k Balance","exp": 0,     "balance": 40000, "chance": 1},
+    {"name": "250 EXP",     "exp": 250,   "balance": 0,     "chance": 40},
+    {"name": "450 EXP",     "exp": 450,   "balance": 0,     "chance": 30},
+    {"name": "1k EXP",      "exp": 1000,  "balance": 0,     "chance": 6},
+    {"name": "1k Balance",  "exp": 0,     "balance": 1000,  "chance": 15},
+    {"name": "1 Huge",      "exp": 0,     "balance": 0,     "chance": 4},
+    {"name": "25m Gems",    "exp": 0,     "balance": 0,     "chance": 4},
+    {"name": "40k Balance", "exp": 0,     "balance": 40000, "chance": 1},
 ]
 
-# The 3 rarest chest prizes (by lowest chance) that trigger an announcement
 RARE_CHEST_PRIZES = {"1 Huge", "25m Gems", "40k Balance"}
 
 async def get_rare_drop_channel(guild_id: int) -> int | None:
@@ -1063,7 +1072,6 @@ async def removeautogiveaway(interaction: discord.Interaction, prize: str):
         await interaction.response.send_message(f"🗑 Removed auto giveaway: {prize}")
 
 # ---------------- START GIVEAWAYS ---------------- #
-# Change 1: added optional `channel` parameter
 
 @bot.tree.command(name="startgiveaways", description="Start automatic giveaways")
 @app_commands.describe(
@@ -1146,7 +1154,6 @@ async def startgiveaways(
     await interaction.response.send_message("✅ Automatic giveaways started.")
 
 # ---------------- STOP GIVEAWAYS ---------------- #
-# Change 1: added optional `channel` parameter (informational only, stopping is global)
 
 @bot.tree.command(name="stopgiveaways", description="Stop automatic giveaways")
 @command_enabled()
@@ -1248,7 +1255,6 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
     embed.set_footer(text=f"Opened {amount} chest(s)")
     await interaction.followup.send(embed=embed)
 
-    # Announce rare drops to the configured channel
     rare_items_won = {name: count for name, count in results.items() if name in RARE_CHEST_PRIZES}
     if rare_items_won:
         rare_channel_id = await get_rare_drop_channel(interaction.guild.id)
@@ -1260,10 +1266,7 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
                 )
                 rare_embed = discord.Embed(
                     title="🌟 Rare Drop!",
-                    description=(
-                        f"{interaction.user.mention} just got {prizes_text} "
-                        f"from a chest! 🎉"
-                    ),
+                    description=f"{interaction.user.mention} just got {prizes_text} from a chest! 🎉",
                     color=discord.Color.gold()
                 )
                 rare_embed.set_thumbnail(url=interaction.user.display_avatar.url)
@@ -1301,6 +1304,60 @@ async def removeexp(interaction: discord.Interaction, user: discord.Member, amou
         return
     await add_exp(user.id, -amount)
     await interaction.response.send_message(f"❌ Removed {amount} EXP from {user.mention}")
+
+# ---------------- INVENTORY HELPERS ---------------- #
+
+async def inventory_add(user_id: int, item_name: str, quantity: int = 1):
+    """Add quantity of an item to a user's inventory."""
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                """
+                INSERT INTO inventory (user_id, item_name, quantity)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, item_name)
+                DO UPDATE SET quantity = quantity + excluded.quantity
+                """,
+                (user_id, item_name, quantity)
+            )
+            await db.commit()
+
+async def inventory_remove(user_id: int, item_name: str, quantity: int = 1) -> bool:
+    """
+    Remove quantity of an item from a user's inventory.
+    Returns True on success, False if they don't have enough.
+    """
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?",
+                (user_id, item_name)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row or row[0] < quantity:
+                return False
+            new_qty = row[0] - quantity
+            if new_qty == 0:
+                await db.execute(
+                    "DELETE FROM inventory WHERE user_id = ? AND item_name = ?",
+                    (user_id, item_name)
+                )
+            else:
+                await db.execute(
+                    "UPDATE inventory SET quantity = ? WHERE user_id = ? AND item_name = ?",
+                    (new_qty, user_id, item_name)
+                )
+            await db.commit()
+    return True
+
+async def inventory_get(user_id: int) -> list[tuple[str, int]]:
+    """Return [(item_name, quantity), ...] for a user, ordered by name."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT item_name, quantity FROM inventory WHERE user_id = ? ORDER BY item_name",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchall()
 
 # ---------------- ITEM FUNCTIONS ---------------- #
 
@@ -1395,7 +1452,7 @@ async def item_store_cmd(interaction: discord.Interaction):
         )
     await interaction.response.send_message(embed=embed)
 
-@item_group.command(name="buy", description="Buy an item")
+@item_group.command(name="buy", description="Buy an item — it goes to your inventory")
 @command_enabled()
 async def item_buy(interaction: discord.Interaction, name: str):
     item = await get_item(name)
@@ -1403,33 +1460,156 @@ async def item_buy(interaction: discord.Interaction, name: str):
         await interaction.response.send_message("❌ Item not found.")
         return
     item_name, price, role_id, description = item
+
     balance = await get_balance(interaction.user.id)
     if balance < price:
         await interaction.response.send_message("❌ Not enough balance.")
         return
+
     role = interaction.guild.get_role(role_id)
     if not role:
         await interaction.response.send_message("❌ Role no longer exists.")
         return
-    member = interaction.guild.get_member(interaction.user.id)
-    if role in member.roles:
-        await interaction.response.send_message("❌ You already own this item.")
-        return
+
+    # Deduct balance and add to inventory — role is granted on /item use
     await add_balance(interaction.user.id, -price)
-    await member.add_roles(role)
+    await inventory_add(interaction.user.id, item_name, 1)
+
     await interaction.response.send_message(
-        f"✅ You bought **{item_name}** for {price:,} coins."
+        f"✅ You bought **{item_name}** for {price:,} coins.\n"
+        f"It's now in your inventory — use `/item use {item_name}` to redeem it!"
     )
 
+@item_group.command(name="use", description="Use an item from your inventory to receive its role")
+@command_enabled()
+async def item_use(interaction: discord.Interaction, name: str):
+    item = await get_item(name)
+    if not item:
+        await interaction.response.send_message("❌ Item not found in the store.")
+        return
+    item_name, price, role_id, description = item
+
+    inv = await inventory_get(interaction.user.id)
+    owned = {i[0].lower(): (i[0], i[1]) for i in inv}  # lower -> (real_name, qty)
+    if item_name.lower() not in owned or owned[item_name.lower()][1] < 1:
+        await interaction.response.send_message(
+            f"❌ You don't have **{item_name}** in your inventory."
+        )
+        return
+
+    role = interaction.guild.get_role(role_id)
+    if not role:
+        await interaction.response.send_message("❌ Role no longer exists.")
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if role in member.roles:
+        await interaction.response.send_message(
+            f"❌ You already have the **{role.name}** role."
+        )
+        return
+
+    removed = await inventory_remove(interaction.user.id, item_name, 1)
+    if not removed:
+        await interaction.response.send_message("❌ Failed to remove item from inventory.")
+        return
+
+    await member.add_roles(role)
+    await interaction.response.send_message(
+        f"✅ Used **{item_name}** — you've been given the {role.mention} role!"
+    )
+
+@item_group.command(name="give", description="Give an item to a user (admin only)")
+@app_commands.describe(user="Target user", name="Item name", quantity="How many to give (default 1)")
+@command_enabled()
+async def item_give(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    name: str,
+    quantity: int = 1
+):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    if quantity <= 0:
+        await interaction.response.send_message("❌ Quantity must be at least 1.", ephemeral=True)
+        return
+    item = await get_item(name)
+    if not item:
+        await interaction.response.send_message("❌ Item not found in the store.")
+        return
+    item_name = item[0]
+    await inventory_add(user.id, item_name, quantity)
+    await interaction.response.send_message(
+        f"✅ Gave **{quantity}x {item_name}** to {user.mention}."
+    )
+
+@item_group.command(name="take", description="Take an item from a user (admin only)")
+@app_commands.describe(user="Target user", name="Item name", quantity="How many to take (default 1)")
+@command_enabled()
+async def item_take(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    name: str,
+    quantity: int = 1
+):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    if quantity <= 0:
+        await interaction.response.send_message("❌ Quantity must be at least 1.", ephemeral=True)
+        return
+    item = await get_item(name)
+    if not item:
+        await interaction.response.send_message("❌ Item not found in the store.")
+        return
+    item_name = item[0]
+    removed = await inventory_remove(user.id, item_name, quantity)
+    if not removed:
+        await interaction.response.send_message(
+            f"❌ {user.mention} doesn't have {quantity}x **{item_name}**."
+        )
+        return
+    await interaction.response.send_message(
+        f"🗑 Took **{quantity}x {item_name}** from {user.mention}."
+    )
+
+@item_group.command(name="inv", description="Check a user's item inventory")
+@app_commands.describe(user="User to check (defaults to yourself)")
+@command_enabled()
+async def item_inv(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    inv = await inventory_get(user.id)
+
+    embed = discord.Embed(
+        title=f"🎒 {user.display_name}'s Inventory",
+        color=discord.Color.blurple()
+    )
+
+    if not inv:
+        embed.description = "No items in inventory."
+    else:
+        lines = []
+        for item_name, quantity in inv:
+            store_item = await get_item(item_name)
+            if store_item:
+                _, _, role_id, _ = store_item
+                role = interaction.guild.get_role(role_id)
+                role_text = f" → {role.mention}" if role else ""
+            else:
+                role_text = ""
+            lines.append(f"• **{item_name}** x{quantity}{role_text}")
+        embed.description = "\n".join(lines)
+
+    await interaction.response.send_message(embed=embed)
+
 # ---------------- ENABLE / DISABLE COMMANDS ---------------- #
-# Change 3: /enablecmd and /disablecmd
 
 @bot.tree.command(name="disablecmd", description="Temporarily disable a command")
 async def disablecmd(interaction: discord.Interaction, command_name: str):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
-    # Protect the enable/disable commands themselves from being disabled
     if command_name in ("disablecmd", "enablecmd"):
         await interaction.response.send_message(
             "❌ You cannot disable the enable/disable commands.", ephemeral=True
@@ -1479,27 +1659,19 @@ async def setraredropchannel(interaction: discord.Interaction, channel: discord.
 # ---------------- RAFFLE INFO CHANNEL ---------------- #
 
 def build_raffle_info_embed(guild: discord.Guild, total_tickets: int, top_entries: list) -> discord.Embed:
-    """Build the live raffle status embed."""
     now = datetime.now(UTC)
     target = now.replace(hour=16, minute=0, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
     end_ts = int(target.timestamp())
 
-    embed = discord.Embed(
-        title="🎟 Live Raffle Status",
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title="🎟 Live Raffle Status", color=discord.Color.gold())
     embed.add_field(
         name="⏰ Next Draw",
         value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)",
         inline=False
     )
-    embed.add_field(
-        name="🎫 Total Tickets in Pool",
-        value=f"{total_tickets:,}",
-        inline=False
-    )
+    embed.add_field(name="🎫 Total Tickets in Pool", value=f"{total_tickets:,}", inline=False)
 
     if top_entries:
         lines = []
@@ -1524,7 +1696,6 @@ async def setraffleinfochannel(interaction: discord.Interaction, channel: discor
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
 
-    # Fetch current raffle data to post the initial embed
     async with get_db() as db:
         async with db.execute(
             "SELECT user_id, tickets FROM raffle WHERE guild_id = ? ORDER BY tickets DESC LIMIT 5",
@@ -1553,7 +1724,6 @@ async def setraffleinfochannel(interaction: discord.Interaction, channel: discor
     )
 
 async def raffle_info_loop():
-    """Background task: refreshes the live raffle status embed every 60 seconds."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         async with get_db() as db:
@@ -1588,7 +1758,6 @@ async def raffle_info_loop():
                     msg = await channel.fetch_message(message_id)
                     await msg.edit(embed=embed)
                 except discord.NotFound:
-                    # Message was deleted — post a fresh one and update DB
                     new_msg = await channel.send(embed=embed)
                     async with db_lock:
                         async with get_db() as db:
@@ -1683,9 +1852,7 @@ async def leaderboard(interaction: discord.Interaction, category: app_commands.C
 
     async with get_db() as db:
         if value == "current_exp":
-            async with db.execute(
-                "SELECT DISTINCT user_id FROM exp_history"
-            ) as cursor:
+            async with db.execute("SELECT DISTINCT user_id FROM exp_history") as cursor:
                 users = await cursor.fetchall()
             for (user_id,) in users:
                 exp = await get_exp(user_id)
