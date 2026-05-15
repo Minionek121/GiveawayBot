@@ -635,9 +635,10 @@ async def end_giveaway(message_id, reroll=False):
     for user in users:
         level = await get_level(user.id)
         weight = min(100, max(1, level))
-        weighted_users.extend([user] * weight)
+        weighted_users.extend([user] * randint(1, weight))
 
     winners = []
+    random.shuffle(weighted_users)
     while len(winners) < min(winner_count, len(users)) and weighted_users:
         selected = random.choice(weighted_users)
         if selected not in winners:
@@ -858,7 +859,7 @@ async def add_tickets(guild_id, user_id, amount):
             )
             await db.commit()
 
-@bot.tree.command(name="buytickets", description="Buy raffle tickets")
+@bot.tree.command(name="buytickets", description="Buy raffle tickets for 100 balance each!")
 @command_enabled()
 async def buytickets(interaction: discord.Interaction, amount: int):
     if amount <= 0:
