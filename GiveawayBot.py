@@ -1249,7 +1249,7 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
         return
 
     exp = await get_exp(interaction.user.id)
-    if exp >= 20000:
+    if exp >= 1400:
         max_chests = exp // CHEST_COST
         amount = min(amount, max_chests)
     else:
