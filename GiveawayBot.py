@@ -492,9 +492,20 @@ async def on_message(message):
 
 # ---------------- READY EVENT ---------------- #
 
+
+GUILD_ID = 1494356360241090661  # Only guild — commands sync here instantly
+TARGET_GUILD = discord.Object(id=GUILD_ID)
+
 @bot.event
 async def on_ready():
     await setup_database()
+    try:
+        # Copy global commands into the guild tree so they register instantly
+        bot.tree.copy_global_to(guild=TARGET_GUILD)
+        synced = await bot.tree.sync(guild=TARGET_GUILD)
+        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
+    except Exception as e:
+        print(e)
     print(f"Logged in as {bot.user}")
     bot.loop.create_task(raffle_loop())
     bot.loop.create_task(giveaway_watcher())
@@ -634,8 +645,8 @@ async def end_giveaway(message_id, reroll=False):
     weighted_users = []
     for user in users:
         level = await get_level(user.id)
-        weight = min(100, max(1, level))
-        weighted_users.extend([user] * randint(1, weight))
+        weight = random.randint(1, min(100, max(1, level)))
+        weighted_users.extend([user] * weight)
 
     winners = []
     random.shuffle(weighted_users)
