@@ -1324,6 +1324,22 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
     )
     embed.set_footer(text=f"Opened {amount} chest(s)")
     await interaction.followup.send(embed=embed)
+    
+    # Rare drop announcement
+    rare_items_won = {name: count for name, count in results.items() if name in RARE_CHEST_PRIZES}
+    if rare_items_won:
+        rare_channel_id = await get_rare_drop_channel(interaction.guild.id)
+        if rare_channel_id:
+            rare_channel = bot.get_channel(rare_channel_id)
+            if rare_channel:
+                prizes_text = " and ".join(f"**{count}x {name}**" for name, count in rare_items_won.items())
+                rare_embed = discord.Embed(
+                    title="🌟 Rare Drop!",
+                    description=f"{interaction.user.mention} just got {prizes_text} from a chest! 🎉",
+                    color=discord.Color.gold()
+                )
+                rare_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                await rare_channel.send(embed=rare_embed)
 
 # ---------------- EXP COMMANDS ---------------- #
 
