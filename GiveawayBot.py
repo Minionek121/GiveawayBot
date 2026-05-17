@@ -774,7 +774,7 @@ async def raffle_loop():
 
 # ---------------- CHEST SYSTEM ---------------- #
 
-CHEST_COST = 750
+CHEST_COST = 1000
 CHEST_PRIZES = [
     {"name": "250 EXP",     "exp": 250,   "balance": 0,     "chance": 40},
     {"name": "450 EXP",     "exp": 450,   "balance": 0,     "chance": 30},
