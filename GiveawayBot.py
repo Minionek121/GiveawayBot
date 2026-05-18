@@ -1413,7 +1413,7 @@ async def vipchest(interaction: discord.Interaction, amount: int = 1):
     await interaction.response.defer()
     if amount <= 0:
         await interaction.followup.send("❌ Amount must be at least 1."); return
-    if amount > 10:
+    if amount > 1000:
         await interaction.followup.send("❌ You can open at most 10 VIP chests at once."); return
 
     # Check and consume keys
