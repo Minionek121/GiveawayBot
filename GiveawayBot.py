@@ -1093,7 +1093,7 @@ async def raffle_loop():
 
 # ---------------- CHEST SYSTEM ---------------- #
 
-CHEST_COST = 750
+CHEST_COST = 1000
 
 # Change 5: Huge 4%, new 1k EXP 6%, totals still 100%
 CHEST_PRIZES = [
