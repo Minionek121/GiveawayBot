@@ -1068,7 +1068,7 @@ async def get_chest_prizes(guild_id: int, chest_type: str) -> list[dict]:
     app_commands.Choice(name="VIP Chest",  value="vipchest")])
 @command_enabled()
 async def addchestprize(interaction: discord.Interaction, chest_type: str, name: str,
-                        exp: int = 0, balance: int = 0, chance: float = 10):
+                        exp: int = 0, balance: int = 0, chance: float = 10.0):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     if chance <= 0:
