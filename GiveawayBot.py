@@ -2887,6 +2887,75 @@ async def game_loop():
                 game_tasks[gid] = asyncio.create_task(guild_game_loop(gid))
         await asyncio.sleep(30)
 
+# ─── LEADERBOARD STAT MANAGEMENT ─────────────────────────────────────────────
+
+_STAT_CHOICES = [
+    app_commands.Choice(name="Total EXP",        value="total_exp"),
+    app_commands.Choice(name="Gifted Balance",    value="gifted_balance"),
+    app_commands.Choice(name="Chests Opened",     value="chests_opened"),
+    app_commands.Choice(name="Lifetime Tickets",  value="raffle_tickets_bought"),
+]
+
+@bot.tree.command(name="removetotalexp", description="Remove from a user's all-time total EXP stat")
+@app_commands.describe(user="Target user", amount="Amount to remove")
+@command_enabled()
+async def removetotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    await ensure_stats(user.id)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE user_stats SET total_exp = MAX(0, total_exp - ?) WHERE user_id = ?",
+                (amount, user.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"❌ Removed **{amount:,}** from {user.mention}'s total EXP stat.")
+
+@bot.tree.command(name="addleaderboardstat", description="Add to a user's leaderboard stat")
+@app_commands.describe(user="Target user", stat="Which stat to modify", amount="Amount to add")
+@app_commands.choices(stat=_STAT_CHOICES)
+@command_enabled()
+async def addleaderboardstat(interaction: discord.Interaction, user: discord.Member,
+                              stat: str, amount: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    await ensure_stats(user.id)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                f"UPDATE user_stats SET {stat} = {stat} + ? WHERE user_id = ?",
+                (amount, user.id))
+            await db.commit()
+    label = next(c.name for c in _STAT_CHOICES if c.value == stat)
+    await interaction.response.send_message(
+        f"✅ Added **{amount:,}** to {user.mention}'s **{label}**.")
+
+@bot.tree.command(name="removeleaderboardstat", description="Remove from a user's leaderboard stat")
+@app_commands.describe(user="Target user", stat="Which stat to modify", amount="Amount to remove")
+@app_commands.choices(stat=_STAT_CHOICES)
+@command_enabled()
+async def removeleaderboardstat(interaction: discord.Interaction, user: discord.Member,
+                                 stat: str, amount: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    await ensure_stats(user.id)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                f"UPDATE user_stats SET {stat} = MAX(0, {stat} - ?) WHERE user_id = ?",
+                (amount, user.id))
+            await db.commit()
+    label = next(c.name for c in _STAT_CHOICES if c.value == stat)
+    await interaction.response.send_message(
+        f"❌ Removed **{amount:,}** from {user.mention}'s **{label}**.")
+
 # ═══════════════════════════════════════════════════════
 # RUN BOT
 # ═══════════════════════════════════════════════════════
