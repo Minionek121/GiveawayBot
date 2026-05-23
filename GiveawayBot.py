@@ -2896,7 +2896,7 @@ _STAT_CHOICES = [
     app_commands.Choice(name="Lifetime Tickets",  value="raffle_tickets_bought"),
 ]
 
-@bot.tree.command(name="removetotalexp", description="Remove from a user's all-time total EXP stat")
+@bot.tree.command(name="removetotalexp", description="Remove from a user's Total EXP (7d) shown in /level")
 @app_commands.describe(user="Target user", amount="Amount to remove")
 @command_enabled()
 async def removetotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -2904,16 +2904,47 @@ async def removetotalexp(interaction: discord.Interaction, user: discord.Member,
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     if amount <= 0:
         await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
-    await ensure_stats(user.id)
+
+    week_ago  = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    remaining = amount
+
     async with db_lock:
         async with get_db() as db:
-            await db.execute(
-                "UPDATE user_stats SET total_exp = MAX(0, total_exp - ?) WHERE user_id = ?",
-                (amount, user.id))
-            await db.commit()
-    await interaction.response.send_message(
-        f"❌ Removed **{amount:,}** from {user.mention}'s total EXP stat.")
+            # Fetch positive entries oldest-first so we eat old EXP first
+            async with db.execute(
+                "SELECT rowid, amount FROM exp_history "
+                "WHERE user_id=? AND timestamp>=? AND amount>0 "
+                "ORDER BY timestamp ASC",
+                (user.id, week_ago)
+            ) as cur:
+                entries = await cur.fetchall()
 
+            for rowid, entry_amount in entries:
+                if remaining <= 0:
+                    break
+                if entry_amount <= remaining:
+                    await db.execute("DELETE FROM exp_history WHERE rowid=?", (rowid,))
+                    remaining -= entry_amount
+                else:
+                    await db.execute(
+                        "UPDATE exp_history SET amount=? WHERE rowid=?",
+                        (entry_amount - remaining, rowid))
+                    remaining = 0
+
+            await db.commit()
+
+    actually_removed = amount - remaining
+    if actually_removed == 0:
+        await interaction.response.send_message(
+            f"❌ {user.mention} has no Total EXP (7d) to remove.")
+    elif remaining > 0:
+        await interaction.response.send_message(
+            f"⚠️ Only removed **{actually_removed:,}** EXP from {user.mention}'s Total EXP (7d) "
+            f"— they didn't have the full {amount:,}.")
+    else:
+        await interaction.response.send_message(
+            f"❌ Removed **{amount:,}** from {user.mention}'s Total EXP (7d).")
+        
 @bot.tree.command(name="addleaderboardstat", description="Add to a user's leaderboard stat")
 @app_commands.describe(user="Target user", stat="Which stat to modify", amount="Amount to add")
 @app_commands.choices(stat=_STAT_CHOICES)
