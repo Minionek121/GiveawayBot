@@ -121,7 +121,7 @@ async def setup_database():
                 message_id INTEGER, channel_id INTEGER, prize TEXT, winners INTEGER,
                 reward INTEGER, end_time INTEGER, required_role INTEGER, template TEXT)""")
             await db.execute("CREATE TABLE IF NOT EXISTS balances(user_id INTEGER PRIMARY KEY, balance INTEGER)")
-            await db.execute("CREATE TABLE IF NOT EXISTS exp_history(user_id INTEGER, amount INTEGER, timestamp INTEGER)")
+            await db.execute("CREATE TABLE IF NOT EXISTS exp_history(user_id INTEGER, amount INTEGER, timestamp INTEGER, is_bonus INTEGER DEFAULT 0)")
             await db.execute("""CREATE TABLE IF NOT EXISTS raffle(
                 guild_id INTEGER, user_id INTEGER, tickets INTEGER, PRIMARY KEY(guild_id,user_id))""")
             await db.execute("CREATE TABLE IF NOT EXISTS giveaway_winners(message_id INTEGER PRIMARY KEY, winner_id INTEGER, reward INTEGER)")
@@ -182,6 +182,10 @@ async def setup_database():
                     await db.execute(f"ALTER TABLE giveaways ADD COLUMN {col[0]} {col[1]}")
                 except aiosqlite.OperationalError:
                     pass
+            try:
+                await db.execute("ALTER TABLE exp_history ADD COLUMN is_bonus INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError:
+                pass
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
             await db.execute("UPDATE spent_exp SET amount=0")
             await db.commit()
@@ -264,14 +268,14 @@ async def add_stat(user_id, column, amount):
 
 last_message_exp: dict[int, float] = {}
 
-async def add_exp(user_id, amount):
-    """Add EXP (or spend, if amount is negative). Only positive amounts count toward stats."""
-    if amount > 0:
+async def add_exp(user_id, amount, is_bonus=False):
+    if amount > 0 and not is_bonus:
         await add_stat(user_id, "total_exp", amount)
     async with db_lock:
         async with get_db() as db:
-            await db.execute("INSERT INTO exp_history VALUES(?,?,?)",
-                             (user_id, amount, int(datetime.now(UTC).timestamp())))
+            await db.execute(
+                "INSERT INTO exp_history(user_id, amount, timestamp, is_bonus) VALUES(?,?,?,?)",
+                (user_id, amount, int(datetime.now(UTC).timestamp()), 1 if is_bonus else 0))
             await db.commit()
 
 async def get_exp(user_id):
@@ -284,11 +288,12 @@ async def get_exp(user_id):
     return max(row[0] or 0, 0)
 
 async def get_level_exp(user_id):
-    """Level EXP = only positive entries in last 7 days (level never drops from spending)."""
     week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
     async with get_db() as db:
-        async with db.execute("SELECT SUM(amount) FROM exp_history WHERE user_id=? AND timestamp>=? AND amount>0",
-                              (user_id, week_ago)) as cur:
+        async with db.execute(
+            "SELECT SUM(amount) FROM exp_history "
+            "WHERE user_id=? AND timestamp>=? AND amount>0 AND is_bonus=0",
+            (user_id, week_ago)) as cur:
             row = await cur.fetchone()
     return max(row[0] or 0, 0)
 
@@ -543,13 +548,16 @@ async def level(interaction: discord.Interaction, user: discord.Member = None):
     embed.add_field(name="Usable EXP",      value=f"{usable:,}", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="addexp", description="Add EXP to a user")
+@bot.tree.command(name="addexp", description="Add usable EXP to a user — does NOT affect Total EXP (7d) or level")
 @command_enabled()
 async def addexp(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    await add_exp(user.id, amount)
-    await interaction.response.send_message(f"✅ Added {amount:,} EXP to {user.mention}")
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    await add_exp(user.id, amount, is_bonus=True)
+    await interaction.response.send_message(
+        f"✅ Added **{amount:,}** usable EXP to {user.mention} (Total EXP / level unchanged).")
 
 @bot.tree.command(name="removeexp", description="Remove EXP from a user")
 @command_enabled()
@@ -2896,7 +2904,31 @@ _STAT_CHOICES = [
     app_commands.Choice(name="Lifetime Tickets",  value="raffle_tickets_bought"),
 ]
 
-@bot.tree.command(name="removetotalexp", description="Remove from a user's Total EXP (7d) shown in /level")
+@bot.tree.command(name="addtotalexp", description="Add to Total EXP (7d) and level only — usable EXP stays the same")
+@app_commands.describe(user="Target user", amount="Amount to add")
+@command_enabled()
+async def addtotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    now = int(datetime.now(UTC).timestamp())
+    async with db_lock:
+        async with get_db() as db:
+            # Non-bonus positive entry → raises Total EXP (7d) and usable EXP
+            await db.execute(
+                "INSERT INTO exp_history(user_id, amount, timestamp, is_bonus) VALUES(?,?,?,?)",
+                (user.id, amount, now, 0))
+            # Matching negative entry → cancels out the usable EXP gain
+            await db.execute(
+                "INSERT INTO exp_history(user_id, amount, timestamp, is_bonus) VALUES(?,?,?,?)",
+                (user.id, -amount, now, 0))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Added **{amount:,}** to {user.mention}'s **Total EXP (7d)** and level. Usable EXP unchanged.")
+
+
+@bot.tree.command(name="removetotalexp", description="Remove from Total EXP (7d) and level only — usable EXP stays the same")
 @app_commands.describe(user="Target user", amount="Amount to remove")
 @command_enabled()
 async def removetotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -2907,6 +2939,49 @@ async def removetotalexp(interaction: discord.Interaction, user: discord.Member,
 
     week_ago  = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
     remaining = amount
+
+    async with db_lock:
+        async with get_db() as db:
+            # Only target positive non-bonus entries — the ones get_level_exp counts
+            async with db.execute(
+                "SELECT rowid, amount FROM exp_history "
+                "WHERE user_id=? AND timestamp>=? AND amount>0 AND is_bonus=0 "
+                "ORDER BY timestamp ASC",
+                (user.id, week_ago)
+            ) as cur:
+                entries = await cur.fetchall()
+
+            for rowid, entry_amount in entries:
+                if remaining <= 0:
+                    break
+                if entry_amount <= remaining:
+                    await db.execute("DELETE FROM exp_history WHERE rowid=?", (rowid,))
+                    remaining -= entry_amount
+                else:
+                    await db.execute(
+                        "UPDATE exp_history SET amount=? WHERE rowid=?",
+                        (entry_amount - remaining, rowid))
+                    remaining = 0
+
+            actually_removed = amount - remaining
+            if actually_removed > 0:
+                # Bonus entry restores the usable EXP that was lost by deleting entries above
+                await db.execute(
+                    "INSERT INTO exp_history(user_id, amount, timestamp, is_bonus) VALUES(?,?,?,?)",
+                    (user.id, actually_removed, int(datetime.now(UTC).timestamp()), 1))
+
+            await db.commit()
+
+    if actually_removed == 0:
+        await interaction.response.send_message(
+            f"❌ {user.mention} has no Total EXP (7d) to remove.")
+    elif remaining > 0:
+        await interaction.response.send_message(
+            f"⚠️ Only removed **{actually_removed:,}** from {user.mention}'s **Total EXP (7d)** "
+            f"— they didn't have the full {amount:,}. Usable EXP unchanged.")
+    else:
+        await interaction.response.send_message(
+            f"✅ Removed **{amount:,}** from {user.mention}'s **Total EXP (7d)** and level. Usable EXP unchanged.")
 
     async with db_lock:
         async with get_db() as db:
