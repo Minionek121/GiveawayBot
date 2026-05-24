@@ -535,7 +535,7 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
 # EXP COMMANDS
 # ═══════════════════════════════════════════════════════
 
-@bot.tree.command(name="xp", description="Check a user's Activity Rank and EXP")
+@bot.tree.command(name="activityrank", description="Check a user's Activity Rank and EXP")
 @command_enabled()
 async def level(interaction: discord.Interaction, user: discord.Member = None):
     user = user or interaction.user
