@@ -176,6 +176,12 @@ async def setup_database():
             await db.execute("""CREATE TABLE IF NOT EXISTS code_uses(
                 guild_id INTEGER, code TEXT, user_id INTEGER,
                 PRIMARY KEY(guild_id, code, user_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS rare_chest_config(
+                guild_id INTEGER, chest_type TEXT, prize_name TEXT,
+                PRIMARY KEY(guild_id, chest_type, prize_name))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS rare_box_config(
+                guild_id INTEGER, box_name TEXT, prize_id INTEGER,
+                PRIMARY KEY(guild_id, box_name, prize_id))""")
             # Migrations
             for col in [("ended", "INTEGER DEFAULT 0")]:
                 try:
@@ -1155,7 +1161,7 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
         await interaction.followup.send(f"❌ You need {total_cost:,} EXP (you have {exp:,})."); return
 
     prizes     = await get_chest_prizes(interaction.guild.id, "chest")
-    rare_names = {p["name"] for p in prizes if p["name"] in RARE_CHEST_PRIZES} or RARE_CHEST_PRIZES
+    rare_names = await get_rare_chest_names(interaction.guild.id, "chest")
     results: dict = {}
     total_balance = 0
     total_exp_won = 0
@@ -1212,7 +1218,7 @@ async def vipchest(interaction: discord.Interaction, amount: int = 1):
         await interaction.followup.send("❌ Failed to consume keys."); return
 
     prizes     = await get_chest_prizes(interaction.guild.id, "vipchest")
-    rare_names = {p["name"] for p in prizes if p["name"] in RARE_VIP_PRIZES} or RARE_VIP_PRIZES
+    rare_names = await get_rare_chest_names(interaction.guild.id, "vipchest")
     results: dict = {}
     total_balance = 0
     total_exp_won = 0
@@ -1294,6 +1300,133 @@ async def daily_key_loop():
                     await inventory_add(member.id, VIP_CHEST_KEY, 1)
                 except Exception as e:
                     print(f"[DailyKey] {member} / {guild.name}: {e}")
+
+# ─── RARE CHEST DROP CONFIG ───────────────────────────────────────────────────
+
+_CHEST_TYPE_CHOICES = [
+    app_commands.Choice(name="EXP Chest",  value="chest"),
+    app_commands.Choice(name="VIP Chest",  value="vipchest"),
+]
+
+@bot.tree.command(name="addrarechestdrop",
+                  description="Mark a chest prize as a rare drop (triggers announcement)")
+@app_commands.describe(chest_type="Which chest", prize="Prize name, or its numeric ID from /listchestprizes")
+@app_commands.choices(chest_type=_CHEST_TYPE_CHOICES)
+@command_enabled()
+async def addrarechestdrop(interaction: discord.Interaction, chest_type: str, prize: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    prize = prize.strip()
+    # If the user typed a numeric ID, resolve it to a name
+    try:
+        pid = int(prize)
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT name FROM chest_prizes WHERE id=? AND guild_id=? AND chest_type=?",
+                (pid, interaction.guild.id, chest_type)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await interaction.response.send_message(
+                f"❌ No custom prize #{pid} found in **{chest_type}**. "
+                f"Use `/listchestprizes` to see IDs.", ephemeral=True); return
+        prize = row[0]
+    except ValueError:
+        pass  # already a name string
+    async with db_lock:
+        async with get_db() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO rare_chest_config(guild_id, chest_type, prize_name) VALUES(?,?,?)",
+                    (interaction.guild.id, chest_type, prize))
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    f"❌ **{prize}** is already a rare drop for **{chest_type}**.",
+                    ephemeral=True); return
+    label = "EXP Chest" if chest_type == "chest" else "VIP Chest"
+    await interaction.response.send_message(
+        f"✅ **{prize}** is now a rare drop for the **{label}**.\n"
+        f"ℹ️ Once any custom rare drop is added, the hardcoded defaults are replaced for this server.")
+
+@bot.tree.command(name="removerarechestdrop",
+                  description="Unmark a chest prize as a rare drop")
+@app_commands.describe(chest_type="Which chest", prize="Prize name, or its numeric ID from /listchestprizes")
+@app_commands.choices(chest_type=_CHEST_TYPE_CHOICES)
+@command_enabled()
+async def removerarechestdrop(interaction: discord.Interaction, chest_type: str, prize: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    prize = prize.strip()
+    try:
+        pid = int(prize)
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT name FROM chest_prizes WHERE id=? AND guild_id=? AND chest_type=?",
+                (pid, interaction.guild.id, chest_type)) as cur:
+                row = await cur.fetchone()
+        if row: prize = row[0]
+    except ValueError:
+        pass
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM rare_chest_config WHERE guild_id=? AND chest_type=? AND prize_name=?",
+                (interaction.guild.id, chest_type, prize))
+            await db.commit()
+    label = "EXP Chest" if chest_type == "chest" else "VIP Chest"
+    await interaction.response.send_message(f"🗑 **{prize}** removed from rare drops for **{label}**.")
+
+# ─── RARE BOX DROP CONFIG ─────────────────────────────────────────────────────
+
+@bot.tree.command(name="addrarebox",
+                  description="Mark a box prize as a rare drop (triggers announcement in rare drop channel)")
+@app_commands.describe(box="Box name", prize_id="Prize ID from /listboxes")
+@command_enabled()
+async def addrarebox(interaction: discord.Interaction, box: str, prize_id: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute("SELECT box_name FROM abuse_boxes WHERE guild_id=? AND box_name=?",
+                              (interaction.guild.id, box)) as cur:
+            if not await cur.fetchone():
+                await interaction.response.send_message(f"❌ Box **{box}** not found.", ephemeral=True); return
+        async with db.execute(
+            "SELECT prize_type, prize_value FROM abuse_box_prizes "
+            "WHERE id=? AND guild_id=? AND box_name=?",
+            (prize_id, interaction.guild.id, box)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await interaction.response.send_message(
+            f"❌ Prize #{prize_id} not found in **{box}**. Use `/listboxes` to see IDs.",
+            ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO rare_box_config(guild_id, box_name, prize_id) VALUES(?,?,?)",
+                    (interaction.guild.id, box, prize_id))
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    f"❌ Prize #{prize_id} in **{box}** is already marked as rare.", ephemeral=True); return
+    p_type, p_value = row
+    await interaction.response.send_message(
+        f"✅ Prize `#{prize_id}` ({p_type}: **{p_value}**) in **{box}** is now a rare drop.")
+
+@bot.tree.command(name="removerarebox",
+                  description="Unmark a box prize as a rare drop")
+@app_commands.describe(box="Box name", prize_id="Prize ID from /listboxes")
+@command_enabled()
+async def removerarebox(interaction: discord.Interaction, box: str, prize_id: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM rare_box_config WHERE guild_id=? AND box_name=? AND prize_id=?",
+                (interaction.guild.id, box, prize_id))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 Prize #{prize_id} in **{box}** is no longer a rare drop.")
 
 # ═══════════════════════════════════════════════════════
 # ITEM STORE
@@ -1638,6 +1771,26 @@ async def get_rare_drop_channel(guild_id: int):
                               (guild_id,)) as cur:
             row = await cur.fetchone()
     return row[0] if row else None
+
+async def get_rare_chest_names(guild_id: int, chest_type: str) -> set[str]:
+    """Returns custom rare-drop names if configured, else falls back to hardcoded defaults."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT prize_name FROM rare_chest_config WHERE guild_id=? AND chest_type=?",
+            (guild_id, chest_type)) as cur:
+            rows = await cur.fetchall()
+    if rows:
+        return {r[0] for r in rows}
+    return RARE_CHEST_PRIZES if chest_type == "chest" else RARE_VIP_PRIZES
+
+async def get_rare_box_ids(guild_id: int, box_name: str) -> set[int]:
+    """Returns the prize IDs that trigger a rare-drop announcement for this box."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT prize_id FROM rare_box_config WHERE guild_id=? AND box_name=?",
+            (guild_id, box_name)) as cur:
+            rows = await cur.fetchall()
+    return {r[0] for r in rows}
 
 @bot.tree.command(name="setraredropchannel", description="Set channel for rare chest drop announcements")
 @command_enabled()
@@ -2164,42 +2317,54 @@ async def openbox(interaction: discord.Interaction, box: str, amount: int = 1):
     await interaction.response.defer()
     if amount <= 0:  await interaction.followup.send("❌ Amount must be ≥ 1."); return
     if amount > 20:  await interaction.followup.send("❌ Max 20 boxes at once."); return
+
     inv   = await inventory_get(interaction.user.id)
     owned = {n.lower(): (n, q) for n, q in inv}
     if box.lower() not in owned or owned[box.lower()][1] < amount:
         have = owned.get(box.lower(), (box, 0))[1]
-        await interaction.followup.send(f"❌ Need {amount}x **{box}** but only have {have}."); return
+        await interaction.followup.send(f"❌ Need {amount}x **{box}** but you only have {have}."); return
+
     canonical_box = owned[box.lower()][0]
     async with get_db() as db:
         async with db.execute("SELECT box_name FROM abuse_boxes WHERE guild_id=? AND box_name=?",
                               (interaction.guild.id, canonical_box)) as cur:
             if not await cur.fetchone():
-                await interaction.followup.send(f"❌ Box **{canonical_box}** no longer exists."); return
+                await interaction.followup.send(f"❌ Box **{canonical_box}** no longer exists on this server."); return
+        # Include the prize ID so we can check rare_box_config
         async with db.execute(
-            "SELECT prize_type,prize_value,prize_amount,chance FROM abuse_box_prizes "
+            "SELECT id, prize_type, prize_value, prize_amount, chance FROM abuse_box_prizes "
             "WHERE guild_id=? AND box_name=?",
             (interaction.guild.id, canonical_box)) as cur:
             prizes = await cur.fetchall()
+
     if not prizes:
-        await interaction.followup.send(f"❌ **{canonical_box}** has no prizes."); return
+        await interaction.followup.send(f"❌ **{canonical_box}** has no prizes configured."); return
     if not await inventory_remove(interaction.user.id, canonical_box, amount):
         await interaction.followup.send("❌ Failed to remove boxes."); return
 
-    results: dict = {}
+    rare_ids = await get_rare_box_ids(interaction.guild.id, canonical_box)
+    results:     dict[str, int] = {}
+    rare_wins:   dict[str, int] = {}
     total_balance = 0
     total_exp     = 0
-    item_grants: dict = {}
+    item_grants:  dict[str, int] = {}
+
     for _ in range(amount):
-        p_type, p_value, p_amount, _ = random.choices(prizes, weights=[p[3] for p in prizes], k=1)[0]
+        p_id, p_type, p_value, p_amount, _ = random.choices(
+            prizes, weights=[p[4] for p in prizes], k=1)[0]
+
         if p_type == "balance":
-            amt = int(p_value); total_balance += amt; key_r = f"💰 {amt:,} coins"
+            amt = int(p_value); total_balance += amt; label = f"💰 {amt:,} coins"
         elif p_type == "exp":
-            amt = int(p_value); total_exp += amt;    key_r = f"⭐ {amt:,} EXP"
+            amt = int(p_value); total_exp += amt;    label = f"⭐ {amt:,} EXP"
         elif p_type == "item":
-            item_grants[p_value] = item_grants.get(p_value, 0) + 1; key_r = f"🎒 {p_value}"
-        elif p_type == "nothing": key_r = f"😔 {p_value}"
-        else:                     key_r = f"✨ {p_value}"
-        results[key_r] = results.get(key_r, 0) + 1
+            item_grants[p_value] = item_grants.get(p_value, 0) + 1; label = f"🎒 {p_value}"
+        elif p_type == "nothing": label = f"😔 {p_value}"
+        else:                     label = f"✨ {p_value}"
+
+        results[label] = results.get(label, 0) + 1
+        if p_id in rare_ids:
+            rare_wins[label] = rare_wins.get(label, 0) + 1
 
     if total_balance > 0: await add_balance(interaction.user.id, total_balance)
     if total_exp > 0:     await add_exp(interaction.user.id, total_exp)
@@ -2208,10 +2373,22 @@ async def openbox(interaction: discord.Interaction, box: str, amount: int = 1):
         await inventory_add(interaction.user.id, si[0] if si else iname, qty)
 
     result_text = "\n".join(f"• {count}x {desc}" for desc, count in results.items())
-    embed = discord.Embed(title=f"📦 {canonical_box} × {amount}", description=result_text,
-                          color=discord.Color.orange())
+    embed = discord.Embed(title=f"📦 {canonical_box} × {amount}",
+                          description=result_text, color=discord.Color.orange())
     embed.set_thumbnail(url=interaction.user.display_avatar.url)
     await interaction.followup.send(embed=embed)
+
+    if rare_wins:
+        rcid = await get_rare_drop_channel(interaction.guild.id)
+        if rcid:
+            rc = bot.get_channel(rcid)
+            if rc:
+                text = " and ".join(f"**{c}x {n}**" for n, c in rare_wins.items())
+                re   = discord.Embed(title="🎁 Rare Box Drop!",
+                    description=f"{interaction.user.mention} pulled {text} from a **{canonical_box}**! 🎉",
+                    color=discord.Color.orange())
+                re.set_thumbnail(url=interaction.user.display_avatar.url)
+                await rc.send(embed=re)
 
 # ═══════════════════════════════════════════════════════
 # CODE SYSTEM
@@ -2452,6 +2629,197 @@ async def daily_gamble_loop():
                 except Exception as e:
                     print(f"[DailyGamble] {member} / {guild.name}: {e}")
 
+# ─── BLACKJACK ────────────────────────────────────────────────────────────────
+
+_BJ_RANKS = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]
+_BJ_SUITS = ["♠","♥","♦","♣"]
+
+def _bj_deck():
+    d = [(r, s) for r in _BJ_RANKS for s in _BJ_SUITS]
+    random.shuffle(d)
+    return d
+
+def _bj_val(hand: list) -> int:
+    total, aces = 0, 0
+    for r, _ in hand:
+        if r in ("J","Q","K"): total += 10
+        elif r == "A":         total += 11; aces += 1
+        else:                  total += int(r)
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+def _bj_fmt(hand: list) -> str:
+    return " ".join(f"{r}{s}" for r, s in hand)
+
+def _bj_rank_int(card) -> int:
+    r = card[0]
+    if r in ("J","Q","K"): return 10
+    if r == "A":           return 11
+    return int(r)
+
+
+class _BJState:
+    def __init__(self, deck, hand, dealer, bet, user_id, tokens):
+        self.deck   = deck
+        self.hands  = [list(hand)]   # grows on split
+        self.dealer = list(dealer)
+        self.bets   = [bet]          # parallel to hands; doubled on double-down
+        self.active = 0              # index of the hand currently being played
+        self.first  = True           # False after first action (disables double/split)
+        self.uid    = user_id
+        self.tokens = tokens
+
+
+class _BJView(discord.ui.View):
+    def __init__(self, state: _BJState):
+        super().__init__(timeout=60)
+        self.state = state
+        self._refresh()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _refresh(self):
+        s    = self.state
+        hand = s.hands[s.active]
+        can_dd    = s.first and len(hand) == 2
+        can_split = can_dd and _bj_rank_int(hand[0]) == _bj_rank_int(hand[1])
+        for btn in self.children:
+            if btn.label == "Double": btn.disabled = not can_dd
+            elif btn.label == "Split": btn.disabled = not can_split
+
+    def _embed(self, note: str = "") -> discord.Embed:
+        s  = self.state
+        h  = s.hands[s.active]
+        v  = _bj_val(h)
+        n  = len(s.hands)
+        title = f"🃏 Blackjack — Hand {s.active+1}/{n}" if n > 1 else "🃏 Blackjack"
+        rows  = [f"**{_bj_fmt(h)}** ({v})",
+                 f"Dealer: **{s.dealer[0][0]}{s.dealer[0][1]}** + ??"]
+        if n > 1:
+            for i, hh in enumerate(s.hands):
+                if i != s.active:
+                    rows.append(f"Hand {i+1}: {_bj_fmt(hh)} ({_bj_val(hh)})")
+        if note: rows.append(f"\n{note}")
+        bets_str = (
+            " | ".join(f"H{i+1}: {b:,}" for i, b in enumerate(s.bets))
+            if n > 1 else f"Bet: {s.bets[0]:,}"
+        )
+        embed = discord.Embed(title=title, description="\n".join(rows), color=discord.Color.blue())
+        embed.set_footer(text=bets_str)
+        return embed
+
+    async def _resolve(self, inter: discord.Interaction):
+        s = self.state
+        while _bj_val(s.dealer) < 17:
+            s.dealer.append(s.deck.pop())
+        dv = _bj_val(s.dealer)
+        lines, delta = [], 0
+        for i, (h, bet) in enumerate(zip(s.hands, s.bets)):
+            pv  = _bj_val(h)
+            lbl = f"H{i+1}" if len(s.hands) > 1 else "You"
+            if pv > 21:
+                lines.append(f"{lbl}: 💸 Bust ({pv}) −{bet:,}");       delta -= bet
+            elif dv > 21 or pv > dv:
+                lines.append(f"{lbl}: 🏆 Win ({pv} vs {dv}) +{bet:,}"); delta += bet
+            elif pv == dv:
+                lines.append(f"{lbl}: 🤝 Push ({pv})")
+            else:
+                lines.append(f"{lbl}: 💸 Loss ({pv} vs {dv}) −{bet:,}"); delta -= bet
+        if delta: await add_balance(s.uid, delta)
+        color = (discord.Color.green() if delta > 0
+                 else discord.Color.red() if delta < 0
+                 else discord.Color.greyple())
+        hs    = "\n".join(f"{_bj_fmt(h)} ({_bj_val(h)})" for h in s.hands)
+        embed = discord.Embed(title="🃏 Blackjack — Result", color=color,
+                              description=(f"Your hand(s):\n{hs}\n"
+                                           f"Dealer: {_bj_fmt(s.dealer)} ({dv})\n\n"
+                                           + "\n".join(lines)))
+        await inter.response.edit_message(embed=embed, view=None)
+        self.stop()
+
+    async def _next(self, inter: discord.Interaction):
+        """Advance to the next hand, or resolve if all hands are done."""
+        s = self.state
+        s.active += 1
+        s.first   = True
+        if s.active >= len(s.hands):
+            await self._resolve(inter)
+        else:
+            if _bj_val(s.hands[s.active]) == 21:   # auto-stand on 21
+                await self._next(inter)
+            else:
+                self._refresh()
+                await inter.response.edit_message(
+                    embed=self._embed(f"Now playing Hand {s.active+1} of {len(s.hands)}."),
+                    view=self)
+
+    # ── interaction guard ────────────────────────────────────────────────────
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.state.uid:
+            await inter.response.send_message("Not your game.", ephemeral=True)
+            return False
+        return True
+
+    # ── buttons ──────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="➕")
+    async def hit(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self.state
+        s.first = False
+        s.hands[s.active].append(s.deck.pop())
+        v = _bj_val(s.hands[s.active])
+        if v >= 21:
+            await self._next(inter)
+        else:
+            self._refresh()
+            await inter.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="✋")
+    async def stand(self, inter: discord.Interaction, btn: discord.ui.Button):
+        self.state.first = False
+        await self._next(inter)
+
+    @discord.ui.button(label="Double", style=discord.ButtonStyle.success, emoji="⬆️")
+    async def double(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self.state
+        if not s.first:
+            await inter.response.send_message("❌ Too late to double.", ephemeral=True); return
+        extra = s.bets[s.active]
+        if await get_balance(s.uid) < extra:
+            await inter.response.send_message(
+                f"❌ You need {extra:,} extra coins to double.", ephemeral=True); return
+        s.bets[s.active] *= 2   # bet doubles; resolved at the end, no upfront deduction
+        s.first = False
+        s.hands[s.active].append(s.deck.pop())
+        await self._next(inter)
+
+    @discord.ui.button(label="Split", style=discord.ButtonStyle.danger, emoji="✂️", disabled=True)
+    async def split_btn(self, inter: discord.Interaction, btn: discord.ui.Button):
+        s = self.state
+        if not s.first:
+            await inter.response.send_message("❌ Too late to split.", ephemeral=True); return
+        hand  = s.hands[s.active]
+        extra = s.bets[s.active]
+        if await get_balance(s.uid) < extra:
+            await inter.response.send_message(
+                f"❌ You need {extra:,} extra coins to split.", ephemeral=True); return
+        c1, c2 = hand[0], hand[1]
+        s.hands[s.active]         = [c1, s.deck.pop()]
+        s.hands.insert(s.active+1,  [c2, s.deck.pop()])
+        s.bets.insert(s.active+1, extra)
+        s.first = True
+        self._refresh()
+        await inter.response.edit_message(
+            embed=self._embed(f"✂️ Split into {len(s.hands)} hands! Playing Hand 1."),
+            view=self)
+
+    async def on_timeout(self):
+        # Forfeit all outstanding bets since game was abandoned
+        await add_balance(self.state.uid, -sum(self.state.bets))
+
+
 @bot.tree.command(name="blackjack", description="Play blackjack — costs 1 Gamble Token")
 @app_commands.describe(bet="Amount of coins to bet")
 @command_enabled()
@@ -2460,111 +2828,98 @@ async def blackjack(interaction: discord.Interaction, bet: int):
         await interaction.response.send_message("❌ Gambling system is disabled.", ephemeral=True); return
     if bet <= 0:
         await interaction.response.send_message("❌ Bet must be > 0.", ephemeral=True); return
-    bal    = await get_balance(interaction.user.id)
+    bal = await get_balance(interaction.user.id)
     if bal < bet:
-        await interaction.response.send_message(f"❌ Not enough balance (you have {bal:,}).",
-                                                ephemeral=True); return
+        await interaction.response.send_message(f"❌ Not enough balance ({bal:,}).", ephemeral=True); return
     tokens = await get_gamble_tokens(interaction.user.id)
     if tokens < 1:
         await interaction.response.send_message(
-            f"❌ You need 1 {GAMBLE_TOKEN} to play. You get one daily (Nitro Boosters get 2)!",
+            f"❌ You need 1 {GAMBLE_TOKEN} to play. You receive one daily (Nitro Boosters get 2)!",
             ephemeral=True); return
     await inventory_remove(interaction.user.id, GAMBLE_TOKEN, 1)
 
-    suits  = ["♠", "♥", "♦", "♣"]
-    ranks  = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]
-    def new_deck():
-        return [(r, s) for r in ranks for s in suits]
-    def card_value(hand):
-        total, aces = 0, 0
-        for rank, _ in hand:
-            if rank in ("J", "Q", "K"): total += 10
-            elif rank == "A":            total += 11; aces += 1
-            else:                        total += int(rank)
-        while total > 21 and aces:
-            total -= 10; aces -= 1
-        return total
-    def fmt(hand):
-        return " ".join(f"{r}{s}" for r, s in hand)
+    deck  = _bj_deck()
+    phand = [deck.pop(), deck.pop()]
+    dhand = [deck.pop(), deck.pop()]
 
-    deck         = new_deck()
-    random.shuffle(deck)
-    player_hand  = [deck.pop(), deck.pop()]
-    dealer_hand  = [deck.pop(), deck.pop()]
-    player_total = card_value(player_hand)
-
-    if player_total == 21:
-        winnings = int(bet * 1.5)
-        await add_balance(interaction.user.id, winnings)
-        embed = discord.Embed(title="🃏 Blackjack — Natural 21!", color=discord.Color.gold(),
-            description=(f"Your hand: **{fmt(player_hand)}** ({player_total})\n"
-                         f"Dealer: **{fmt(dealer_hand)}** ({card_value(dealer_hand)})\n\n"
-                         f"🏆 **Blackjack! You win {winnings:,} coins!**"))
+    # Natural blackjack (21 on first two cards)
+    if _bj_val(phand) == 21:
+        win = int(bet * 1.5)
+        await add_balance(interaction.user.id, win)
+        embed = discord.Embed(
+            title="🃏 Blackjack — Natural 21! 🎉", color=discord.Color.gold(),
+            description=(f"**{_bj_fmt(phand)}** (21)\n"
+                         f"Dealer: **{_bj_fmt(dhand)}** ({_bj_val(dhand)})\n\n"
+                         f"🏆 **Blackjack! +{win:,} coins** (1.5× payout)"))
         await interaction.response.send_message(embed=embed); return
 
-    class BJView(discord.ui.View):
-        def __init__(self_):
-            super().__init__(timeout=60)
+    state = _BJState(deck, phand, dhand, bet, interaction.user.id, tokens)
+    view  = _BJView(state)
+    await interaction.response.send_message(embed=view._embed(), view=view)
 
-        @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="➕")
-        async def hit(self_, inter: discord.Interaction, button: discord.ui.Button):
-            if inter.user.id != interaction.user.id:
-                await inter.response.send_message("Not your game.", ephemeral=True); return
-            player_hand.append(deck.pop())
-            total = card_value(player_hand)
-            if total > 21:
-                self_.stop()
-                await add_balance(interaction.user.id, -bet)
-                await inter.response.edit_message(
-                    embed=discord.Embed(title="🃏 Blackjack — Bust!", color=discord.Color.red(),
-                        description=(f"Your hand: **{fmt(player_hand)}** ({total})\n\n"
-                                     f"💸 **Busted! Lost {bet:,} coins.**")), view=None)
-            else:
-                await inter.response.edit_message(
-                    embed=discord.Embed(title="🃏 Blackjack", color=discord.Color.blue(),
-                        description=(f"Your hand: **{fmt(player_hand)}** ({total})\n"
-                                     f"Dealer: **{dealer_hand[0][0]}{dealer_hand[0][1]}** + ??\n\n"
-                                     f"Bet: {bet:,} | Hit or Stand?")), view=self_)
+# ─── ROULETTE ─────────────────────────────────────────────────────────────────
 
-        @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="✋")
-        async def stand(self_, inter: discord.Interaction, button: discord.ui.Button):
-            if inter.user.id != interaction.user.id:
-                await inter.response.send_message("Not your game.", ephemeral=True); return
-            self_.stop()
-            while card_value(dealer_hand) < 17:
-                dealer_hand.append(deck.pop())
-            p = card_value(player_hand)
-            d = card_value(dealer_hand)
-            if d > 21 or p > d:
-                await add_balance(interaction.user.id, bet)
-                result = f"🏆 **You win {bet:,} coins!** (Your {p} vs Dealer {d})"
-                color  = discord.Color.green()
-            elif p == d:
-                result = f"🤝 **Push!** (Both {p})"
-                color  = discord.Color.greyple()
-            else:
-                await add_balance(interaction.user.id, -bet)
-                result = f"💸 **Dealer wins. Lost {bet:,} coins.** (Your {p} vs Dealer {d})"
-                color  = discord.Color.red()
-            await inter.response.edit_message(
-                embed=discord.Embed(title="🃏 Blackjack — Result", color=color,
-                    description=(f"Your hand: **{fmt(player_hand)}** ({p})\n"
-                                 f"Dealer: **{fmt(dealer_hand)}** ({d})\n\n{result}")),
-                view=None)
+_R_RED   = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+_R_BLACK = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+_R_EVEN  = {n for n in range(2, 37, 2)}
+_R_ODD   = {n for n in range(1, 37, 2)}
+_R_LOW   = set(range(1, 19))
+_R_HIGH  = set(range(19, 37))
+_R_COL1  = {n for n in range(1, 37) if n % 3 == 1}   # 1st column: 3n+1
+_R_COL2  = {n for n in range(1, 37) if n % 3 == 2}   # 2nd column: 3n+2
+_R_COL3  = {n for n in range(1, 37) if n % 3 == 0}   # 3rd column: divisible by 3
+_R_DOZ1  = set(range(1, 13))
+_R_DOZ2  = set(range(13, 25))
+_R_DOZ3  = set(range(25, 37))
 
-        async def on_timeout(self_):
-            await add_balance(interaction.user.id, -bet)
+_R_BETS: dict[str, tuple[str, set[int], int]] = {
+    # ×2 even-money bets (0 not included in any)
+    "red":    ("🔴 Red",          _R_RED,   2),
+    "black":  ("⚫ Black",        _R_BLACK, 2),
+    "even":   ("Even",            _R_EVEN,  2),
+    "odd":    ("Odd",             _R_ODD,   2),
+    "low":    ("1–18 (Low)",      _R_LOW,   2),
+    "1-18":   ("1–18 (Low)",      _R_LOW,   2),
+    "high":   ("19–36 (High)",    _R_HIGH,  2),
+    "19-36":  ("19–36 (High)",    _R_HIGH,  2),
+    # ×3 dozens
+    "1-12":   ("1st Dozen (1–12)",   _R_DOZ1, 3),
+    "dozen1": ("1st Dozen (1–12)",   _R_DOZ1, 3),
+    "13-24":  ("2nd Dozen (13–24)", _R_DOZ2, 3),
+    "dozen2": ("2nd Dozen (13–24)", _R_DOZ2, 3),
+    "25-36":  ("3rd Dozen (25–36)", _R_DOZ3, 3),
+    "dozen3": ("3rd Dozen (25–36)", _R_DOZ3, 3),
+    # ×3 columns
+    "col1":   ("1st Column (3n+1)", _R_COL1, 3),
+    "1st":    ("1st Column (3n+1)", _R_COL1, 3),
+    "col2":   ("2nd Column (3n+2)", _R_COL2, 3),
+    "2nd":    ("2nd Column (3n+2)", _R_COL2, 3),
+    "col3":   ("3rd Column (÷3)",   _R_COL3, 3),
+    "3rd":    ("3rd Column (÷3)",   _R_COL3, 3),
+}
 
-    embed = discord.Embed(title="🃏 Blackjack", color=discord.Color.blue(),
-        description=(f"Your hand: **{fmt(player_hand)}** ({player_total})\n"
-                     f"Dealer: **{dealer_hand[0][0]}{dealer_hand[0][1]}** + ??\n\n"
-                     f"**Bet: {bet:,} coins** | Hit or Stand?"))
-    embed.set_footer(text=f"1 {GAMBLE_TOKEN} consumed | {tokens - 1} remaining")
-    await interaction.response.send_message(embed=embed, view=BJView())
+def _r_parse(choice: str) -> tuple[str, set[int], int] | None:
+    """Return (label, winning_numbers, multiplier) or None if invalid."""
+    c = choice.lower().strip()
+    if c in _R_BETS:
+        return _R_BETS[c]
+    try:
+        n = int(c)
+        if 0 <= n <= 36:
+            return (f"Number {n}", {n}, 36)
+    except ValueError:
+        pass
+    return None
+
 
 @bot.tree.command(name="roulette", description="Play roulette — costs 1 Gamble Token")
-@app_commands.describe(bet="Amount of coins to bet",
-                       choice="red/black (2x), even/odd (2x), or a number 0–36 (35x)")
+@app_commands.describe(
+    bet="Coins to bet",
+    choice=(
+        "×36: 0–36  |  ×2: red black even odd 1-18 19-36  |  "
+        "×3 dozen: 1-12 13-24 25-36  |  ×3 col: col1/1st  col2/2nd  col3/3rd"
+    ),
+)
 @command_enabled()
 async def roulette(interaction: discord.Interaction, bet: int, choice: str):
     if not await is_system_enabled(interaction.guild.id, "gamble"):
@@ -2576,42 +2931,55 @@ async def roulette(interaction: discord.Interaction, bet: int, choice: str):
         await interaction.response.send_message(f"❌ Not enough balance ({bal:,}).", ephemeral=True); return
     tokens = await get_gamble_tokens(interaction.user.id)
     if tokens < 1:
-        await interaction.response.send_message(f"❌ You need 1 {GAMBLE_TOKEN} to play.",
-                                                ephemeral=True); return
-    choice = choice.lower().strip()
-    RED   = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
-    BLACK = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
-    is_number, chosen_number = False, -1
-    if choice not in ("red", "black", "even", "odd"):
-        try:
-            chosen_number = int(choice)
-            assert 0 <= chosen_number <= 36
-            is_number = True
-        except (ValueError, AssertionError):
-            await interaction.response.send_message(
-                "❌ Choice must be red, black, even, odd, or a number 0–36.", ephemeral=True); return
+        await interaction.response.send_message(f"❌ You need 1 {GAMBLE_TOKEN} to play.", ephemeral=True); return
+
+    parsed = _r_parse(choice)
+    if parsed is None:
+        await interaction.response.send_message(
+            f"❌ Invalid choice `{choice}`.\n\n"
+            "**×36** — single number `0`–`36`\n"
+            "**×2** — `red` `black` `even` `odd` `1-18` `19-36`\n"
+            "**×3 dozens** — `1-12` `13-24` `25-36`  *(aliases: dozen1 / dozen2 / dozen3)*\n"
+            "**×3 columns** — `col1`/`1st` (3n+1) · `col2`/`2nd` (3n+2) · `col3`/`3rd` (3n)\n\n"
+            "*0 only wins on a direct single-number bet.*",
+            ephemeral=True)
+        return
+
+    bet_label, winning_set, multiplier = parsed
     await inventory_remove(interaction.user.id, GAMBLE_TOKEN, 1)
-    result       = random.randint(0, 36)
-    result_color = "🟢 Green" if result == 0 else ("🔴 Red" if result in RED else "⚫ Black")
-    result_parity = "0" if result == 0 else ("Even" if result % 2 == 0 else "Odd")
-    won, multiplier = False, 0
-    if choice == "red"   and result in RED:             won = True; multiplier = 2
-    elif choice == "black" and result in BLACK:         won = True; multiplier = 2
-    elif choice == "even"  and result > 0 and result % 2 == 0: won = True; multiplier = 2
-    elif choice == "odd"   and result % 2 == 1:         won = True; multiplier = 2
-    elif is_number and chosen_number == result:         won = True; multiplier = 35
-    if won:
+    result = random.randint(0, 36)
+
+    # Build a human-readable description of the result
+    if result == 0:
+        result_str = "🟢 **0** (Green)"
+    else:
+        col  = "🔴 Red" if result in _R_RED else "⚫ Black"
+        par  = "Even" if result % 2 == 0 else "Odd"
+        half = "1–18" if result <= 18 else "19–36"
+        if result in _R_COL1:    col_lbl = "Col 1"
+        elif result in _R_COL2:  col_lbl = "Col 2"
+        else:                    col_lbl = "Col 3"
+        if result in _R_DOZ1:    doz_lbl = "Doz 1"
+        elif result in _R_DOZ2:  doz_lbl = "Doz 2"
+        else:                    doz_lbl = "Doz 3"
+        result_str = f"{col} **{result}** ({par}, {half}, {col_lbl}, {doz_lbl})"
+
+    if result in winning_set:
         winnings = bet * (multiplier - 1)
         await add_balance(interaction.user.id, winnings)
-        outcome = f"🏆 **You win {winnings:,} coins!** ({multiplier}x)"
+        outcome = f"🏆 **You win {winnings:,} coins!** ({multiplier}×)"
         color   = discord.Color.green()
     else:
         await add_balance(interaction.user.id, -bet)
         outcome = f"💸 **You lose {bet:,} coins.**"
         color   = discord.Color.red()
+
     embed = discord.Embed(title="🎰 Roulette", color=color,
-        description=(f"Ball landed on **{result}** ({result_color}, {result_parity})\n"
-                     f"Your bet: **{choice}** for **{bet:,} coins**\n\n{outcome}"))
+        description=(
+            f"Ball landed on: {result_str}\n"
+            f"Your bet: **{bet_label}** for **{bet:,} coins** ({multiplier}×)\n\n"
+            f"{outcome}"
+        ))
     embed.set_footer(text=f"1 {GAMBLE_TOKEN} consumed | {tokens - 1} remaining")
     await interaction.response.send_message(embed=embed)
 
@@ -3061,6 +3429,193 @@ async def removeleaderboardstat(interaction: discord.Interaction, user: discord.
     label = next(c.name for c in _STAT_CHOICES if c.value == stat)
     await interaction.response.send_message(
         f"❌ Removed **{amount:,}** from {user.mention}'s **{label}**.")
+
+# ─── HELP SYSTEM ─────────────────────────────────────────────────────────────
+
+# (emoji, display title, [(command_name, description), ...])
+_HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
+    "giveaway": ("🎉", "Giveaway Commands", [
+        ("giveaway",          "Create a giveaway. Duration in **seconds**. Supports coin, EXP, ticket, gamble token, VIP key, role, and item/box rewards."),
+        ("reroll",            "Reroll a finished giveaway by its message ID. The old winner's coins are refunded."),
+        ("addautogiveaway",   "Add a prize/reward/winners preset to the auto-rotation pool."),
+        ("removeautogiveaway","Remove a preset from the auto pool by prize name."),
+        ("startgiveaways",    "Start posting giveaways automatically at a fixed interval using the presets in the pool."),
+        ("stopgiveaways",     "Stop the automatic giveaway loop."),
+        ("addgiveawayrole",   "Give a role permission to manage giveaways and use admin commands."),
+        ("removegiveawayrole","Remove a role's management permissions."),
+        ("giveawayroles",     "List all roles with giveaway/admin permissions."),
+    ]),
+    "economy": ("💰", "Economy & EXP", [
+        ("balance",             "Check a user's coin balance."),
+        ("gift",                "Send coins to another user (deducted from your own balance)."),
+        ("addbalance",          "Admin: add coins to a user."),
+        ("removebalance",       "Admin: remove coins from a user."),
+        ("level",               "Show Level, **Total EXP (7d)** (used for level), and **Usable EXP** (spent on chests)."),
+        ("addexp",              "Admin: add **usable EXP only** — does **not** change level or Total EXP (7d)."),
+        ("removeexp",           "Admin: deduct EXP from a user."),
+        ("addtotalexp",         "Admin: add to **Total EXP (7d) and level only** — usable EXP stays the same."),
+        ("removetotalexp",      "Admin: remove from **Total EXP (7d) and level only** — usable EXP stays the same."),
+        ("expboost",            "Set a chat-EXP multiplier for a role, e.g. +50% or -25%. Multiple roles are summed."),
+        ("removeexpboost",      "Remove a role's EXP multiplier."),
+        ("listexpboosts",       "List all active EXP boosts."),
+        ("leaderboard",         "Top-10 across: Balance, Total EXP, Current EXP, Tickets, Chests Opened, Gifted Balance."),
+        ("addleaderboardstat",  "Admin: directly add to a user's leaderboard stat."),
+        ("removeleaderboardstat","Admin: directly subtract from a user's leaderboard stat."),
+    ]),
+    "raffle": ("🎟", "Raffle", [
+        ("buytickets",          "Buy tickets for 100 coins each. More tickets → higher win chance (weighted draw)."),
+        ("rafflechance",        "Check a user's ticket count and current win probability."),
+        ("addtickets",          "Admin: add tickets to a user."),
+        ("removetickets",       "Admin: remove tickets from a user."),
+        ("setrafflechannel",    "Set the channel for daily winner announcements."),
+        ("setraffleinfochannel","Post a live status board showing the pool and top participants (auto-updates every 60 s)."),
+    ]),
+    "chests": ("📦", "Chests", [
+        ("chest",               "Open EXP chest(s). Costs **1 000 EXP** each. Bulk-open when you have ≥1 400 EXP."),
+        ("vipchest",            "Open VIP Chest(s) — costs 1 **VIP Chest Key** each (max 10). Better prizes than normal chests."),
+        ("givekey",             "Admin: give VIP Chest Keys to a user."),
+        ("takekey",             "Admin: take VIP Chest Keys from a user."),
+        ("addchestprize",       "Admin: add a custom prize to the EXP or VIP chest loot table (overrides defaults for this server)."),
+        ("removechestprize",    "Admin: remove a custom chest prize by ID (see /listchestprizes)."),
+        ("listchestprizes",     "List all prizes and drop percentages for a chest type."),
+        ("addrarechestdrop",    "Admin: mark a prize name **or ID** as a rare drop for announcements. Custom list replaces defaults once any entry is added."),
+        ("removerarechestdrop", "Admin: unmark a prize as a rare drop."),
+        ("setraredropchannel",  "Set the channel for all rare-drop announcements (chests, VIP chests, and boxes)."),
+    ]),
+    "items": ("🛒", "Item Store & Inventory", [
+        ("item store",  "Browse items available to purchase."),
+        ("item buy",    "Buy an item for coins (goes to your inventory)."),
+        ("item use",    "Redeem a store item to receive its Discord role."),
+        ("item inv",    "View a user's inventory — items, boxes, VIP keys, and gamble tokens."),
+        ("item info",   "Show details for an item **or** box (includes all prizes and drop chances)."),
+        ("item give",   "Admin: give any item, box, VIP Chest Key, or Gamble Token to a user."),
+        ("item take",   "Admin: take any item, box, VIP Chest Key, or Gamble Token from a user."),
+        ("item add",    "Admin: add a new purchasable item to the store (linked to a Discord role)."),
+        ("item remove", "Admin: remove an item from the store."),
+    ]),
+    "boxes": ("🎁", "Admin Abuse Boxes", [
+        ("addbox",          "Create a new box."),
+        ("removebox",       "Delete a box and all its prizes permanently."),
+        ("addboxprize",     "Add a prize to a box — balance, EXP, item, nothing, or a custom label."),
+        ("removeboxprize",  "Remove a specific prize from a box by ID (see /listboxes)."),
+        ("listboxes",       "List every box with its prizes, weights, and percentage chances."),
+        ("givebox",         "Give boxes to every member that has a specific role."),
+        ("openbox",         "Open one or more boxes from your inventory (max 20 at once)."),
+        ("addrarebox",      "Admin: mark a box prize by ID as a rare drop → triggers an announcement."),
+        ("removerarebox",   "Admin: unmark a box prize as a rare drop."),
+    ]),
+    "gambling": ("🎲", "Gambling", [
+        ("blackjack",       (
+            "Play blackjack vs the dealer — costs 1 **Gamble Token**.\n"
+            "**Hit** ➕ draw a card\n"
+            "**Stand** ✋ end your turn\n"
+            "**Double** ⬆️ first action only: double your bet, receive exactly one more card, then auto-stand\n"
+            "**Split** ✂️ first action only, same-value cards: split into two independent hands each with the original bet\n"
+            "Natural 21 pays **1.5×**. Dealer stands on soft 17."
+        )),
+        ("roulette",        (
+            "Spin the wheel — costs 1 **Gamble Token**.\n"
+            "**×36** — single number `0`–`36`\n"
+            "**×2** — `red` · `black` · `even` · `odd` · `1-18` / `low` · `19-36` / `high`\n"
+            "**×3 dozens** — `1-12` · `13-24` · `25-36` (aliases: `dozen1/2/3`)\n"
+            "**×3 columns** — `col1` / `1st` (3n+1) · `col2` / `2nd` (3n+2) · `col3` / `3rd` (3n)\n"
+            "0 only wins on a single-number bet."
+        )),
+        ("givegambletoken", "Admin: give Gamble Tokens to a user."),
+        ("takegambletoken", "Admin: take Gamble Tokens from a user."),
+    ]),
+    "games": ("🎮", "Random Games", [
+        ("addgame",         "Add a trivia/guessing game question with optional coin + EXP rewards for the winner."),
+        ("removegame",      "Delete a game and all its answers."),
+        ("enablegame",      "Enable a disabled game so it appears in automatic rotation."),
+        ("disablegame",     "Disable a game without deleting it (excluded from rotation)."),
+        ("addgameanswer",   "Add a valid answer to a game (case-insensitive matching)."),
+        ("removegameanswer","Remove an answer by its ID (see /listgames)."),
+        ("listgames",       "List all games with answers, rewards, and enabled/disabled status."),
+        ("setgamechannel",  "Set the posting channel, the answer window in seconds, and the interval between games."),
+        ("startgames",      "Start the automatic game loop in the configured channel."),
+        ("stopgames",       "Stop the automatic game loop."),
+    ]),
+    "trade": ("🤝", "Trading", [
+        ("trade", (
+            "Open an interactive trade session with another user.\n"
+            "Both parties click **Set Offer** to enter what they're offering "
+            "(coins, EXP, raffle tickets, and any inventory items/boxes), "
+            "then both click **Confirm** to execute. Either party can cancel at any time. "
+            "Times out after 5 minutes."
+        )),
+    ]),
+    "codes": ("🎫", "Redeemable Codes", [
+        ("createcode", "Admin: create a code with any prize mix. Supports limited or unlimited uses, min level/balance, and a required role."),
+        ("deletecode", "Admin: delete a code and its usage history."),
+        ("listcodes",  "Admin: list all active codes with prizes, uses remaining, and requirements."),
+        ("redeem",     "Redeem a code to claim its prizes (each code can only be used once per user)."),
+    ]),
+    "admin": ("⚙️", "Admin & System", [
+        ("disablecmd",          "Temporarily disable any bot command by name."),
+        ("enablecmd",           "Re-enable a previously disabled command."),
+        ("enablesystem",        "Enable a major system: **raffle**, **vipkey**, or **gamble**."),
+        ("disablesystem",       "Disable a major system (blocks related commands for all users)."),
+        ("systemstatus",        "Check which major systems are currently enabled or disabled."),
+        ("setraredropchannel",  "Set the announcement channel for rare drops from chests and boxes."),
+        ("addgiveawayrole",     "Give a role giveaway/admin permissions."),
+        ("removegiveawayrole",  "Remove a role's permissions."),
+        ("giveawayroles",       "List all privileged roles."),
+    ]),
+}
+
+# Flat lookup: command_name → (category_title, description)
+_HELP_LOOKUP: dict[str, tuple[str, str]] = {}
+for _ck, (_ce, _ct, _cc) in _HELP_CATS.items():
+    for _cn, _cd in _cc:
+        _HELP_LOOKUP[_cn.lower()] = (_ct, _cd)
+
+
+@bot.tree.command(name="help", description="Overview of the bot or detailed info on a specific command")
+@app_commands.describe(command="Command name or category (blank for full overview)")
+@command_enabled()
+async def help_cmd(interaction: discord.Interaction, command: str = None):
+    if command is None:
+        embed = discord.Embed(
+            title="📖 Bot Help",
+            description=(
+                "A giveaway, economy, gambling, and games bot.\n"
+                "Use `/help <command>` or `/help <category>` for details.\n\u200b"
+            ),
+            color=discord.Color.blurple(),
+        )
+        for ck, (ce, ct, cc) in _HELP_CATS.items():
+            sample = ", ".join(f"`{n}`" for n, _ in cc[:4])
+            more   = f" *+{len(cc)-4} more*" if len(cc) > 4 else ""
+            embed.add_field(name=f"{ce} {ct}", value=sample + more, inline=False)
+        embed.set_footer(text="/help <command name>  or  /help <category key, e.g. gambling>")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    key = command.lower().strip().lstrip("/")
+
+    # Category match
+    if key in _HELP_CATS:
+        ce, ct, cc = _HELP_CATS[key]
+        embed = discord.Embed(title=f"{ce} {ct}", color=discord.Color.blurple())
+        for cn, cd in cc:
+            embed.add_field(name=f"`/{cn}`", value=cd, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # Command match
+    if key in _HELP_LOOKUP:
+        ct, cd = _HELP_LOOKUP[key]
+        embed  = discord.Embed(title=f"📖 /{key}", description=cd, color=discord.Color.blurple())
+        embed.set_footer(text=f"Category: {ct}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"❌ No command or category **{command}** found.\n"
+        "Valid categories: " + ", ".join(f"`{k}`" for k in _HELP_CATS),
+        ephemeral=True,
+    )
 
 # ═══════════════════════════════════════════════════════
 # RUN BOT
