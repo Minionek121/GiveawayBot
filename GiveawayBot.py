@@ -535,20 +535,20 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
 # EXP COMMANDS
 # ═══════════════════════════════════════════════════════
 
-@bot.tree.command(name="level", description="Check a user's level and EXP")
+@bot.tree.command(name="xp", description="Check a user's Activity Rank and EXP")
 @command_enabled()
 async def level(interaction: discord.Interaction, user: discord.Member = None):
     user = user or interaction.user
     exp    = await get_level_exp(user.id)
     usable = await get_exp(user.id)
     lvl    = await get_level(user.id)
-    embed = discord.Embed(title=f"⭐ {user.display_name}'s Level", color=discord.Color.gold())
-    embed.add_field(name="Level",           value=str(lvl),    inline=False)
+    embed = discord.Embed(title=f"⭐ {user.display_name}'s Activity Rank", color=discord.Color.gold())
+    embed.add_field(name="Activity Rank",           value=str(lvl),    inline=False)
     embed.add_field(name="Total EXP (7d)",  value=f"{exp:,}",  inline=False)
     embed.add_field(name="Usable EXP",      value=f"{usable:,}", inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="addexp", description="Add usable EXP to a user — does NOT affect Total EXP (7d) or level")
+@bot.tree.command(name="addexp", description="Add usable EXP to a user — does NOT affect Total EXP (7d) or Activity Rank")
 @command_enabled()
 async def addexp(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not await is_allowed_to_giveaway(interaction):
@@ -557,7 +557,7 @@ async def addexp(interaction: discord.Interaction, user: discord.Member, amount:
         await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
     await add_exp(user.id, amount, is_bonus=True)
     await interaction.response.send_message(
-        f"✅ Added **{amount:,}** usable EXP to {user.mention} (Total EXP / level unchanged).")
+        f"✅ Added **{amount:,}** usable EXP to {user.mention} (Total EXP / Activity Rank unchanged).")
 
 @bot.tree.command(name="removeexp", description="Remove EXP from a user")
 @command_enabled()
@@ -2221,14 +2221,14 @@ async def openbox(interaction: discord.Interaction, box: str, amount: int = 1):
 @app_commands.describe(
     code="Code players type (e.g. SUMMER2025)",
     prize_json='JSON prize: {"balance":500,"exp":1000,"tickets":2,"gamble_tokens":1,"vip_keys":1,"item":"BoxName","item_qty":1}',
-    uses="How many times (−1 for unlimited, default 1)",
-    min_level="Minimum level required (default 0)",
+    uses="How many times (−1 for unlimited, default -1)",
+    min_activity_rank="Minimum Activity Rank required (default 0)",
     min_balance="Minimum balance required (default 0)",
     required_role="Required role to redeem (optional)"
 )
 @command_enabled()
 async def createcode(interaction: discord.Interaction, code: str, prize_json: str,
-                     uses: int = 1, min_level: int = 0, min_balance: int = 0,
+                     uses: int = -1, min_activity_rank: int = 0, min_balance: int = 0,
                      required_role: discord.Role = None):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
@@ -2244,7 +2244,7 @@ async def createcode(interaction: discord.Interaction, code: str, prize_json: st
                 await db.execute(
                     "INSERT INTO redeem_codes(guild_id,code,prize_json,uses_left,min_level,min_balance,required_role_id) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (interaction.guild.id, code, json.dumps(prize), uses, min_level, min_balance,
+                    (interaction.guild.id, code, json.dumps(prize), uses, min_activity_rank, min_balance,
                      required_role.id if required_role else 0))
                 await db.commit()
             except aiosqlite.IntegrityError:
@@ -2260,7 +2260,7 @@ async def createcode(interaction: discord.Interaction, code: str, prize_json: st
     uses_str = "unlimited" if uses == -1 else str(uses)
     await interaction.response.send_message(
         f"✅ Code **{code}** created!\nPrize: {' + '.join(parts) or 'None'}\n"
-        f"Uses: {uses_str} | Min level: {min_level} | Min balance: {min_balance:,}"
+        f"Uses: {uses_str} | Min activity rank: {min_activity_rank} | Min balance: {min_balance:,}"
         + (f" | Required role: {required_role.mention}" if required_role else ""),
         ephemeral=True)
 
@@ -2314,7 +2314,7 @@ async def listcodes(interaction: discord.Interaction):
             req  = f" | Role: {role.mention if role else '?'}"
         embed.add_field(name=f"🎫 `{code}`",
                         value=f"{' + '.join(parts) or 'No prize'}\n"
-                              f"Uses: {uses_str} | Lvl ≥ {min_level} | Bal ≥ {min_balance:,}{req}",
+                              f"Uses: {uses_str} | Activity Rank ≥ {min_level} | Bal ≥ {min_balance:,}{req}",
                         inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -2344,7 +2344,7 @@ async def redeem(interaction: discord.Interaction, code: str):
                                                         ephemeral=True); return
     if await get_level(user_id) < min_level:
         await interaction.response.send_message(
-            f"❌ You need level {min_level} (you're level {await get_level(user_id)}).",
+            f"❌ You need Activity Rank {min_level} (you're Activity Rank {await get_level(user_id)}).",
             ephemeral=True); return
     if await get_balance(user_id) < min_balance:
         await interaction.response.send_message(
@@ -2904,7 +2904,7 @@ _STAT_CHOICES = [
     app_commands.Choice(name="Lifetime Tickets",  value="raffle_tickets_bought"),
 ]
 
-@bot.tree.command(name="addtotalexp", description="Add to Total EXP (7d) and level only — usable EXP stays the same")
+@bot.tree.command(name="addtotalexp", description="Add to Total EXP (7d) and Activity Rank only — usable EXP stays the same")
 @app_commands.describe(user="Target user", amount="Amount to add")
 @command_enabled()
 async def addtotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -2925,10 +2925,10 @@ async def addtotalexp(interaction: discord.Interaction, user: discord.Member, am
                 (user.id, -amount, now, 0))
             await db.commit()
     await interaction.response.send_message(
-        f"✅ Added **{amount:,}** to {user.mention}'s **Total EXP (7d)** and level. Usable EXP unchanged.")
+        f"✅ Added **{amount:,}** to {user.mention}'s **Total EXP (7d)** and Activity Rank. Usable EXP unchanged.")
 
 
-@bot.tree.command(name="removetotalexp", description="Remove from Total EXP (7d) and level only — usable EXP stays the same")
+@bot.tree.command(name="removetotalexp", description="Remove from Total EXP (7d) and Activity Rank only — usable EXP stays the same")
 @app_commands.describe(user="Target user", amount="Amount to remove")
 @command_enabled()
 async def removetotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -2981,7 +2981,7 @@ async def removetotalexp(interaction: discord.Interaction, user: discord.Member,
             f"— they didn't have the full {amount:,}. Usable EXP unchanged.")
     else:
         await interaction.response.send_message(
-            f"✅ Removed **{amount:,}** from {user.mention}'s **Total EXP (7d)** and level. Usable EXP unchanged.")
+            f"✅ Removed **{amount:,}** from {user.mention}'s **Total EXP (7d)** and Activity Rank. Usable EXP unchanged.")
 
     async with db_lock:
         async with get_db() as db:
