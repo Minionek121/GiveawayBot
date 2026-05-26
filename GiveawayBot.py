@@ -182,6 +182,9 @@ async def setup_database():
             await db.execute("""CREATE TABLE IF NOT EXISTS rare_box_config(
                 guild_id INTEGER, box_name TEXT, prize_id INTEGER,
                 PRIMARY KEY(guild_id, box_name, prize_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS log_channels(
+                guild_id INTEGER, log_type TEXT, channel_id INTEGER,
+                PRIMARY KEY(guild_id, log_type))""")
             # Migrations
             for col in [("ended", "INTEGER DEFAULT 0")]:
                 try:
@@ -193,7 +196,6 @@ async def setup_database():
             except aiosqlite.OperationalError:
                 pass
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
-            await db.execute("UPDATE spent_exp SET amount=0")
             await db.commit()
 
 # ═══════════════════════════════════════════════════════
@@ -1056,6 +1058,10 @@ async def raffle_loop():
             ann = bot.get_channel(row[0]) if row else guild.system_channel
             if ann:
                 await ann.send(f"🎉 <@{winner_id}> won the daily raffle and will receive a huge pet!")
+                # ▼ ADD THIS LINE:
+                await log_event(guild.id, "raffle", _log_embed(
+                    "🎟 Daily Raffle Draw", discord.Color.gold(),
+                    Winner=f"<@{winner_id}>", Guild=guild.name))
             async with get_db() as db:
                 await db.execute("DELETE FROM raffle WHERE guild_id=?", (guild.id,))
                 await db.commit()
@@ -3296,7 +3302,8 @@ async def addtotalexp(interaction: discord.Interaction, user: discord.Member, am
         f"✅ Added **{amount:,}** to {user.mention}'s **Total EXP (7d)** and Activity Rank. Usable EXP unchanged.")
 
 
-@bot.tree.command(name="removetotalexp", description="Remove from Total EXP (7d) and Activity Rank only — usable EXP stays the same")
+@bot.tree.command(name="removetotalexp",
+                  description="Remove from Total EXP (7d) and Activity Rank only — usable EXP stays the same")
 @app_commands.describe(user="Target user", amount="Amount to remove")
 @command_enabled()
 async def removetotalexp(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -3305,18 +3312,17 @@ async def removetotalexp(interaction: discord.Interaction, user: discord.Member,
     if amount <= 0:
         await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
 
-    week_ago  = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
-    remaining = amount
+    week_ago        = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    remaining       = amount
+    actually_removed = 0
 
     async with db_lock:
         async with get_db() as db:
-            # Only target positive non-bonus entries — the ones get_level_exp counts
             async with db.execute(
                 "SELECT rowid, amount FROM exp_history "
                 "WHERE user_id=? AND timestamp>=? AND amount>0 AND is_bonus=0 "
                 "ORDER BY timestamp ASC",
-                (user.id, week_ago)
-            ) as cur:
+                (user.id, week_ago)) as cur:
                 entries = await cur.fetchall()
 
             for rowid, entry_amount in entries:
@@ -3326,67 +3332,35 @@ async def removetotalexp(interaction: discord.Interaction, user: discord.Member,
                     await db.execute("DELETE FROM exp_history WHERE rowid=?", (rowid,))
                     remaining -= entry_amount
                 else:
-                    await db.execute(
-                        "UPDATE exp_history SET amount=? WHERE rowid=?",
-                        (entry_amount - remaining, rowid))
+                    await db.execute("UPDATE exp_history SET amount=? WHERE rowid=?",
+                                     (entry_amount - remaining, rowid))
                     remaining = 0
 
             actually_removed = amount - remaining
             if actually_removed > 0:
-                # Bonus entry restores the usable EXP that was lost by deleting entries above
+                # Bonus entry so usable EXP is not affected
                 await db.execute(
-                    "INSERT INTO exp_history(user_id, amount, timestamp, is_bonus) VALUES(?,?,?,?)",
+                    "INSERT INTO exp_history(user_id,amount,timestamp,is_bonus) VALUES(?,?,?,?)",
                     (user.id, actually_removed, int(datetime.now(UTC).timestamp()), 1))
-
             await db.commit()
 
     if actually_removed == 0:
-        await interaction.response.send_message(
-            f"❌ {user.mention} has no Total EXP (7d) to remove.")
+        await interaction.response.send_message(f"❌ {user.mention} has no Total EXP (7d) to remove.")
     elif remaining > 0:
         await interaction.response.send_message(
             f"⚠️ Only removed **{actually_removed:,}** from {user.mention}'s **Total EXP (7d)** "
             f"— they didn't have the full {amount:,}. Usable EXP unchanged.")
     else:
         await interaction.response.send_message(
-            f"✅ Removed **{amount:,}** from {user.mention}'s **Total EXP (7d)** and Activity Rank. Usable EXP unchanged.")
-
-    async with db_lock:
-        async with get_db() as db:
-            # Fetch positive entries oldest-first so we eat old EXP first
-            async with db.execute(
-                "SELECT rowid, amount FROM exp_history "
-                "WHERE user_id=? AND timestamp>=? AND amount>0 "
-                "ORDER BY timestamp ASC",
-                (user.id, week_ago)
-            ) as cur:
-                entries = await cur.fetchall()
-
-            for rowid, entry_amount in entries:
-                if remaining <= 0:
-                    break
-                if entry_amount <= remaining:
-                    await db.execute("DELETE FROM exp_history WHERE rowid=?", (rowid,))
-                    remaining -= entry_amount
-                else:
-                    await db.execute(
-                        "UPDATE exp_history SET amount=? WHERE rowid=?",
-                        (entry_amount - remaining, rowid))
-                    remaining = 0
-
-            await db.commit()
-
-    actually_removed = amount - remaining
-    if actually_removed == 0:
-        await interaction.response.send_message(
-            f"❌ {user.mention} has no Total EXP (7d) to remove.")
-    elif remaining > 0:
-        await interaction.response.send_message(
-            f"⚠️ Only removed **{actually_removed:,}** EXP from {user.mention}'s Total EXP (7d) "
-            f"— they didn't have the full {amount:,}.")
-    else:
-        await interaction.response.send_message(
-            f"❌ Removed **{amount:,}** from {user.mention}'s Total EXP (7d).")
+            f"✅ Removed **{amount:,}** from {user.mention}'s **Total EXP (7d)** and Activity Rank. "
+            f"Usable EXP unchanged.")
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "📉 Total EXP Removed", discord.Color.orange(),
+        Admin=interaction.user.mention, User=user.mention,
+        Removed=f"-{actually_removed:,}", Requested=f"-{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ Remove Total EXP", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"-{actually_removed:,}"))
         
 @bot.tree.command(name="addleaderboardstat", description="Add to a user's leaderboard stat")
 @app_commands.describe(user="Target user", stat="Which stat to modify", amount="Amount to add")
@@ -3616,6 +3590,463 @@ async def help_cmd(interaction: discord.Interaction, command: str = None):
         "Valid categories: " + ", ".join(f"`{k}`" for k in _HELP_CATS),
         ephemeral=True,
     )
+
+# ═══════════════════════════════════════════════════════
+# LOGGING SYSTEM
+# ═══════════════════════════════════════════════════════
+
+_LOG_CHOICES = [
+    app_commands.Choice(name="💰 Balance  — add/remove/gift/wins",        value="balance"),
+    app_commands.Choice(name="⭐ EXP      — add/remove/chest spend",      value="exp"),
+    app_commands.Choice(name="🎒 Items    — buy/use/give/take/keys",      value="item"),
+    app_commands.Choice(name="🎟 Raffle   — ticket purchases, daily draw",value="raffle"),
+    app_commands.Choice(name="🎉 Giveaway — create/end/reroll",           value="giveaway"),
+    app_commands.Choice(name="📦 Chests   — open results",                value="chest"),
+    app_commands.Choice(name="🎁 Boxes    — open results",                value="box"),
+    app_commands.Choice(name="🎲 Gamble   — blackjack/roulette results",  value="gamble"),
+    app_commands.Choice(name="🎫 Codes    — create/redeem",               value="code"),
+    app_commands.Choice(name="🤝 Trades   — executed trades",             value="trade"),
+    app_commands.Choice(name="💬 Commands — every slash command used",    value="command"),
+    app_commands.Choice(name="⚙️ Admin    — all admin-only actions",      value="admin"),
+]
+
+async def log_event(guild_id: int, log_type: str, embed: discord.Embed):
+    """Send embed to the configured log channel, silently no-op if not configured."""
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id FROM log_channels WHERE guild_id=? AND log_type=?",
+                (guild_id, log_type)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return
+        ch = bot.get_channel(row[0])
+        if ch:
+            await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[Log:{log_type}] {e}")
+
+def _log_embed(title: str, color: discord.Color, **fields) -> discord.Embed:
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(UTC))
+    for name, value in fields.items():
+        embed.add_field(name=name, value=str(value), inline=True)
+    return embed
+
+# ── /setlogchannel ────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setlogchannel", description="Set a channel for a specific log type")
+@app_commands.describe(log_type="Which events to send here", channel="Destination channel")
+@app_commands.choices(log_type=_LOG_CHOICES)
+@command_enabled()
+async def setlogchannel(interaction: discord.Interaction,
+                        log_type: str, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO log_channels(guild_id,log_type,channel_id) VALUES(?,?,?)",
+                (interaction.guild.id, log_type, channel.id))
+            await db.commit()
+    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
+    await interaction.response.send_message(f"✅ **{label}** logs → {channel.mention}")
+
+@bot.tree.command(name="removelogchannel", description="Disable logging for a specific type")
+@app_commands.describe(log_type="Which log type to disable")
+@app_commands.choices(log_type=_LOG_CHOICES)
+@command_enabled()
+async def removelogchannel(interaction: discord.Interaction, log_type: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("DELETE FROM log_channels WHERE guild_id=? AND log_type=?",
+                             (interaction.guild.id, log_type))
+            await db.commit()
+    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
+    await interaction.response.send_message(f"🗑 **{label}** logs disabled.")
+
+@bot.tree.command(name="listlogchannels", description="Show all configured log channels")
+@command_enabled()
+async def listlogchannels(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT log_type,channel_id FROM log_channels WHERE guild_id=? ORDER BY log_type",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("❌ No log channels configured."); return
+    embed = discord.Embed(title="📋 Log Channels", color=discord.Color.blurple())
+    for log_type, channel_id in rows:
+        label = next((c.name for c in _LOG_CHOICES if c.value == log_type), log_type)
+        ch    = bot.get_channel(channel_id)
+        embed.add_field(name=label,
+                        value=ch.mention if ch else f"<#{channel_id}> *(channel deleted)*",
+                        inline=False)
+    await interaction.response.send_message(embed=embed)
+
+# ── Command log via interaction listener ──────────────────────────────────────
+# Uses bot.listen so it doesn't override on_message / on_ready.
+
+@bot.listen("on_interaction")
+async def _log_command_use(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.application_command:
+        return
+    if not interaction.guild:
+        return
+    cmd  = interaction.data.get("name", "?")
+    opts = interaction.data.get("options", [])
+    # Resolve sub-command name if present (type 1 = SUB_COMMAND, type 2 = SUB_COMMAND_GROUP)
+    if opts and opts[0].get("type") in (1, 2):
+        cmd += f" {opts[0]['name']}"
+    embed = discord.Embed(
+        description=f"{interaction.user.mention} used **`/{cmd}`**",
+        color=discord.Color.light_grey(),
+        timestamp=datetime.now(UTC))
+    embed.set_author(name=str(interaction.user),
+                     icon_url=interaction.user.display_avatar.url)
+    embed.set_footer(text=(f"#{interaction.channel.name}" if interaction.channel else "?")
+                     + f" | UID: {interaction.user.id}")
+    await log_event(interaction.guild.id, "command", embed)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The functions below are MONKEY-PATCHED versions of the existing bot commands.
+# They wrap the originals so we can inject log_event calls without rewriting
+# every command.  Place this AFTER all command definitions above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Balance logs ──────────────────────────────────────────────────────────────
+
+_orig_addbalance = addbalance.callback
+async def _addbalance_logged(interaction: discord.Interaction,
+                              user: discord.Member, amount: int):
+    await _orig_addbalance(interaction, user, amount)
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "💰 Balance Added", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ addbalance", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+addbalance.callback = _addbalance_logged
+
+_orig_removebalance = removebalance.callback
+async def _removebalance_logged(interaction: discord.Interaction,
+                                 user: discord.Member, amount: int):
+    await _orig_removebalance(interaction, user, amount)
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "💸 Balance Removed", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ removebalance", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+removebalance.callback = _removebalance_logged
+
+_orig_gift = gift.callback
+async def _gift_logged(interaction: discord.Interaction,
+                        user: discord.Member, amount: int):
+    await _orig_gift(interaction, user, amount)
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "🎁 Gift Sent", discord.Color.green(),
+        From=interaction.user.mention, To=user.mention, Amount=f"{amount:,}"))
+gift.callback = _gift_logged
+
+# ── EXP logs ─────────────────────────────────────────────────────────────────
+
+_orig_addexp = addexp.callback
+async def _addexp_logged(interaction: discord.Interaction,
+                          user: discord.Member, amount: int):
+    await _orig_addexp(interaction, user, amount)
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "⭐ Usable EXP Added", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ addexp (usable)", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+addexp.callback = _addexp_logged
+
+_orig_removeexp = removeexp.callback
+async def _removeexp_logged(interaction: discord.Interaction,
+                              user: discord.Member, amount: int):
+    await _orig_removeexp(interaction, user, amount)
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "📉 EXP Removed", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ removeexp", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+removeexp.callback = _removeexp_logged
+
+_orig_addtotalexp = addtotalexp.callback
+async def _addtotalexp_logged(interaction: discord.Interaction,
+                               user: discord.Member, amount: int):
+    await _orig_addtotalexp(interaction, user, amount)
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "⭐ Total EXP Added", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ addtotalexp", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+addtotalexp.callback = _addtotalexp_logged
+
+# ── Item / key / token logs ───────────────────────────────────────────────────
+
+_orig_item_give = item_give.callback
+async def _item_give_logged(interaction: discord.Interaction,
+                             user: discord.Member, name: str, quantity: int = 1):
+    await _orig_item_give(interaction, user, name, quantity)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎒 Item Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention,
+        Item=name, Qty=str(quantity)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ item give", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Item=f"{quantity}x {name}"))
+item_give.callback = _item_give_logged
+
+_orig_item_take = item_take.callback
+async def _item_take_logged(interaction: discord.Interaction,
+                             user: discord.Member, name: str, quantity: int = 1):
+    await _orig_item_take(interaction, user, name, quantity)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎒 Item Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention,
+        Item=name, Qty=str(quantity)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ item take", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Item=f"{quantity}x {name}"))
+item_take.callback = _item_take_logged
+
+_orig_item_buy = item_buy.callback
+async def _item_buy_logged(interaction: discord.Interaction, name: str):
+    await _orig_item_buy(interaction, name)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🛒 Item Purchased", discord.Color.blue(),
+        User=interaction.user.mention, Item=name))
+item_buy.callback = _item_buy_logged
+
+_orig_item_use = item_use.callback
+async def _item_use_logged(interaction: discord.Interaction, name: str):
+    await _orig_item_use(interaction, name)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "✅ Item Used (Role Claimed)", discord.Color.blue(),
+        User=interaction.user.mention, Item=name))
+item_use.callback = _item_use_logged
+
+_orig_givekey = givekey.callback
+async def _givekey_logged(interaction: discord.Interaction,
+                           user: discord.Member, amount: int = 1):
+    await _orig_givekey(interaction, user, amount)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Key Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ givekey", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
+givekey.callback = _givekey_logged
+
+_orig_takekey = takekey.callback
+async def _takekey_logged(interaction: discord.Interaction,
+                           user: discord.Member, amount: int = 1):
+    await _orig_takekey(interaction, user, amount)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Key Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ takekey", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
+takekey.callback = _takekey_logged
+
+_orig_givegambletoken = givegambletoken.callback
+async def _givegambletoken_logged(interaction: discord.Interaction,
+                                   user: discord.Member, amount: int = 1):
+    await _orig_givegambletoken(interaction, user, amount)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎲 Gamble Token Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ givegambletoken", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
+givegambletoken.callback = _givegambletoken_logged
+
+_orig_takegambletoken = takegambletoken.callback
+async def _takegambletoken_logged(interaction: discord.Interaction,
+                                   user: discord.Member, amount: int = 1):
+    await _orig_takegambletoken(interaction, user, amount)
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎲 Gamble Token Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ takegambletoken", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
+takegambletoken.callback = _takegambletoken_logged
+
+# ── Raffle logs ───────────────────────────────────────────────────────────────
+
+_orig_buytickets = buytickets.callback
+async def _buytickets_logged(interaction: discord.Interaction, amount: int):
+    await _orig_buytickets(interaction, amount)
+    cost = amount * RAFFLE_TICKET_PRICE
+    await log_event(interaction.guild.id, "raffle", _log_embed(
+        "🎟 Tickets Purchased", discord.Color.gold(),
+        User=interaction.user.mention, Tickets=str(amount), Cost=f"{cost:,} coins"))
+buytickets.callback = _buytickets_logged
+
+# ── Giveaway logs ─────────────────────────────────────────────────────────────
+
+_orig_giveaway_cmd = giveaway.callback
+async def _giveaway_logged(interaction: discord.Interaction, prize: str, seconds: int,
+                            winners: int, reward_balance: int = 0, reward_exp: int = 0,
+                            reward_tickets: int = 0, reward_gamble_tokens: int = 0,
+                            reward_vip_keys: int = 0, reward_role=None, reward_item=None,
+                            reward_item_qty: int = 1, channel=None,
+                            required_role=None, template: str = "gold"):
+    await _orig_giveaway_cmd(interaction, prize, seconds, winners, reward_balance,
+                              reward_exp, reward_tickets, reward_gamble_tokens, reward_vip_keys,
+                              reward_role, reward_item, reward_item_qty, channel,
+                              required_role, template)
+    ch   = channel or interaction.channel
+    embed = _log_embed("🎉 Giveaway Created", discord.Color.gold(),
+        By=interaction.user.mention, Prize=prize, Duration=f"{seconds}s",
+        Winners=str(winners), Channel=ch.mention if ch else "?")
+    await log_event(interaction.guild.id, "giveaway", embed)
+    await log_event(interaction.guild.id, "admin", embed)
+giveaway.callback = _giveaway_logged
+
+# ── Code logs ─────────────────────────────────────────────────────────────────
+
+_orig_createcode = createcode.callback
+async def _createcode_logged(interaction: discord.Interaction, code: str,
+                              prize_json: str, uses: int = -1,
+                              min_activity_rank: int = 0, min_balance: int = 0,
+                              required_role=None):
+    await _orig_createcode(interaction, code, prize_json, uses,
+                            min_activity_rank, min_balance, required_role)
+    await log_event(interaction.guild.id, "code", _log_embed(
+        "🎫 Code Created", discord.Color.green(),
+        By=interaction.user.mention, Code=code,
+        Uses="∞" if uses == -1 else str(uses),
+        MinRank=str(min_activity_rank)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ createcode", discord.Color.orange(),
+        By=interaction.user.mention, Code=code,
+        Uses="∞" if uses == -1 else str(uses)))
+createcode.callback = _createcode_logged
+
+_orig_redeem = redeem.callback
+async def _redeem_logged(interaction: discord.Interaction, code: str):
+    await _orig_redeem(interaction, code)
+    await log_event(interaction.guild.id, "code", _log_embed(
+        "🎫 Code Redeemed", discord.Color.green(),
+        User=interaction.user.mention, Code=code.upper().strip()))
+redeem.callback = _redeem_logged
+
+# ── Chest / box logs ──────────────────────────────────────────────────────────
+
+_orig_chest = chest.callback
+async def _chest_logged(interaction: discord.Interaction, amount: int = 1):
+    await _orig_chest(interaction, amount)
+    await log_event(interaction.guild.id, "chest", _log_embed(
+        "📦 Chest Opened", discord.Color.purple(),
+        User=interaction.user.mention, Amount=str(amount),
+        Cost=f"{CHEST_COST * amount:,} EXP"))
+chest.callback = _chest_logged
+
+_orig_vipchest = vipchest.callback
+async def _vipchest_logged(interaction: discord.Interaction, amount: int = 1):
+    await _orig_vipchest(interaction, amount)
+    await log_event(interaction.guild.id, "chest", _log_embed(
+        "💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
+        User=interaction.user.mention, Keys_Used=str(amount)))
+vipchest.callback = _vipchest_logged
+
+_orig_openbox = openbox.callback
+async def _openbox_logged(interaction: discord.Interaction, box: str, amount: int = 1):
+    await _orig_openbox(interaction, box, amount)
+    await log_event(interaction.guild.id, "box", _log_embed(
+        "🎁 Box Opened", discord.Color.orange(),
+        User=interaction.user.mention, Box=box, Amount=str(amount)))
+openbox.callback = _openbox_logged
+
+# ── Gambling logs ─────────────────────────────────────────────────────────────
+# Roulette can be patched; blackjack logging is injected into _BJView._resolve.
+
+_orig_roulette = roulette.callback
+async def _roulette_logged(interaction: discord.Interaction, bet: int, choice: str):
+    await _orig_roulette(interaction, bet, choice)
+    # Note: result is already shown in the embed sent by the original; we just log metadata.
+    await log_event(interaction.guild.id, "gamble", _log_embed(
+        "🎰 Roulette Played", discord.Color.gold(),
+        User=interaction.user.mention, Bet=f"{bet:,}", Choice=choice))
+roulette.callback = _roulette_logged
+
+# Patch _BJView._resolve to add a gamble log when the blackjack game ends.
+_orig_bj_resolve = _BJView._resolve
+async def _bj_resolve_logged(self, inter: discord.Interaction):
+    await _orig_bj_resolve(self, inter)
+    if inter.guild:
+        total_bet = sum(self.state.bets)
+        await log_event(inter.guild.id, "gamble", _log_embed(
+            "🃏 Blackjack Played", discord.Color.dark_green(),
+            User=inter.user.mention, Total_Bet=f"{total_bet:,}"))
+_BJView._resolve = _bj_resolve_logged
+
+# ── Trade log injected into execute_trade ────────────────────────────────────
+_orig_execute_trade = execute_trade
+async def _execute_trade_logged(session) -> tuple[bool, str]:
+    success, err = await _orig_execute_trade(session)
+    if success:
+        for guild in bot.guilds:
+            if guild.id == session.guild_id:
+                init  = guild.get_member(session.initiator_id)
+                tgt   = guild.get_member(session.target_id)
+                io    = session.offers[session.initiator_id]
+                to_   = session.offers[session.target_id]
+                embed = discord.Embed(title="🤝 Trade Executed",
+                                      color=discord.Color.blurple(),
+                                      timestamp=datetime.now(UTC))
+                embed.add_field(name=f"{init.display_name if init else '?'} gave",
+                                value=io.display() if io else "*Nothing*", inline=True)
+                embed.add_field(name=f"{tgt.display_name if tgt else '?'} gave",
+                                value=to_.display() if to_ else "*Nothing*", inline=True)
+                await log_event(guild.id, "trade", embed)
+                break
+    return success, err
+execute_trade = _execute_trade_logged
+
+# ── Raffle draw log (injected by patching raffle_loop is impractical;
+#    instead add log_event call directly where raffle_loop announces winner) ──
+# This is done in the raffle_loop function below — see the single added line.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Giveaway end / reroll logs ────────────────────────────────────────────────
+# These fire inside end_giveaway() and reroll() after the embed is sent.
+# Because those are plain async functions (not commands), we patch them directly.
+
+_orig_end_giveaway = end_giveaway
+async def _end_giveaway_logged(message_id, reroll=False):
+    await _orig_end_giveaway(message_id, reroll)
+    # Minimal context — full details already in the giveaway channel embed.
+    for guild in bot.guilds:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id, prize FROM giveaways WHERE message_id=?",
+                (message_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            channel_id, prize_raw = row
+            ch = bot.get_channel(channel_id)
+            if ch and ch.guild.id == guild.id:
+                try:
+                    meta = json.loads(prize_raw)
+                    label = meta.get("label", prize_raw)
+                except Exception:
+                    label = prize_raw
+                event_title = "🔄 Giveaway Rerolled" if reroll else "🎊 Giveaway Ended"
+                await log_event(guild.id, "giveaway", _log_embed(
+                    event_title, discord.Color.green(),
+                    Prize=label, Channel=ch.mention))
+                break
+end_giveaway = _end_giveaway_logged
 
 # ═══════════════════════════════════════════════════════
 # RUN BOT
