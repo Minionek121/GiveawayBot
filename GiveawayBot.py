@@ -3710,16 +3710,14 @@ async def _log_command_use(interaction: discord.Interaction):
     await log_event(interaction.guild.id, "command", embed)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The functions below are MONKEY-PATCHED versions of the existing bot commands.
-# They wrap the originals so we can inject log_event calls without rewriting
-# every command.  Place this AFTER all command definitions above.
+# LOGGING PATCHES  ── use ._callback (private attr) because the .callback
+# property has no setter in this version of discord.py
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Balance logs ──────────────────────────────────────────────────────────────
+# ── Balance ───────────────────────────────────────────────────────────────────
 
-_orig_addbalance = addbalance.callback
-async def _addbalance_logged(interaction: discord.Interaction,
-                              user: discord.Member, amount: int):
+_orig_addbalance = addbalance._callback
+async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_addbalance(interaction, user, amount)
     await log_event(interaction.guild.id, "balance", _log_embed(
         "💰 Balance Added", discord.Color.green(),
@@ -3727,11 +3725,10 @@ async def _addbalance_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ addbalance", discord.Color.orange(),
         By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addbalance.callback = _addbalance_logged
+addbalance._callback = _addbalance_logged
 
-_orig_removebalance = removebalance.callback
-async def _removebalance_logged(interaction: discord.Interaction,
-                                 user: discord.Member, amount: int):
+_orig_removebalance = removebalance._callback
+async def _removebalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_removebalance(interaction, user, amount)
     await log_event(interaction.guild.id, "balance", _log_embed(
         "💸 Balance Removed", discord.Color.red(),
@@ -3739,22 +3736,20 @@ async def _removebalance_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ removebalance", discord.Color.orange(),
         By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removebalance.callback = _removebalance_logged
+removebalance._callback = _removebalance_logged
 
-_orig_gift = gift.callback
-async def _gift_logged(interaction: discord.Interaction,
-                        user: discord.Member, amount: int):
+_orig_gift = gift._callback
+async def _gift_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_gift(interaction, user, amount)
     await log_event(interaction.guild.id, "balance", _log_embed(
         "🎁 Gift Sent", discord.Color.green(),
         From=interaction.user.mention, To=user.mention, Amount=f"{amount:,}"))
-gift.callback = _gift_logged
+gift._callback = _gift_logged
 
-# ── EXP logs ─────────────────────────────────────────────────────────────────
+# ── EXP ───────────────────────────────────────────────────────────────────────
 
-_orig_addexp = addexp.callback
-async def _addexp_logged(interaction: discord.Interaction,
-                          user: discord.Member, amount: int):
+_orig_addexp = addexp._callback
+async def _addexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_addexp(interaction, user, amount)
     await log_event(interaction.guild.id, "exp", _log_embed(
         "⭐ Usable EXP Added", discord.Color.green(),
@@ -3762,11 +3757,10 @@ async def _addexp_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ addexp (usable)", discord.Color.orange(),
         By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addexp.callback = _addexp_logged
+addexp._callback = _addexp_logged
 
-_orig_removeexp = removeexp.callback
-async def _removeexp_logged(interaction: discord.Interaction,
-                              user: discord.Member, amount: int):
+_orig_removeexp = removeexp._callback
+async def _removeexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_removeexp(interaction, user, amount)
     await log_event(interaction.guild.id, "exp", _log_embed(
         "📉 EXP Removed", discord.Color.red(),
@@ -3774,65 +3768,53 @@ async def _removeexp_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ removeexp", discord.Color.orange(),
         By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removeexp.callback = _removeexp_logged
+removeexp._callback = _removeexp_logged
 
-_orig_addtotalexp = addtotalexp.callback
-async def _addtotalexp_logged(interaction: discord.Interaction,
-                               user: discord.Member, amount: int):
-    await _orig_addtotalexp(interaction, user, amount)
-    await log_event(interaction.guild.id, "exp", _log_embed(
-        "⭐ Total EXP Added", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ addtotalexp", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addtotalexp.callback = _addtotalexp_logged
+# NOTE: addtotalexp and removetotalexp already call log_event inline — no patch needed.
 
-# ── Item / key / token logs ───────────────────────────────────────────────────
+# ── Items / keys / tokens ─────────────────────────────────────────────────────
 
-_orig_item_give = item_give.callback
+_orig_item_give = item_give._callback
 async def _item_give_logged(interaction: discord.Interaction,
                              user: discord.Member, name: str, quantity: int = 1):
     await _orig_item_give(interaction, user, name, quantity)
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎒 Item Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention,
-        Item=name, Qty=str(quantity)))
+        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ item give", discord.Color.orange(),
         By=interaction.user.mention, To=user.mention, Item=f"{quantity}x {name}"))
-item_give.callback = _item_give_logged
+item_give._callback = _item_give_logged
 
-_orig_item_take = item_take.callback
+_orig_item_take = item_take._callback
 async def _item_take_logged(interaction: discord.Interaction,
                              user: discord.Member, name: str, quantity: int = 1):
     await _orig_item_take(interaction, user, name, quantity)
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎒 Item Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention,
-        Item=name, Qty=str(quantity)))
+        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ item take", discord.Color.orange(),
         By=interaction.user.mention, From=user.mention, Item=f"{quantity}x {name}"))
-item_take.callback = _item_take_logged
+item_take._callback = _item_take_logged
 
-_orig_item_buy = item_buy.callback
+_orig_item_buy = item_buy._callback
 async def _item_buy_logged(interaction: discord.Interaction, name: str):
     await _orig_item_buy(interaction, name)
     await log_event(interaction.guild.id, "item", _log_embed(
         "🛒 Item Purchased", discord.Color.blue(),
         User=interaction.user.mention, Item=name))
-item_buy.callback = _item_buy_logged
+item_buy._callback = _item_buy_logged
 
-_orig_item_use = item_use.callback
+_orig_item_use = item_use._callback
 async def _item_use_logged(interaction: discord.Interaction, name: str):
     await _orig_item_use(interaction, name)
     await log_event(interaction.guild.id, "item", _log_embed(
         "✅ Item Used (Role Claimed)", discord.Color.blue(),
         User=interaction.user.mention, Item=name))
-item_use.callback = _item_use_logged
+item_use._callback = _item_use_logged
 
-_orig_givekey = givekey.callback
+_orig_givekey = givekey._callback
 async def _givekey_logged(interaction: discord.Interaction,
                            user: discord.Member, amount: int = 1):
     await _orig_givekey(interaction, user, amount)
@@ -3842,9 +3824,9 @@ async def _givekey_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ givekey", discord.Color.orange(),
         By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givekey.callback = _givekey_logged
+givekey._callback = _givekey_logged
 
-_orig_takekey = takekey.callback
+_orig_takekey = takekey._callback
 async def _takekey_logged(interaction: discord.Interaction,
                            user: discord.Member, amount: int = 1):
     await _orig_takekey(interaction, user, amount)
@@ -3854,9 +3836,9 @@ async def _takekey_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ takekey", discord.Color.orange(),
         By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takekey.callback = _takekey_logged
+takekey._callback = _takekey_logged
 
-_orig_givegambletoken = givegambletoken.callback
+_orig_givegambletoken = givegambletoken._callback
 async def _givegambletoken_logged(interaction: discord.Interaction,
                                    user: discord.Member, amount: int = 1):
     await _orig_givegambletoken(interaction, user, amount)
@@ -3866,9 +3848,9 @@ async def _givegambletoken_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ givegambletoken", discord.Color.orange(),
         By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givegambletoken.callback = _givegambletoken_logged
+givegambletoken._callback = _givegambletoken_logged
 
-_orig_takegambletoken = takegambletoken.callback
+_orig_takegambletoken = takegambletoken._callback
 async def _takegambletoken_logged(interaction: discord.Interaction,
                                    user: discord.Member, amount: int = 1):
     await _orig_takegambletoken(interaction, user, amount)
@@ -3878,129 +3860,131 @@ async def _takegambletoken_logged(interaction: discord.Interaction,
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ takegambletoken", discord.Color.orange(),
         By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takegambletoken.callback = _takegambletoken_logged
+takegambletoken._callback = _takegambletoken_logged
 
-# ── Raffle logs ───────────────────────────────────────────────────────────────
+# ── Raffle ────────────────────────────────────────────────────────────────────
 
-_orig_buytickets = buytickets.callback
+_orig_buytickets = buytickets._callback
 async def _buytickets_logged(interaction: discord.Interaction, amount: int):
     await _orig_buytickets(interaction, amount)
-    cost = amount * RAFFLE_TICKET_PRICE
     await log_event(interaction.guild.id, "raffle", _log_embed(
         "🎟 Tickets Purchased", discord.Color.gold(),
-        User=interaction.user.mention, Tickets=str(amount), Cost=f"{cost:,} coins"))
-buytickets.callback = _buytickets_logged
+        User=interaction.user.mention, Tickets=str(amount),
+        Cost=f"{amount * RAFFLE_TICKET_PRICE:,} coins"))
+buytickets._callback = _buytickets_logged
 
-# ── Giveaway logs ─────────────────────────────────────────────────────────────
+# ── Giveaway ──────────────────────────────────────────────────────────────────
 
-_orig_giveaway_cmd = giveaway.callback
-async def _giveaway_logged(interaction: discord.Interaction, prize: str, seconds: int,
-                            winners: int, reward_balance: int = 0, reward_exp: int = 0,
-                            reward_tickets: int = 0, reward_gamble_tokens: int = 0,
-                            reward_vip_keys: int = 0, reward_role=None, reward_item=None,
-                            reward_item_qty: int = 1, channel=None,
-                            required_role=None, template: str = "gold"):
-    await _orig_giveaway_cmd(interaction, prize, seconds, winners, reward_balance,
-                              reward_exp, reward_tickets, reward_gamble_tokens, reward_vip_keys,
-                              reward_role, reward_item, reward_item_qty, channel,
-                              required_role, template)
-    ch   = channel or interaction.channel
+_orig_giveaway_cmd = giveaway._callback
+async def _giveaway_logged(
+    interaction: discord.Interaction,
+    prize: str, seconds: int, winners: int,
+    reward_balance: int = 0, reward_exp: int = 0, reward_tickets: int = 0,
+    reward_gamble_tokens: int = 0, reward_vip_keys: int = 0,
+    reward_role: discord.Role = None, reward_item: str = None,
+    reward_item_qty: int = 1, channel: discord.TextChannel = None,
+    required_role: discord.Role = None, template: str = "gold"
+):
+    await _orig_giveaway_cmd(
+        interaction, prize, seconds, winners, reward_balance, reward_exp,
+        reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role,
+        reward_item, reward_item_qty, channel, required_role, template)
+    ch = channel or interaction.channel
     embed = _log_embed("🎉 Giveaway Created", discord.Color.gold(),
-        By=interaction.user.mention, Prize=prize, Duration=f"{seconds}s",
-        Winners=str(winners), Channel=ch.mention if ch else "?")
+        By=interaction.user.mention, Prize=prize,
+        Duration=f"{seconds}s", Winners=str(winners),
+        Channel=ch.mention if ch else "?")
     await log_event(interaction.guild.id, "giveaway", embed)
     await log_event(interaction.guild.id, "admin", embed)
-giveaway.callback = _giveaway_logged
+giveaway._callback = _giveaway_logged
 
-# ── Code logs ─────────────────────────────────────────────────────────────────
+# ── Codes ─────────────────────────────────────────────────────────────────────
 
-_orig_createcode = createcode.callback
-async def _createcode_logged(interaction: discord.Interaction, code: str,
-                              prize_json: str, uses: int = -1,
-                              min_activity_rank: int = 0, min_balance: int = 0,
-                              required_role=None):
+_orig_createcode = createcode._callback
+async def _createcode_logged(
+    interaction: discord.Interaction, code: str, prize_json: str,
+    uses: int = -1, min_activity_rank: int = 0, min_balance: int = 0,
+    required_role: discord.Role = None
+):
     await _orig_createcode(interaction, code, prize_json, uses,
                             min_activity_rank, min_balance, required_role)
     await log_event(interaction.guild.id, "code", _log_embed(
         "🎫 Code Created", discord.Color.green(),
         By=interaction.user.mention, Code=code,
-        Uses="∞" if uses == -1 else str(uses),
-        MinRank=str(min_activity_rank)))
+        Uses="∞" if uses == -1 else str(uses), MinRank=str(min_activity_rank)))
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ createcode", discord.Color.orange(),
         By=interaction.user.mention, Code=code,
         Uses="∞" if uses == -1 else str(uses)))
-createcode.callback = _createcode_logged
+createcode._callback = _createcode_logged
 
-_orig_redeem = redeem.callback
+_orig_redeem = redeem._callback
 async def _redeem_logged(interaction: discord.Interaction, code: str):
     await _orig_redeem(interaction, code)
     await log_event(interaction.guild.id, "code", _log_embed(
         "🎫 Code Redeemed", discord.Color.green(),
         User=interaction.user.mention, Code=code.upper().strip()))
-redeem.callback = _redeem_logged
+redeem._callback = _redeem_logged
 
-# ── Chest / box logs ──────────────────────────────────────────────────────────
+# ── Chests / boxes ────────────────────────────────────────────────────────────
 
-_orig_chest = chest.callback
+_orig_chest = chest._callback
 async def _chest_logged(interaction: discord.Interaction, amount: int = 1):
     await _orig_chest(interaction, amount)
     await log_event(interaction.guild.id, "chest", _log_embed(
         "📦 Chest Opened", discord.Color.purple(),
         User=interaction.user.mention, Amount=str(amount),
         Cost=f"{CHEST_COST * amount:,} EXP"))
-chest.callback = _chest_logged
+chest._callback = _chest_logged
 
-_orig_vipchest = vipchest.callback
+_orig_vipchest = vipchest._callback
 async def _vipchest_logged(interaction: discord.Interaction, amount: int = 1):
     await _orig_vipchest(interaction, amount)
     await log_event(interaction.guild.id, "chest", _log_embed(
         "💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
         User=interaction.user.mention, Keys_Used=str(amount)))
-vipchest.callback = _vipchest_logged
+vipchest._callback = _vipchest_logged
 
-_orig_openbox = openbox.callback
+_orig_openbox = openbox._callback
 async def _openbox_logged(interaction: discord.Interaction, box: str, amount: int = 1):
     await _orig_openbox(interaction, box, amount)
     await log_event(interaction.guild.id, "box", _log_embed(
         "🎁 Box Opened", discord.Color.orange(),
         User=interaction.user.mention, Box=box, Amount=str(amount)))
-openbox.callback = _openbox_logged
+openbox._callback = _openbox_logged
 
-# ── Gambling logs ─────────────────────────────────────────────────────────────
-# Roulette can be patched; blackjack logging is injected into _BJView._resolve.
+# ── Gambling ──────────────────────────────────────────────────────────────────
 
-_orig_roulette = roulette.callback
+_orig_roulette = roulette._callback
 async def _roulette_logged(interaction: discord.Interaction, bet: int, choice: str):
     await _orig_roulette(interaction, bet, choice)
-    # Note: result is already shown in the embed sent by the original; we just log metadata.
     await log_event(interaction.guild.id, "gamble", _log_embed(
         "🎰 Roulette Played", discord.Color.gold(),
         User=interaction.user.mention, Bet=f"{bet:,}", Choice=choice))
-roulette.callback = _roulette_logged
+roulette._callback = _roulette_logged
 
-# Patch _BJView._resolve to add a gamble log when the blackjack game ends.
+# _BJView._resolve is a plain class method — standard Python patching works fine.
 _orig_bj_resolve = _BJView._resolve
 async def _bj_resolve_logged(self, inter: discord.Interaction):
     await _orig_bj_resolve(self, inter)
     if inter.guild:
-        total_bet = sum(self.state.bets)
         await log_event(inter.guild.id, "gamble", _log_embed(
             "🃏 Blackjack Played", discord.Color.dark_green(),
-            User=inter.user.mention, Total_Bet=f"{total_bet:,}"))
+            User=inter.user.mention, Total_Bet=f"{sum(self.state.bets):,}"))
 _BJView._resolve = _bj_resolve_logged
 
-# ── Trade log injected into execute_trade ────────────────────────────────────
+# ── Trade ─────────────────────────────────────────────────────────────────────
+# execute_trade is a plain async function — module-level rebinding works fine.
 _orig_execute_trade = execute_trade
 async def _execute_trade_logged(session) -> tuple[bool, str]:
     success, err = await _orig_execute_trade(session)
     if success:
         for guild in bot.guilds:
             if guild.id == session.guild_id:
-                init  = guild.get_member(session.initiator_id)
-                tgt   = guild.get_member(session.target_id)
-                io    = session.offers[session.initiator_id]
-                to_   = session.offers[session.target_id]
+                init = guild.get_member(session.initiator_id)
+                tgt  = guild.get_member(session.target_id)
+                io   = session.offers[session.initiator_id]
+                to_  = session.offers[session.target_id]
                 embed = discord.Embed(title="🤝 Trade Executed",
                                       color=discord.Color.blurple(),
                                       timestamp=datetime.now(UTC))
@@ -4013,19 +3997,10 @@ async def _execute_trade_logged(session) -> tuple[bool, str]:
     return success, err
 execute_trade = _execute_trade_logged
 
-# ── Raffle draw log (injected by patching raffle_loop is impractical;
-#    instead add log_event call directly where raffle_loop announces winner) ──
-# This is done in the raffle_loop function below — see the single added line.
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ── Giveaway end / reroll logs ────────────────────────────────────────────────
-# These fire inside end_giveaway() and reroll() after the embed is sent.
-# Because those are plain async functions (not commands), we patch them directly.
-
+# end_giveaway is also a plain async function — same approach.
 _orig_end_giveaway = end_giveaway
 async def _end_giveaway_logged(message_id, reroll=False):
     await _orig_end_giveaway(message_id, reroll)
-    # Minimal context — full details already in the giveaway channel embed.
     for guild in bot.guilds:
         async with get_db() as db:
             async with db.execute(
@@ -4037,8 +4012,7 @@ async def _end_giveaway_logged(message_id, reroll=False):
             ch = bot.get_channel(channel_id)
             if ch and ch.guild.id == guild.id:
                 try:
-                    meta = json.loads(prize_raw)
-                    label = meta.get("label", prize_raw)
+                    label = json.loads(prize_raw).get("label", prize_raw)
                 except Exception:
                     label = prize_raw
                 event_title = "🔄 Giveaway Rerolled" if reroll else "🎊 Giveaway Ended"
