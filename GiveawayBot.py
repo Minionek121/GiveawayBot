@@ -185,6 +185,8 @@ async def setup_database():
             await db.execute("""CREATE TABLE IF NOT EXISTS log_channels(
                 guild_id INTEGER, log_type TEXT, channel_id INTEGER,
                 PRIMARY KEY(guild_id, log_type))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS disabled_commands_persist(
+                command_name TEXT PRIMARY KEY)""")
             # Migrations
             for col in [("ended", "INTEGER DEFAULT 0")]:
                 try:
@@ -427,21 +429,46 @@ async def on_message(message):
 # ═══════════════════════════════════════════════════════
 
 @bot.event
+@bot.event
 async def on_ready():
     await setup_database()
-    try:
-        bot.tree.copy_global_to(guild=TARGET_GUILD)
-        synced = await bot.tree.sync(guild=TARGET_GUILD)
-        print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync(guild=None)
-        print("Cleared global commands")
-    except Exception as e:
-        print(f"[Sync Error] {e}")
+    await load_disabled_commands()   # ← restore persisted disabled commands
+
+    # Sync to every guild the bot is currently in.
+    # Guild-scoped syncs appear instantly (no 1-hour delay).
+    # For 2–10 servers this completes in a few seconds total.
+    ok, fail = 0, 0
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"[Sync] ✅  {guild.name} ({guild.id})")
+            ok += 1
+        except discord.HTTPException as e:
+            print(f"[Sync] ❌  {guild.name} ({guild.id}): {e}")
+            fail += 1
+
+    # Clear global commands so nothing appears twice in any server.
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync(guild=None)
+
+    print(f"[Sync] Done — {ok} succeeded, {fail} failed")
     print(f"Logged in as {bot.user}")
+
     for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
                     game_loop, daily_key_loop, daily_gamble_loop]:
         bot.loop.create_task(task_fn())
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Sync slash commands the moment the bot is added to a new server."""
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"[Sync] Joined + synced: {guild.name} ({guild.id})")
+    except discord.HTTPException as e:
+        print(f"[Sync] Failed on join for {guild.name}: {e}")
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1653,13 +1680,27 @@ async def item_inv(interaction: discord.Interaction, user: discord.Member = None
 # ENABLE / DISABLE COMMANDS
 # ═══════════════════════════════════════════════════════
 
+async def load_disabled_commands():
+    async with get_db() as db:
+        async with db.execute("SELECT command_name FROM disabled_commands_persist") as cur:
+            rows = await cur.fetchall()
+    disabled_commands.update(r[0] for r in rows)
+    if disabled_commands:
+        print(f"[DisabledCmds] Restored: {', '.join(sorted(disabled_commands))}")
+
 @bot.tree.command(name="disablecmd", description="Temporarily disable a command")
 async def disablecmd(interaction: discord.Interaction, command_name: str):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    if command_name in ("disablecmd", "enablecmd"):
-        await interaction.response.send_message("❌ Cannot disable these commands.", ephemeral=True); return
+    if command_name in ("disablecmd", "enablecmd", "listcmds"):
+        await interaction.response.send_message(
+            "❌ That command cannot be disabled.", ephemeral=True); return
     disabled_commands.add(command_name)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO disabled_commands_persist VALUES(?)", (command_name,))
+            await db.commit()
     await interaction.response.send_message(f"🔒 `/{command_name}` disabled.")
 
 @bot.tree.command(name="enablecmd", description="Re-enable a disabled command")
@@ -1667,9 +1708,31 @@ async def enablecmd(interaction: discord.Interaction, command_name: str):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     if command_name not in disabled_commands:
-        await interaction.response.send_message(f"ℹ️ `/{command_name}` is not disabled.", ephemeral=True); return
+        await interaction.response.send_message(
+            f"ℹ️ `/{command_name}` is not disabled.", ephemeral=True); return
     disabled_commands.discard(command_name)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM disabled_commands_persist WHERE command_name=?", (command_name,))
+            await db.commit()
     await interaction.response.send_message(f"🔓 `/{command_name}` re-enabled.")
+
+# No @command_enabled() here — this command is permanently immune to /disablecmd.
+@bot.tree.command(name="listcmds", description="Show which commands are currently disabled")
+async def listcmds(interaction: discord.Interaction):
+    if disabled_commands:
+        embed = discord.Embed(
+            title="🔒 Disabled Commands",
+            description="\n".join(f"• `/{cmd}`" for cmd in sorted(disabled_commands)),
+            color=discord.Color.red())
+        embed.set_footer(text=f"{len(disabled_commands)} disabled — all others are active")
+    else:
+        embed = discord.Embed(
+            title="✅ All Commands Active",
+            description="No commands are currently disabled.",
+            color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
 # SYSTEM TOGGLES  (raffle / vipkey / gamble)
