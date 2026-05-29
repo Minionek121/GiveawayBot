@@ -24,51 +24,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# =======================================================
-# TIME DIFFERENCE
-# =======================================================
-
-# Source - https://stackoverflow.com/q/69706549
-# Posted by J Muzhen, modified by community. See post 'Timeline' for change history
-# Retrieved 2026-05-29, License - CC BY-SA 4.0
-
-@bot.command(name='timedif', help='', aliases=['snowflake', 'timediff'])
-async def timedif(ctx, id1, id2):
-    try:
-        id1 = int(id1)
-        id2 = int(id2)
-        
-    except:
-        await ctx.reply("Check your message ID's! They are incorrect!")
-    
-    # Source - https://stackoverflow.com/a/69708431
-    # Posted by Taku
-    # Retrieved 2026-05-29, License - CC BY-SA 4.0
-
-    time1 = discord.utils.snowflake_time(int(id1))
-    time2 = discord.utils.snowflake_time(int(id2))
-    ts_diff = time2 - time1
-    secs = abs(ts_diff.total_seconds())
-
-    days,secs=divmod(secs,secs_per_day:=60*60*24)
-    hrs,secs=divmod(secs,secs_per_hr:=60*60)
-    mins,secs=divmod(secs,secs_per_min:=60)
-    secs=round(secs, 2)
-    answer='{} secs'.format(secs)
-    
-    if secs > 60:
-        answer='{} mins and {} secs'.format(int(mins),secs)
-        if mins > 60:
-            answer='{} hrs, {} mins and {} secs'.format(int(hrs),int(mins),secs)
-            if hrs > 24:
-                answer='{} days, {} hrs, {} mins and {} secs'.format(int(days),int(hrs),int(mins),secs)
-    
-    embed = discord.Embed(title="**Time Difference**", description=f"""IDs: {id1}, {id2}
-Time difference between the 2 IDs: 
-{answer}""")
-    await ctx.reply(embed=embed)
-
-
 # ═══════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════
