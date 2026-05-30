@@ -223,9 +223,10 @@ async def setup_database():
                 ("exp_history",
                  "CREATE TABLE exp_history(guild_id INTEGER, user_id INTEGER, amount INTEGER, timestamp INTEGER, is_bonus INTEGER DEFAULT 0)"),
                 ("user_stats",
-                 "CREATE TABLE user_stats(guild_id INTEGER, user_id INTEGER PRIMARY KEY, "  # kept user_id PK for compat
+                 "CREATE TABLE user_stats(guild_id INTEGER, user_id INTEGER, "
                  "total_exp INTEGER DEFAULT 0, gifted_balance INTEGER DEFAULT 0, "
-                 "chests_opened INTEGER DEFAULT 0, raffle_tickets_bought INTEGER DEFAULT 0)"),
+                 "chests_opened INTEGER DEFAULT 0, raffle_tickets_bought INTEGER DEFAULT 0, "
+                 "PRIMARY KEY(guild_id, user_id))"),
                 ("inventory",
                  "CREATE TABLE inventory(guild_id INTEGER, user_id INTEGER, item_name TEXT, quantity INTEGER DEFAULT 0, PRIMARY KEY(guild_id,user_id,item_name))"),
                 ("item_store",
@@ -903,8 +904,8 @@ async def end_giveaway(message_id, reroll=False):
 
     weighted = []
     for user in users:
-        inv   = await inventory_get(interaction.guild.id, interaction.user.id)
-        weighted.extend([user] * min(100, max(1, level)))
+        lvl = await get_level(channel.guild.id, user.id)
+        weighted.extend([user] * random.randint(1, min(100, max(1, lvl))))
 
     winners = []
     while len(winners) < min(winner_count, len(users)) and weighted:
@@ -983,7 +984,7 @@ async def reroll(interaction: discord.Interaction, message_id: str):
     weighted = []
     for user in users:
         inv   = await inventory_get(interaction.guild.id, interaction.user.id)
-        weighted.extend([user] * min(100, max(1, level)))
+        weighted.extend([user] * random.randint(1, min(100, max(1, level))))
     new_winner = random.choice(weighted)
 
     try:
@@ -2200,7 +2201,7 @@ class TradeOfferModal(discord.ui.Modal, title="Set Your Trade Offer"):
         if tickets > 0 and await get_tickets(session.guild_id, uid) < tickets:
             await interaction.response.send_message("❌ Not enough tickets.", ephemeral=True); return
         if items:
-            inv = {n.lower(): q for n, q in await inventory_get(self.session_guild.id, uid)}
+            inv = {n.lower(): q for n, q in await inventory_get(self.session.guild_id, uid)}
             for n, q in items:
                 if inv.get(n.lower(), 0) < q:
                     await interaction.response.send_message(f"❌ Not enough {n}.", ephemeral=True); return
@@ -3587,11 +3588,11 @@ async def addleaderboardstat(interaction: discord.Interaction, user: discord.Mem
     if amount <= 0:
         await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
     await ensure_stats(interaction.guild.id, user.id)
-        async with db_lock:
-            async with get_db() as db:
-                await db.execute(
-                    f"UPDATE user_stats SET {stat}={stat}+? WHERE guild_id=? AND user_id=?",
-                    (amount, interaction.guild.id, user.id))
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                f"UPDATE user_stats SET {stat}={stat}+? WHERE guild_id=? AND user_id=?",
+                (amount, interaction.guild.id, user.id))
             await db.commit()
     label = next(c.name for c in _STAT_CHOICES if c.value == stat)
     await interaction.response.send_message(
@@ -3607,13 +3608,12 @@ async def removeleaderboardstat(interaction: discord.Interaction, user: discord.
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     if amount <= 0:
         await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
-    await ensure_stats(user.id)
     await ensure_stats(interaction.guild.id, user.id)
-        async with db_lock:
-            async with get_db() as db:
-                await db.execute(
-                    f"UPDATE user_stats SET {stat}=MAX(0,{stat}-?) WHERE guild_id=? AND user_id=?",
-                    (amount, interaction.guild.id, user.id))
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                f"UPDATE user_stats SET {stat}=MAX(0,{stat}-?) WHERE guild_id=? AND user_id=?",
+                (amount, interaction.guild.id, user.id))
             await db.commit()
     label = next(c.name for c in _STAT_CHOICES if c.value == stat)
     await interaction.response.send_message(
