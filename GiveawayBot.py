@@ -3338,21 +3338,58 @@ async def listgames(interaction: discord.Interaction, game_name: str = None):
                 games = await cur.fetchall()
     if not games:
         await interaction.followup.send("❌ No games configured."); return
+
     embed = discord.Embed(title="🎮 Random Games", color=discord.Color.teal())
+
     for (gname, enabled, reward_bal, reward_exp) in games:
         async with get_db() as db:
             async with db.execute(
                 "SELECT id,answer FROM game_answers WHERE guild_id=? AND game_name=? ORDER BY id",
                 (interaction.guild.id, gname)) as cur:
                 answers = await cur.fetchall()
+
         status = "✅ Enabled" if enabled else "🔒 Disabled"
         parts  = []
         if reward_bal > 0: parts.append(f"💰 {reward_bal:,}")
         if reward_exp > 0: parts.append(f"⭐ {reward_exp:,}")
-        ans_lines = "\n".join(f"  `#{aid}` {ans}" for aid, ans in answers) or "  *No answers yet*"
-        embed.add_field(name=f"🎯 {gname} [{status}]",
-                        value=f"Reward: {' + '.join(parts) or 'None'}\nAnswers:\n{ans_lines}",
-                        inline=False)
+
+        header = f"Reward: {' + '.join(parts) or 'None'}\nAnswers ({len(answers)} total):\n"
+
+        if not answers:
+            ans_block = "  *No answers yet*"
+        else:
+            all_lines = [f"  `#{aid}` {ans}" for aid, ans in answers]
+            shown = []
+            truncated = False
+
+            for i, line in enumerate(all_lines):
+                remaining = len(all_lines) - i - 1
+                # When more lines follow, reserve space for the truncation note
+                if remaining > 0:
+                    test = header + "\n".join(shown + [line]) + f"\n  *... and {remaining} more*"
+                else:
+                    test = header + "\n".join(shown + [line])
+
+                if len(test) > 1024:
+                    truncated = True
+                    break
+                shown.append(line)
+
+            if truncated:
+                left = len(all_lines) - len(shown)
+                if shown:
+                    ans_block = "\n".join(shown) + f"\n  *... and {left} more*"
+                else:
+                    # Even the first answer is too long (extremely unlikely)
+                    ans_block = f"  *{len(all_lines)} answers — use `/listgames {gname}` to browse*"
+            else:
+                ans_block = "\n".join(shown)
+
+        embed.add_field(
+            name=f"🎯 {gname} [{status}]",
+            value=header + ans_block,
+            inline=False)
+
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="setgamechannel", description="Set the channel for random games and configure timing")
