@@ -524,6 +524,8 @@ async def on_message(message):
             if message.content.strip().lower() == session["answer"].lower():
                 session["answered"] = True
                 session["winner"] = message.author
+                if "event" in session:
+                    session["event"].set()
     now = datetime.now().timestamp()
     key = (message.guild.id, message.author.id)
     last_time = last_message_exp.get(key, 0)
@@ -3322,6 +3324,7 @@ async def removegameanswer(interaction: discord.Interaction, game_name: str, ans
 @bot.tree.command(name="listgames", description="List all games and their answers")
 @command_enabled()
 async def listgames(interaction: discord.Interaction, game_name: str = None):
+    await interaction.response.defer()
     async with get_db() as db:
         if game_name:
             async with db.execute(
@@ -3334,7 +3337,7 @@ async def listgames(interaction: discord.Interaction, game_name: str = None):
                 (interaction.guild.id,)) as cur:
                 games = await cur.fetchall()
     if not games:
-        await interaction.response.send_message("❌ No games configured."); return
+        await interaction.followup.send("❌ No games configured."); return
     embed = discord.Embed(title="🎮 Random Games", color=discord.Color.teal())
     for (gname, enabled, reward_bal, reward_exp) in games:
         async with get_db() as db:
@@ -3350,7 +3353,7 @@ async def listgames(interaction: discord.Interaction, game_name: str = None):
         embed.add_field(name=f"🎯 {gname} [{status}]",
                         value=f"Reward: {' + '.join(parts) or 'None'}\nAnswers:\n{ans_lines}",
                         inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="setgamechannel", description="Set the channel for random games and configure timing")
 @app_commands.describe(channel="Channel for games",
@@ -3450,12 +3453,17 @@ async def guild_game_loop(guild_id: int):
         embed.set_footer(text=f"Answer within {answer_time} seconds!")
         await channel.send(embed=embed)
 
+        answered_event = asyncio.Event()
         active_game_sessions[guild_id] = {
             "game_name": gname, "answer": correct,
-            "channel_id": channel_id, "answered": False, "winner": None
+            "channel_id": channel_id, "answered": False, "winner": None,
+            "event": answered_event
         }
 
-        await asyncio.sleep(answer_time)
+        try:
+            await asyncio.wait_for(answered_event.wait(), timeout=answer_time)
+        except asyncio.TimeoutError:
+            pass
         session = active_game_sessions.pop(guild_id, None)
         if not session: await asyncio.sleep(max(0, interval_seconds - answer_time)); continue
 
