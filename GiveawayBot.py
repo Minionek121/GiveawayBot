@@ -1363,6 +1363,10 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
     embed = discord.Embed(title="📦 Chest Results", description=result_text, color=discord.Color.purple())
     embed.set_footer(text=f"Opened {amount} chest(s) | Cost: {total_cost:,} EXP")
     await interaction.followup.send(embed=embed)
+    await log_event(gid, "chest", _log_embed(
+        "📦 Chest Opened", discord.Color.purple(),
+        User=interaction.user.mention, Opened=str(amount),
+        Cost=f"{total_cost:,} EXP"))
 
     rare_won = {n: c for n, c in results.items() if n in rare_names}
     if rare_won:
@@ -1419,6 +1423,10 @@ async def vipchest(interaction: discord.Interaction, amount: int = 1):
                           color=discord.Color.from_rgb(148, 0, 211))
     embed.set_footer(text=f"Opened {amount} VIP chest(s) | {available_keys - amount} key(s) remaining")
     await interaction.followup.send(embed=embed)
+    await log_event(interaction.guild.id, "chest", _log_embed(
+        "💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
+        User=interaction.user.mention, Opened=str(amount),
+        Keys_Used=str(amount)))
 
     rare_won = {n: c for n, c in results.items() if n in rare_names}
     if rare_won:
@@ -3000,6 +3008,14 @@ class _BJView(discord.ui.View):
                                            + "\n".join(lines)))
         await inter.response.edit_message(embed=embed, view=None)
         self.stop()
+        if inter.guild:
+            outcome = (f"+{delta:,}" if delta > 0 else
+                       (f"{delta:,}" if delta < 0 else "Push ±0"))
+            await log_event(inter.guild.id, "gamble", _log_embed(
+                "🃏 Blackjack", color,
+                User=inter.user.mention,
+                Total_Bet=f"{sum(s.bets):,}",
+                Outcome=outcome))
 
     async def _next(self, inter: discord.Interaction):
         """Advance to the next hand, or resolve if all hands are done."""
@@ -3228,14 +3244,16 @@ async def roulette(interaction: discord.Interaction, bet: int, choice: str):
         result_str = f"{col} **{result}** ({par}, {half}, {col_lbl}, {doz_lbl})"
 
     if result in winning_set:
-        winnings = bet * (multiplier - 1)
+        winnings    = bet * (multiplier - 1)
         await add_balance(interaction.guild.id, interaction.user.id, winnings)
-        outcome = f"🏆 **You win {winnings:,} coins!** ({multiplier}×)"
-        color   = discord.Color.green()
+        outcome     = f"🏆 **You win {winnings:,} coins!** ({multiplier}×)"
+        color       = discord.Color.green()
+        log_outcome = f"WIN +{winnings:,}"
     else:
         await add_balance(interaction.guild.id, interaction.user.id, -bet)
-        outcome = f"💸 **You lose {bet:,} coins.**"
-        color   = discord.Color.red()
+        outcome     = f"💸 **You lose {bet:,} coins.**"
+        color       = discord.Color.red()
+        log_outcome = f"LOSS −{bet:,}"
 
     embed = discord.Embed(title="🎰 Roulette", color=color,
         description=(
@@ -3245,6 +3263,10 @@ async def roulette(interaction: discord.Interaction, bet: int, choice: str):
         ))
     embed.set_footer(text=f"1 {GAMBLE_TOKEN} consumed | {tokens - 1} remaining")
     await interaction.response.send_message(embed=embed)
+    await log_event(interaction.guild.id, "gamble", _log_embed(
+        "🎰 Roulette", color,
+        User=interaction.user.mention, Bet=f"{bet:,}", Choice=choice,
+        Number=str(result), Outcome=log_outcome))
 
 # ═══════════════════════════════════════════════════════
 # GAME PRESETS
@@ -3960,43 +3982,65 @@ async def removehint(interaction: discord.Interaction, hint_id: int):
 @command_enabled()
 async def listhints(interaction: discord.Interaction, game_name: str,
                     answer_id: Optional[int] = None):
+    await interaction.response.defer(ephemeral=True)
     async with get_db() as db:
         if answer_id is not None:
             async with db.execute(
-                "SELECT h.id, a.answer, h.hint_order, h.hint_text "
+                "SELECT h.id, a.id, a.answer, h.hint_order, h.hint_text "
                 "FROM game_hints h JOIN game_answers a ON h.answer_id=a.id "
                 "WHERE h.guild_id=? AND h.game_name=? AND h.answer_id=? ORDER BY h.hint_order",
                 (interaction.guild.id, game_name, answer_id)) as cur:
                 rows = await cur.fetchall()
         else:
             async with db.execute(
-                "SELECT h.id, a.answer, h.hint_order, h.hint_text "
+                "SELECT h.id, a.id, a.answer, h.hint_order, h.hint_text "
                 "FROM game_hints h JOIN game_answers a ON h.answer_id=a.id "
-                "WHERE h.guild_id=? AND h.game_name=? ORDER BY a.answer, h.hint_order",
+                "WHERE h.guild_id=? AND h.game_name=? ORDER BY a.id, h.hint_order",
                 (interaction.guild.id, game_name)) as cur:
                 rows = await cur.fetchall()
-    if not rows:
-        await interaction.response.send_message(
-            f"❌ No hints found for **{game_name}**" +
-            (f" answer #{answer_id}" if answer_id else "") + ".", ephemeral=True); return
 
-    embed = discord.Embed(title=f"💡 Hints — {game_name}", color=discord.Color.teal())
-    current_ans = None
-    block = []
-    for h_id, answer, h_order, h_text in rows:
-        if answer != current_ans:
-            if block:
-                val = "\n".join(block)
-                if len(val) > 1024: val = val[:1021] + "..."
-                embed.add_field(name=f"📝 {current_ans}", value=val, inline=False)
-                block = []
-            current_ans = answer
-        block.append(f"`#{h_id}` **[{h_order}]** {h_text}")
-    if block:
-        val = "\n".join(block)
-        if len(val) > 1024: val = val[:1021] + "..."
-        embed.add_field(name=f"📝 {current_ans}", value=val, inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if not rows:
+        await interaction.followup.send(
+            f"❌ No hints found for **{game_name}**" +
+            (f" answer #{answer_id}" if answer_id else "") + ".",
+            ephemeral=True)
+        return
+
+    # Group hints by (answer_id, answer_text), preserving order
+    grouped: dict[tuple, list] = {}
+    for h_id, a_id, answer, h_order, h_text in rows:
+        key = (a_id, answer)
+        grouped.setdefault(key, []).append((h_id, h_order, h_text))
+
+    ANSWERS_PER_PAGE = 8
+    answer_list = list(grouped.items())
+    total_pages = max(1, (len(answer_list) + ANSWERS_PER_PAGE - 1) // ANSWERS_PER_PAGE)
+    pages: list[discord.Embed] = []
+
+    for page_idx in range(total_pages):
+        chunk = answer_list[page_idx * ANSWERS_PER_PAGE: (page_idx + 1) * ANSWERS_PER_PAGE]
+        lines = []
+        for (a_id, a_text), hints in chunk:
+            lines.append(f"**`#{a_id}` {a_text}**")
+            for h_id, h_order, h_text in sorted(hints, key=lambda x: x[1]):
+                lines.append(f"  `[ID #{h_id}]` Hint {h_order}: {h_text}")
+        description = "\n".join(lines)
+        if len(description) > 4000:
+            description = description[:3997] + "..."
+        embed = discord.Embed(
+            title=f"💡 Hints — {game_name}",
+            description=description,
+            color=discord.Color.teal())
+        embed.set_footer(
+            text=f"Page {page_idx+1}/{total_pages} | {len(answer_list)} answers with hints"
+                 " | Use /removehint <ID> to delete a hint")
+        pages.append(embed)
+
+    view = GameListView(pages, interaction.user.id)
+    await interaction.followup.send(
+        embed=pages[0],
+        view=view if len(pages) > 1 else None,
+        ephemeral=True)
 
 
 # ── List games (paginated) ────────────────────────────────────────────────────
@@ -4916,8 +4960,14 @@ async def _log_command_use(interaction: discord.Interaction):
     await log_event(interaction.guild.id, "command", embed)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOGGING PATCHES  ── use ._callback (private attr) because the .callback
-# property has no setter in this version of discord.py
+# LOGGING PATCHES
+# Rules:
+#   • Admin-only commands: check is_allowed_to_giveaway BEFORE logging so
+#     denied attempts don't appear as successful actions in the log.
+#   • User commands (buy, use, redeem): pre-check all early-return conditions
+#     before the original call so we know whether it will succeed.
+#   • chest / vipchest / roulette / blackjack: logged inline inside the command
+#     bodies (so the actual amount/outcome is used). No patches for those.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -4925,6 +4975,7 @@ async def _log_command_use(interaction: discord.Interaction):
 _orig_addbalance = addbalance._callback
 async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_addbalance(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "balance", _log_embed(
         "💰 Balance Added", discord.Color.green(),
         Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
@@ -4936,6 +4987,7 @@ addbalance._callback = _addbalance_logged
 _orig_removebalance = removebalance._callback
 async def _removebalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_removebalance(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "balance", _log_embed(
         "💸 Balance Removed", discord.Color.red(),
         Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
@@ -4946,6 +4998,12 @@ removebalance._callback = _removebalance_logged
 
 _orig_gift = gift._callback
 async def _gift_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    # Pre-check every condition that causes gift() to return early without acting
+    if (amount <= 0 or
+            user.id == interaction.user.id or
+            await get_balance(interaction.guild.id, interaction.user.id) < amount):
+        await _orig_gift(interaction, user, amount)
+        return
     await _orig_gift(interaction, user, amount)
     await log_event(interaction.guild.id, "balance", _log_embed(
         "🎁 Gift Sent", discord.Color.green(),
@@ -4957,6 +5015,7 @@ gift._callback = _gift_logged
 _orig_addexp = addexp._callback
 async def _addexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_addexp(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "exp", _log_embed(
         "⭐ Usable EXP Added", discord.Color.green(),
         Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
@@ -4968,6 +5027,7 @@ addexp._callback = _addexp_logged
 _orig_removeexp = removeexp._callback
 async def _removeexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_removeexp(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "exp", _log_embed(
         "📉 EXP Removed", discord.Color.red(),
         Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
@@ -4976,7 +5036,7 @@ async def _removeexp_logged(interaction: discord.Interaction, user: discord.Memb
         By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
 removeexp._callback = _removeexp_logged
 
-# NOTE: addtotalexp and removetotalexp already call log_event inline — no patch needed.
+# NOTE: addtotalexp and removetotalexp already call log_event inline.
 
 # ── Items / keys / tokens ─────────────────────────────────────────────────────
 
@@ -4984,6 +5044,7 @@ _orig_item_give = item_give._callback
 async def _item_give_logged(interaction: discord.Interaction,
                              user: discord.Member, name: str, quantity: int = 1):
     await _orig_item_give(interaction, user, name, quantity)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎒 Item Given", discord.Color.green(),
         Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
@@ -4996,6 +5057,7 @@ _orig_item_take = item_take._callback
 async def _item_take_logged(interaction: discord.Interaction,
                              user: discord.Member, name: str, quantity: int = 1):
     await _orig_item_take(interaction, user, name, quantity)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎒 Item Taken", discord.Color.red(),
         Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
@@ -5006,24 +5068,49 @@ item_take._callback = _item_take_logged
 
 _orig_item_buy = item_buy._callback
 async def _item_buy_logged(interaction: discord.Interaction, name: str):
+    # Pre-check: item must exist, role must exist, user must afford it
+    item = await get_item(interaction.guild.id, name)
+    should_log = (
+        item is not None and
+        interaction.guild.get_role(item[3]) is not None and
+        await get_balance(interaction.guild.id, interaction.user.id) >= item[2]
+    )
     await _orig_item_buy(interaction, name)
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🛒 Item Purchased", discord.Color.blue(),
-        User=interaction.user.mention, Item=name))
+    if should_log:
+        await log_event(interaction.guild.id, "item", _log_embed(
+            "🛒 Item Purchased", discord.Color.blue(),
+            User=interaction.user.mention, Item=name))
 item_buy._callback = _item_buy_logged
 
 _orig_item_use = item_use._callback
 async def _item_use_logged(interaction: discord.Interaction, name: str):
+    # Pre-check every early-return condition inside item_use()
+    item = await get_item(interaction.guild.id, name)
+    if item:
+        _, item_name, _, role_id, _ = item
+        inv    = {n.lower(): q for n, q in await inventory_get(interaction.guild.id, interaction.user.id)}
+        role   = interaction.guild.get_role(role_id)
+        member = interaction.guild.get_member(interaction.user.id)
+        should_log = (
+            inv.get(item_name.lower(), 0) >= 1 and
+            role is not None and
+            member is not None and
+            role not in member.roles
+        )
+    else:
+        should_log = False
     await _orig_item_use(interaction, name)
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "✅ Item Used (Role Claimed)", discord.Color.blue(),
-        User=interaction.user.mention, Item=name))
+    if should_log:
+        await log_event(interaction.guild.id, "item", _log_embed(
+            "✅ Item Used (Role Claimed)", discord.Color.blue(),
+            User=interaction.user.mention, Item=name))
 item_use._callback = _item_use_logged
 
 _orig_givekey = givekey._callback
 async def _givekey_logged(interaction: discord.Interaction,
                            user: discord.Member, amount: int = 1):
     await _orig_givekey(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🔑 VIP Key Given", discord.Color.green(),
         Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
@@ -5036,6 +5123,7 @@ _orig_takekey = takekey._callback
 async def _takekey_logged(interaction: discord.Interaction,
                            user: discord.Member, amount: int = 1):
     await _orig_takekey(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🔑 VIP Key Taken", discord.Color.red(),
         Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
@@ -5048,6 +5136,7 @@ _orig_givegambletoken = givegambletoken._callback
 async def _givegambletoken_logged(interaction: discord.Interaction,
                                    user: discord.Member, amount: int = 1):
     await _orig_givegambletoken(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎲 Gamble Token Given", discord.Color.green(),
         Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
@@ -5060,6 +5149,7 @@ _orig_takegambletoken = takegambletoken._callback
 async def _takegambletoken_logged(interaction: discord.Interaction,
                                    user: discord.Member, amount: int = 1):
     await _orig_takegambletoken(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "item", _log_embed(
         "🎲 Gamble Token Taken", discord.Color.red(),
         Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
@@ -5072,11 +5162,19 @@ takegambletoken._callback = _takegambletoken_logged
 
 _orig_buytickets = buytickets._callback
 async def _buytickets_logged(interaction: discord.Interaction, amount: int):
+    # Pre-check: system on, positive amount, sufficient balance
+    price = amount * RAFFLE_TICKET_PRICE
+    should_log = (
+        amount > 0 and
+        await is_system_enabled(interaction.guild.id, "raffle") and
+        await get_balance(interaction.guild.id, interaction.user.id) >= price
+    )
     await _orig_buytickets(interaction, amount)
-    await log_event(interaction.guild.id, "raffle", _log_embed(
-        "🎟 Tickets Purchased", discord.Color.gold(),
-        User=interaction.user.mention, Tickets=str(amount),
-        Cost=f"{amount * RAFFLE_TICKET_PRICE:,} coins"))
+    if should_log:
+        await log_event(interaction.guild.id, "raffle", _log_embed(
+            "🎟 Tickets Purchased", discord.Color.gold(),
+            User=interaction.user.mention, Tickets=str(amount),
+            Cost=f"{price:,} coins"))
 buytickets._callback = _buytickets_logged
 
 # ── Giveaway ──────────────────────────────────────────────────────────────────
@@ -5095,6 +5193,7 @@ async def _giveaway_logged(
         interaction, prize, seconds, winners, reward_balance, reward_exp,
         reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role,
         reward_item, reward_item_qty, channel, required_role, template)
+    if not await is_allowed_to_giveaway(interaction): return
     ch = channel or interaction.channel
     embed = _log_embed("🎉 Giveaway Created", discord.Color.gold(),
         By=interaction.user.mention, Prize=prize,
@@ -5114,73 +5213,74 @@ async def _createcode_logged(
 ):
     await _orig_createcode(interaction, code, prize_json, uses,
                             min_activity_rank, min_balance, required_role)
+    if not await is_allowed_to_giveaway(interaction): return
     await log_event(interaction.guild.id, "code", _log_embed(
         "🎫 Code Created", discord.Color.green(),
-        By=interaction.user.mention, Code=code,
+        By=interaction.user.mention, Code=code.upper().strip(),
         Uses="∞" if uses == -1 else str(uses), MinRank=str(min_activity_rank)))
     await log_event(interaction.guild.id, "admin", _log_embed(
         "⚙️ createcode", discord.Color.orange(),
-        By=interaction.user.mention, Code=code,
+        By=interaction.user.mention, Code=code.upper().strip(),
         Uses="∞" if uses == -1 else str(uses)))
 createcode._callback = _createcode_logged
 
 _orig_redeem = redeem._callback
 async def _redeem_logged(interaction: discord.Interaction, code: str):
+    code_upper = code.upper().strip()
+    # Pre-check: code must exist and not yet used by this person
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT uses_left FROM redeem_codes WHERE guild_id=? AND code=?",
+            (interaction.guild.id, code_upper)) as cur:
+            guild_row = await cur.fetchone()
+        async with db.execute(
+            "SELECT uses_left FROM global_redeem_codes WHERE code=?",
+            (code_upper,)) as cur:
+            global_row = await cur.fetchone()
+    # Determine if a successful redemption is possible
+    should_log = False
+    if guild_row and guild_row[0] != 0:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT 1 FROM code_uses WHERE guild_id=? AND code=? AND user_id=?",
+                (interaction.guild.id, code_upper, interaction.user.id)) as cur:
+                should_log = (await cur.fetchone() is None)
+    elif global_row and global_row[0] != 0:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT 1 FROM global_code_uses WHERE code=? AND user_id=?",
+                (code_upper, interaction.user.id)) as cur:
+                should_log = (await cur.fetchone() is None)
     await _orig_redeem(interaction, code)
-    await log_event(interaction.guild.id, "code", _log_embed(
-        "🎫 Code Redeemed", discord.Color.green(),
-        User=interaction.user.mention, Code=code.upper().strip()))
+    if should_log:
+        await log_event(interaction.guild.id, "code", _log_embed(
+            "🎫 Code Redeemed", discord.Color.green(),
+            User=interaction.user.mention, Code=code_upper))
 redeem._callback = _redeem_logged
 
-# ── Chests / boxes ────────────────────────────────────────────────────────────
-
-_orig_chest = chest._callback
-async def _chest_logged(interaction: discord.Interaction, amount: int = 1):
-    await _orig_chest(interaction, amount)
-    await log_event(interaction.guild.id, "chest", _log_embed(
-        "📦 Chest Opened", discord.Color.purple(),
-        User=interaction.user.mention, Amount=str(amount),
-        Cost=f"{CHEST_COST * amount:,} EXP"))
-chest._callback = _chest_logged
-
-_orig_vipchest = vipchest._callback
-async def _vipchest_logged(interaction: discord.Interaction, amount: int = 1):
-    await _orig_vipchest(interaction, amount)
-    await log_event(interaction.guild.id, "chest", _log_embed(
-        "💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
-        User=interaction.user.mention, Keys_Used=str(amount)))
-vipchest._callback = _vipchest_logged
+# ── Chests / boxes ───────────────────────────────────────────────────────────
+# chest and vipchest: log_event moved inline into the command bodies (Fixes 2 & 3).
+# openbox stays as a patch — amount can't change inside openbox.
 
 _orig_openbox = openbox._callback
 async def _openbox_logged(interaction: discord.Interaction, box: str, amount: int = 1):
+    if amount <= 0:
+        await _orig_openbox(interaction, box, amount); return
+    inv   = await inventory_get(interaction.guild.id, interaction.user.id)
+    owned = {n.lower(): q for n, q in inv}
+    if owned.get(box.lower(), 0) < amount:
+        await _orig_openbox(interaction, box, amount); return
     await _orig_openbox(interaction, box, amount)
     await log_event(interaction.guild.id, "box", _log_embed(
         "🎁 Box Opened", discord.Color.orange(),
         User=interaction.user.mention, Box=box, Amount=str(amount)))
 openbox._callback = _openbox_logged
 
-# ── Gambling ──────────────────────────────────────────────────────────────────
-
-_orig_roulette = roulette._callback
-async def _roulette_logged(interaction: discord.Interaction, bet: int, choice: str):
-    await _orig_roulette(interaction, bet, choice)
-    await log_event(interaction.guild.id, "gamble", _log_embed(
-        "🎰 Roulette Played", discord.Color.gold(),
-        User=interaction.user.mention, Bet=f"{bet:,}", Choice=choice))
-roulette._callback = _roulette_logged
-
-# _BJView._resolve is a plain class method — standard Python patching works fine.
-_orig_bj_resolve = _BJView._resolve
-async def _bj_resolve_logged(self, inter: discord.Interaction):
-    await _orig_bj_resolve(self, inter)
-    if inter.guild:
-        await log_event(inter.guild.id, "gamble", _log_embed(
-            "🃏 Blackjack Played", discord.Color.dark_green(),
-            User=inter.user.mention, Total_Bet=f"{sum(self.state.bets):,}"))
-_BJView._resolve = _bj_resolve_logged
+# ── Gambling ─────────────────────────────────────────────────────────────────
+# roulette and blackjack: logged inline (Fixes 4 & 5). No patches here.
 
 # ── Trade ─────────────────────────────────────────────────────────────────────
-# execute_trade is a plain async function — module-level rebinding works fine.
+
 _orig_execute_trade = execute_trade
 async def _execute_trade_logged(session) -> tuple[bool, str]:
     success, err = await _orig_execute_trade(session)
@@ -5203,7 +5303,6 @@ async def _execute_trade_logged(session) -> tuple[bool, str]:
     return success, err
 execute_trade = _execute_trade_logged
 
-# end_giveaway is also a plain async function — same approach.
 _orig_end_giveaway = end_giveaway
 async def _end_giveaway_logged(message_id, reroll=False):
     await _orig_end_giveaway(message_id, reroll)
