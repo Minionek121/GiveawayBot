@@ -5,6 +5,7 @@ import asyncio
 import aiosqlite
 from datetime import datetime, timedelta, UTC
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -112,6 +113,8 @@ async def is_system_enabled(guild_id: int, flag: str) -> bool:
 # ═══════════════════════════════════════════════════════
 
 async def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
+    if interaction.user.id == BOT_OWNER_ID:          # owner is always allowed
+        return True
     member = interaction.user
     if not isinstance(member, discord.Member):
         return False
@@ -124,7 +127,7 @@ async def is_allowed_to_giveaway(interaction: discord.Interaction) -> bool:
                 rows = await cur.fetchall()
     allowed = {r[0] for r in rows}
     return any(role.id in allowed for role in member.roles)
-
+    
 # ═══════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════
@@ -260,6 +263,31 @@ async def setup_database():
                     pass
             try:
                 await db.execute("ALTER TABLE exp_history ADD COLUMN is_bonus INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError:
+                pass
+            # ── Game system expansions ─────────────────────────────────────
+            await db.execute("""CREATE TABLE IF NOT EXISTS game_hints(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER, game_name TEXT, answer_id INTEGER,
+                hint_text TEXT, hint_order INTEGER DEFAULT 1)""")
+
+            for _col in [
+                ("reward_tickets",       "INTEGER DEFAULT 0"),
+                ("reward_gamble_tokens", "INTEGER DEFAULT 0"),
+                ("reward_vip_keys",      "INTEGER DEFAULT 0"),
+                ("reward_item",          "TEXT"),
+                ("reward_item_qty",      "INTEGER DEFAULT 1"),
+                ("reward_role_id",       "INTEGER DEFAULT 0"),
+                ("chance",               "REAL DEFAULT 1.0"),
+                ("answer_time",          "INTEGER DEFAULT 30"),
+            ]:
+                try:
+                    await db.execute(f"ALTER TABLE games ADD COLUMN {_col[0]} {_col[1]}")
+                except aiosqlite.OperationalError:
+                    pass
+
+            try:
+                await db.execute("ALTER TABLE game_config ADD COLUMN hint_delays TEXT")
             except aiosqlite.OperationalError:
                 pass
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
@@ -509,6 +537,18 @@ async def giveaway_timer(message_id: int, delay: int):
         await end_giveaway(message_id)
     except Exception as e:
         print(f"[GiveawayTimer] {message_id}: {e}")
+
+async def _send_hint_at(channel: discord.TextChannel, hint_text: str,
+                         delay_secs: float, stop_event: asyncio.Event):
+    """Wait delay_secs, then post a hint — unless the game was already answered."""
+    try:
+        await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=delay_secs)
+        # Event fired before timeout: game already answered, skip hint
+    except asyncio.TimeoutError:
+        if not stop_event.is_set():
+            await channel.send(f"💡 **Hint:** {hint_text}")
+    except (asyncio.CancelledError, Exception):
+        pass
 
 # ═══════════════════════════════════════════════════════
 # ON_MESSAGE  (game guesses + EXP with boosts)
@@ -3207,31 +3247,544 @@ async def roulette(interaction: discord.Interaction, bet: int, choice: str):
     await interaction.response.send_message(embed=embed)
 
 # ═══════════════════════════════════════════════════════
+# GAME PRESETS
+# ═══════════════════════════════════════════════════════
+
+def _ch(continent: str, cap_letter: str, extra: str = None) -> list[str]:
+    h = [f"This country is in {continent}",
+         f"Its capital city starts with the letter '{cap_letter}'"]
+    if extra:
+        h.append(extra)
+    return h
+
+_PRESET_DATA: dict[str, dict] = {
+    # ── Colors ────────────────────────────────────────────────────────────
+    "colors": {
+        "description": "Common colors",
+        "answers_hints": {
+            "Red":        ["It is a primary color",          "It is a warm color",           "Associated with fire and blood",    "Opposite of green on a color wheel"],
+            "Orange":     ["It is a warm color",             "Secondary color (red + yellow)","Color of pumpkins",                 "Named after the fruit"],
+            "Yellow":     ["It is a primary color",          "It is a warm color",           "Color of the sun and bananas",      "Brightest color to the human eye"],
+            "Green":      ["It is a secondary color",        "It is a cool color",           "Color of grass and leaves",         "Made by mixing blue and yellow"],
+            "Blue":       ["It is a primary color",          "It is a cool color",           "Color of the sky and oceans",       "Most popular favorite color worldwide"],
+            "Purple":     ["It is a secondary color",        "It is a cool color",           "Historically associated with royalty","Made by mixing red and blue"],
+            "Pink":       ["It is a warm color",             "Made by mixing red and white", "Color of flamingos and roses"],
+            "Brown":      ["It is a neutral/warm color",     "Color of wood and chocolate",  "Made by mixing all three primary colors"],
+            "Black":      ["It is an achromatic color",      "Absorbs all visible light",    "The darkest possible color"],
+            "White":      ["It is an achromatic color",      "Reflects all visible light",   "The lightest possible color"],
+            "Gray":       ["Between black and white",        "Color of storm clouds",        "An achromatic/neutral color"],
+            "Grey":       ["Between black and white",        "British spelling variant",     "An achromatic/neutral color"],
+            "Cyan":       ["Cool color",                     "Made by mixing blue and green","Used in CMYK printing",             "Color of tropical ocean water"],
+            "Magenta":    ["Warm color",                     "Used in CMYK printing",        "Mix of red and violet"],
+            "Turquoise":  ["Cool color",                     "Mix of blue and green",        "Color of the gemstone turquoise"],
+            "Violet":     ["Cool color",                     "Shortest visible wavelength",  "Part of the rainbow (ROY G BIV)"],
+            "Indigo":     ["Cool color",                     "Between blue and violet",      "One of Newton's seven rainbow colors"],
+            "Maroon":     ["Warm color",                     "Dark brownish-red",            "Named after the French word for chestnut"],
+            "Navy":       ["Cool color",                     "Very dark blue",               "Named after naval uniform color"],
+            "Olive":      ["Warm/neutral color",             "Dark yellowish-green",         "Color of unripe olives"],
+            "Teal":       ["Cool color",                     "Combination of blue and green","Named after the common teal duck"],
+            "Coral":      ["Warm color",                     "Mix of orange, pink, and red", "Named after coral reef organisms"],
+            "Gold":       ["Warm color",                     "Shiny metallic yellow",        "Color of the precious metal gold"],
+            "Silver":     ["Cool/neutral color",             "Shiny metallic gray",          "Color of the precious metal silver"],
+            "Beige":      ["Neutral color",                  "Pale sandy color",             "Commonly used in interior design"],
+            "Lavender":   ["Cool color",                     "Light purple/violet",          "Named after the lavender flower"],
+            "Crimson":    ["Warm color",                     "Strong, deep red",             "Associated with passion and urgency"],
+            "Scarlet":    ["Warm color",                     "Bright red with orange tint",  "Associated with warning and danger"],
+            "Azure":      ["Cool color",                     "Bright cerulean blue",         "Color of a clear midday sky"],
+        }
+    },
+
+    # ── Africa ────────────────────────────────────────────────────────────
+    "countries_africa": {
+        "description": "Countries in Africa",
+        "answers_hints": {
+            "Algeria":                          _ch("Africa", "A", "Largest country in Africa by area"),
+            "Angola":                           _ch("Africa", "L"),
+            "Benin":                            _ch("Africa", "P", "Historically a center of the Voodoo religion"),
+            "Botswana":                         _ch("Africa", "G", "Home to the Okavango Delta"),
+            "Burkina Faso":                     _ch("Africa", "O"),
+            "Burundi":                          _ch("Africa", "G", "One of the smallest countries in Africa"),
+            "Cameroon":                         _ch("Africa", "Y", "Called 'Africa in miniature' for its diversity"),
+            "Cape Verde":                       _ch("Africa", "P", "Atlantic island nation off West Africa"),
+            "Central African Republic":         _ch("Africa", "B"),
+            "Chad":                             _ch("Africa", "N", "Named after Lake Chad"),
+            "Comoros":                          _ch("Africa", "M", "Island nation in the Indian Ocean"),
+            "Democratic Republic of the Congo": _ch("Africa", "K", "Second largest country in Africa"),
+            "Republic of the Congo":            _ch("Africa", "B"),
+            "Djibouti":                         _ch("Africa", "D", "One of the smallest countries in mainland Africa"),
+            "Egypt":                            _ch("Africa", "C", "Home to the ancient pyramids and Sphinx"),
+            "Equatorial Guinea":                _ch("Africa", "M", "Only African country with Spanish as official language"),
+            "Eritrea":                          _ch("Africa", "A"),
+            "Eswatini":                         _ch("Africa", "M", "Formerly known as Swaziland"),
+            "Ethiopia":                         _ch("Africa", "A", "Never colonized; one of the oldest civilizations"),
+            "Gabon":                            _ch("Africa", "L"),
+            "Gambia":                           _ch("Africa", "B", "Smallest country in mainland Africa"),
+            "Ghana":                            _ch("Africa", "A", "First sub-Saharan country to gain independence"),
+            "Guinea":                           _ch("Africa", "C"),
+            "Guinea-Bissau":                    _ch("Africa", "B"),
+            "Ivory Coast":                      _ch("Africa", "Y", "World's largest cocoa producer; also called Côte d'Ivoire"),
+            "Kenya":                            _ch("Africa", "N", "Famous for the Maasai Mara wildlife reserve"),
+            "Lesotho":                          _ch("Africa", "M", "Landlocked country entirely surrounded by South Africa"),
+            "Liberia":                          _ch("Africa", "M", "Founded by freed American slaves"),
+            "Libya":                            _ch("Africa", "T"),
+            "Madagascar":                       _ch("Africa", "A", "Fourth largest island in the world"),
+            "Malawi":                           _ch("Africa", "L"),
+            "Mali":                             _ch("Africa", "B", "Home to the ancient city of Timbuktu"),
+            "Mauritania":                       _ch("Africa", "N"),
+            "Mauritius":                        _ch("Africa", "P", "Island nation in the Indian Ocean"),
+            "Morocco":                          _ch("Africa", "R", "Northernmost country in Africa"),
+            "Mozambique":                       _ch("Africa", "M"),
+            "Namibia":                          _ch("Africa", "W", "Home to the Namib Desert, one of Earth's oldest"),
+            "Niger":                            _ch("Africa", "N"),
+            "Nigeria":                          _ch("Africa", "A", "Most populous country in Africa"),
+            "Rwanda":                           _ch("Africa", "K", "Known as the 'Land of a Thousand Hills'"),
+            "São Tomé and Príncipe":             _ch("Africa", "S", "Smallest country in Africa by population"),
+            "Senegal":                          _ch("Africa", "D"),
+            "Seychelles":                       _ch("Africa", "V", "Island nation; smallest population in Africa"),
+            "Sierra Leone":                     _ch("Africa", "F"),
+            "Somalia":                          _ch("Africa", "M", "Easternmost country in Africa"),
+            "South Africa":                     _ch("Africa", "P", "Has three capital cities"),
+            "South Sudan":                      _ch("Africa", "J", "World's youngest country, independent since 2011"),
+            "Sudan":                            _ch("Africa", "K"),
+            "Tanzania":                         _ch("Africa", "D", "Home to Mount Kilimanjaro, Africa's highest peak"),
+            "Togo":                             _ch("Africa", "L"),
+            "Tunisia":                          _ch("Africa", "T", "Northeasternmost country in Africa"),
+            "Uganda":                           _ch("Africa", "K", "Home to mountain gorillas"),
+            "Zambia":                           _ch("Africa", "L", "Home to Victoria Falls"),
+            "Zimbabwe":                         _ch("Africa", "H", "Shares Victoria Falls with Zambia"),
+        }
+    },
+
+    # ── Americas ─────────────────────────────────────────────────────────
+    "countries_americas": {
+        "description": "Countries in the Americas",
+        "answers_hints": {
+            "Antigua and Barbuda":              _ch("the Caribbean", "S", "Island nation said to have 365 beaches"),
+            "Argentina":                        _ch("South America", "B", "Second largest country in South America"),
+            "Bahamas":                          _ch("the Caribbean",  "N", "Archipelago of over 700 islands"),
+            "Barbados":                         _ch("the Caribbean",  "B", "Birthplace of rum production"),
+            "Belize":                           _ch("Central America","B", "Only Central American country with English as official language"),
+            "Bolivia":                          _ch("South America",  "S", "Home to one of the world's highest capital cities"),
+            "Brazil":                           _ch("South America",  "B", "Largest country in South America"),
+            "Canada":                           _ch("North America",  "O", "Second largest country in the world by area"),
+            "Chile":                            _ch("South America",  "S", "Longest country in the world from north to south"),
+            "Colombia":                         _ch("South America",  "B", "Only South American country with coastline on both Pacific and Caribbean"),
+            "Costa Rica":                       _ch("Central America","S", "Has no standing army; known for biodiversity"),
+            "Cuba":                             _ch("the Caribbean",  "H", "Largest island in the Caribbean"),
+            "Dominica":                         _ch("the Caribbean",  "R", "Known as the 'Nature Isle of the Caribbean'"),
+            "Dominican Republic":               _ch("the Caribbean",  "S", "Shares the island of Hispaniola with Haiti"),
+            "Ecuador":                          _ch("South America",  "Q", "Named after the equator that crosses it"),
+            "El Salvador":                      _ch("Central America","S", "Smallest and most densely populated in Central America"),
+            "Grenada":                          _ch("the Caribbean",  "S", "Known as the 'Spice Isle'"),
+            "Guatemala":                        _ch("Central America","G", "Most populous country in Central America"),
+            "Guyana":                           _ch("South America",  "G", "Only English-speaking country in South America"),
+            "Haiti":                            _ch("the Caribbean",  "P", "First Black republic in the world"),
+            "Honduras":                         _ch("Central America","T"),
+            "Jamaica":                          _ch("the Caribbean",  "K", "Birthplace of reggae music and Bob Marley"),
+            "Mexico":                           _ch("North America",  "M", "Largest Spanish-speaking country in the world"),
+            "Nicaragua":                        _ch("Central America","M", "Largest country in Central America"),
+            "Panama":                           _ch("Central America","P", "Home to the famous canal connecting two oceans"),
+            "Paraguay":                         _ch("South America",  "A", "Doubly landlocked country in South America"),
+            "Peru":                             _ch("South America",  "L", "Home to Machu Picchu and the Amazon River source"),
+            "Saint Kitts and Nevis":            _ch("the Caribbean",  "B", "Smallest country in the Americas"),
+            "Saint Lucia":                      _ch("the Caribbean",  "C"),
+            "Saint Vincent and the Grenadines": _ch("the Caribbean",  "K"),
+            "Suriname":                         _ch("South America",  "P", "Smallest country in South America"),
+            "Trinidad and Tobago":              _ch("the Caribbean",  "P", "Southernmost Caribbean island nation"),
+            "United States":                    _ch("North America",  "W", "Third largest country by area"),
+            "Uruguay":                          _ch("South America",  "M", "Smallest Spanish-speaking country in South America"),
+            "Venezuela":                        _ch("South America",  "C", "Home to Angel Falls, world's highest waterfall"),
+        }
+    },
+
+    # ── Asia ─────────────────────────────────────────────────────────────
+    "countries_asia": {
+        "description": "Countries in Asia",
+        "answers_hints": {
+            "Afghanistan":          _ch("Asia", "K"),
+            "Armenia":              _ch("Asia", "Y", "First country in history to adopt Christianity as state religion"),
+            "Azerbaijan":           _ch("Asia", "B", "Known as the 'Land of Fire'"),
+            "Bahrain":              _ch("Asia", "M", "Smallest country in Asia"),
+            "Bangladesh":           _ch("Asia", "D", "One of the most densely populated countries"),
+            "Bhutan":               _ch("Asia", "T", "Measures Gross National Happiness instead of GDP"),
+            "Brunei":               _ch("Asia", "B", "Oil-rich sultanate on the island of Borneo"),
+            "Cambodia":             _ch("Asia", "P", "Home to Angkor Wat, the largest religious monument"),
+            "China":                _ch("Asia", "B", "Most populous country in the world"),
+            "Cyprus":               _ch("Asia", "N", "Island country in the Mediterranean Sea"),
+            "Georgia":              _ch("Asia", "T", "Claims to be the birthplace of wine"),
+            "India":                _ch("Asia", "N", "Second most populous country in the world"),
+            "Indonesia":            _ch("Asia", "J", "Largest archipelago nation in the world"),
+            "Iran":                 _ch("Asia", "T", "Formerly known as Persia"),
+            "Iraq":                 _ch("Asia", "B", "Location of ancient Mesopotamia"),
+            "Israel":               _ch("Asia", "J", "Country in the Middle East"),
+            "Japan":                _ch("Asia", "T", "Island nation known for Mount Fuji"),
+            "Jordan":               _ch("Asia", "A", "Home to the ancient rose-red city of Petra"),
+            "Kazakhstan":           _ch("Asia", "N", "Largest landlocked country in the world"),
+            "Kuwait":               _ch("Asia", "K", "One of the wealthiest countries per capita"),
+            "Kyrgyzstan":           _ch("Asia", "B"),
+            "Laos":                 _ch("Asia", "V", "Only landlocked country in Southeast Asia"),
+            "Lebanon":              _ch("Asia", "B", "Known as the 'Switzerland of the Middle East'"),
+            "Malaysia":             _ch("Asia", "K", "Home to the Petronas Twin Towers"),
+            "Maldives":             _ch("Asia", "M", "Lowest-lying country in the world"),
+            "Mongolia":             _ch("Asia", "U", "Most sparsely populated country in the world"),
+            "Myanmar":              _ch("Asia", "N", "Formerly known as Burma"),
+            "Nepal":                _ch("Asia", "K", "Home to Mount Everest, the world's highest peak"),
+            "North Korea":          _ch("Asia", "P"),
+            "Oman":                 _ch("Asia", "M"),
+            "Pakistan":             _ch("Asia", "I"),
+            "Palestine":            _ch("Asia", "R"),
+            "Philippines":          _ch("Asia", "M", "Archipelago of over 7,600 islands"),
+            "Qatar":                _ch("Asia", "D", "Host of the 2022 FIFA World Cup"),
+            "Saudi Arabia":         _ch("Asia", "R", "Largest country in the Middle East"),
+            "Singapore":            _ch("Asia", "S", "City-state and one of the world's leading financial hubs"),
+            "South Korea":          _ch("Asia", "S"),
+            "Sri Lanka":            _ch("Asia", "C", "Island nation called the 'Pearl of the Indian Ocean'"),
+            "Syria":                _ch("Asia", "D"),
+            "Taiwan":               _ch("Asia", "T"),
+            "Tajikistan":           _ch("Asia", "D"),
+            "Thailand":             _ch("Asia", "B", "Known as the 'Land of Smiles'"),
+            "Timor-Leste":          _ch("Asia", "D", "Also known as East Timor"),
+            "Turkey":               _ch("Asia", "A", "Bridges Europe and Asia; formerly the Ottoman Empire"),
+            "Turkmenistan":         _ch("Asia", "A"),
+            "United Arab Emirates": _ch("Asia", "A", "Home to the Burj Khalifa, world's tallest building"),
+            "Uzbekistan":           _ch("Asia", "T", "Doubly landlocked country"),
+            "Vietnam":              _ch("Asia", "H", "S-shaped country in Southeast Asia"),
+            "Yemen":                _ch("Asia", "S"),
+        }
+    },
+
+    # ── Europe ───────────────────────────────────────────────────────────
+    "countries_europe": {
+        "description": "Countries in Europe",
+        "answers_hints": {
+            "Albania":                  _ch("Europe", "T"),
+            "Andorra":                  _ch("Europe", "A", "Microstate in the Pyrenees between France and Spain"),
+            "Austria":                  _ch("Europe", "V", "Home of Mozart; former center of the Habsburg Empire"),
+            "Belarus":                  _ch("Europe", "M"),
+            "Belgium":                  _ch("Europe", "B", "Home of the European Union headquarters"),
+            "Bosnia and Herzegovina":   _ch("Europe", "S"),
+            "Bulgaria":                 _ch("Europe", "S"),
+            "Croatia":                  _ch("Europe", "Z", "Famous for Dubrovnik and Plitvice Lakes"),
+            "Czech Republic":           _ch("Europe", "P", "Also called Czechia; home to medieval Prague"),
+            "Denmark":                  _ch("Europe", "C", "Birthplace of Hans Christian Andersen"),
+            "Estonia":                  _ch("Europe", "T", "One of the most digitally advanced countries"),
+            "Finland":                  _ch("Europe", "H", "Home of Santa Claus (Rovaniemi)"),
+            "France":                   _ch("Europe", "P", "Home to the Eiffel Tower; most visited country"),
+            "Germany":                  _ch("Europe", "B", "Most populous country in the European Union"),
+            "Greece":                   _ch("Europe", "A", "Birthplace of democracy and the Olympic Games"),
+            "Hungary":                  _ch("Europe", "B", "Known for thermal baths and paprika"),
+            "Iceland":                  _ch("Europe", "R", "Most sparsely populated country in Europe"),
+            "Ireland":                  _ch("Europe", "D", "Known as the 'Emerald Isle'"),
+            "Italy":                    _ch("Europe", "R", "Home to the Roman Colosseum and pizza"),
+            "Kosovo":                   _ch("Europe", "P", "One of the youngest countries in Europe (2008)"),
+            "Latvia":                   _ch("Europe", "R"),
+            "Liechtenstein":            _ch("Europe", "V", "Doubly landlocked microstate"),
+            "Lithuania":                _ch("Europe", "V", "Largest of the three Baltic states"),
+            "Luxembourg":               _ch("Europe", "L", "One of the world's wealthiest countries"),
+            "Malta":                    _ch("Europe", "V", "Smallest EU member state"),
+            "Moldova":                  _ch("Europe", "C"),
+            "Monaco":                   _ch("Europe", "M", "Second smallest country in the world"),
+            "Montenegro":               _ch("Europe", "P"),
+            "Netherlands":              _ch("Europe", "A", "Famous for windmills, tulips, and canals"),
+            "North Macedonia":          _ch("Europe", "S"),
+            "Norway":                   _ch("Europe", "O", "Famous for fjords and the Northern Lights"),
+            "Poland":                   _ch("Europe", "W"),
+            "Portugal":                 _ch("Europe", "L", "Westernmost country in continental Europe"),
+            "Romania":                  _ch("Europe", "B", "Home to Transylvania and the Dracula legend"),
+            "Russia":                   _ch("Europe", "M", "Largest country in the world by area"),
+            "San Marino":               _ch("Europe", "S", "World's oldest republic; surrounded by Italy"),
+            "Serbia":                   _ch("Europe", "B"),
+            "Slovakia":                 _ch("Europe", "B"),
+            "Slovenia":                 _ch("Europe", "L"),
+            "Spain":                    _ch("Europe", "M", "Famous for flamenco and paella"),
+            "Sweden":                   _ch("Europe", "S", "Home of IKEA, ABBA, and Volvo"),
+            "Switzerland":              _ch("Europe", "B", "Famous for chocolate, cheese, and watches"),
+            "Ukraine":                  _ch("Europe", "K", "Largest country lying entirely within Europe"),
+            "United Kingdom":           _ch("Europe", "L", "Made up of England, Scotland, Wales, and Northern Ireland"),
+            "Vatican City":             _ch("Europe", "V", "Smallest country in the world; home of the Pope"),
+        }
+    },
+
+    # ── Oceania ──────────────────────────────────────────────────────────
+    "countries_oceania": {
+        "description": "Countries in Oceania",
+        "answers_hints": {
+            "Australia":         _ch("Oceania", "C", "Largest country in Oceania; home to kangaroos"),
+            "Fiji":              _ch("Oceania", "S", "Island nation in the South Pacific"),
+            "Kiribati":          _ch("Oceania", "T", "One of the first countries threatened by rising sea levels"),
+            "Marshall Islands":  _ch("Oceania", "M"),
+            "Micronesia":        _ch("Oceania", "P", "Full name: Federated States of Micronesia"),
+            "Nauru":             _ch("Oceania", "Y", "Smallest island country in the world"),
+            "New Zealand":       _ch("Oceania", "W", "Filming location for the Lord of the Rings trilogy"),
+            "Palau":             _ch("Oceania", "N"),
+            "Papua New Guinea":  _ch("Oceania", "P", "One of the most biodiverse countries on Earth"),
+            "Samoa":             _ch("Oceania", "A"),
+            "Solomon Islands":   _ch("Oceania", "H"),
+            "Tonga":             _ch("Oceania", "N", "Only monarchy in the Pacific"),
+            "Tuvalu":            _ch("Oceania", "F", "Second smallest country by area"),
+            "Vanuatu":           _ch("Oceania", "P"),
+        }
+    },
+
+    # ── Food ─────────────────────────────────────────────────────────────
+    "food": {
+        "description": "Common foods",
+        "answers_hints": {
+            "Pizza":          ["Italian dish", "Often has cheese and tomato sauce", "Baked in an oven", "Can be topped with pepperoni or vegetables"],
+            "Sushi":          ["Japanese dish", "Usually involves rice and seafood", "Often served with soy sauce and wasabi"],
+            "Burger":         ["American fast food", "Usually beef patty between two buns", "Often served with fries and ketchup"],
+            "Pasta":          ["Italian dish", "Made from flour and water", "Comes in shapes like spaghetti and penne"],
+            "Tacos":          ["Mexican dish", "Served in a folded tortilla", "Filled with meat, beans, or vegetables"],
+            "Ramen":          ["Japanese noodle soup", "Often topped with pork, egg, and nori", "Has a rich broth"],
+            "Curry":          ["Common in South and Southeast Asia", "Made with spices", "Often served with rice or bread"],
+            "Steak":          ["Cut of beef", "Grilled or pan-fried", "Can be ordered rare, medium, or well-done"],
+            "Fried rice":     ["Asian dish", "Made with leftover rice, vegetables, and often egg", "Often cooked in a wok"],
+            "Sandwich":       ["Food between two slices of bread", "Named after the Earl of Sandwich"],
+            "Soup":           ["Liquid dish", "Can be hot or cold", "Made by cooking ingredients in liquid or broth"],
+            "Salad":          ["Dish of raw vegetables", "Often dressed with oil and vinegar", "Can include greens, tomatoes, and cucumber"],
+            "Bread":          ["Baked food made from flour and water", "One of the oldest prepared foods", "Staple in many cultures"],
+            "Cheese":         ["Dairy product made from milk", "Comes in hundreds of varieties", "Can be soft or hard"],
+            "Chocolate":      ["Sweet food made from cacao beans", "Can be dark, milk, or white", "Popular in desserts worldwide"],
+            "Ice cream":      ["Frozen dessert", "Made with cream and sugar", "Comes in many flavors"],
+            "Pancakes":       ["Flat cake cooked on a griddle", "Often served with syrup or fruit", "Popular breakfast food"],
+            "Waffles":        ["Grid-patterned baked food", "Often served with syrup or whipped cream", "Crispy on the outside"],
+            "Dumplings":      ["Dough filled with meat or vegetables", "Common in many Asian cuisines", "Can be steamed or fried"],
+            "Falafel":        ["Middle Eastern dish", "Deep-fried chickpea balls", "Often served in pita bread"],
+            "Hummus":         ["Middle Eastern dip", "Made from chickpeas and tahini", "Often served with pita or vegetables"],
+            "Croissant":      ["French pastry", "Flaky and buttery", "Crescent-shaped baked good"],
+            "Paella":         ["Spanish rice dish", "Often made with seafood or chicken", "Named after the pan it is cooked in"],
+            "Fish and chips": ["British dish", "Battered fried fish served with thick-cut fries", "Often seasoned with malt vinegar"],
+            "Hot dog":        ["American fast food", "Sausage in a long bun", "Common at sporting events"],
+            "Pho":            ["Vietnamese noodle soup", "Made with broth, rice noodles, and herbs", "Often served with beef or chicken"],
+            "Churros":        ["Spanish/Latin American dessert", "Fried dough pastry", "Often dipped in chocolate sauce"],
+            "Biryani":        ["South Asian dish", "Fragrant rice cooked with spices and meat", "Common in India and Pakistan"],
+            "Dim sum":        ["Chinese dish", "Small bite-sized portions served in steamer baskets", "Usually enjoyed with tea"],
+            "Gyoza":          ["Japanese dumplings", "Usually filled with pork and cabbage", "Pan-fried or steamed"],
+        }
+    },
+
+    # ── Fruits ───────────────────────────────────────────────────────────
+    "fruits": {
+        "description": "Common fruits",
+        "answers_hints": {
+            "Apple":          ["Common red or green fruit", "Used to make cider", "Grows on trees", "'An apple a day keeps the doctor away'"],
+            "Banana":         ["Yellow tropical fruit", "High in potassium", "Monkeys love this fruit", "Grows in large bunches"],
+            "Orange":         ["Citrus fruit", "High in vitamin C", "Named after its color", "Florida and Spain are famous for them"],
+            "Grape":          ["Grows in clusters on vines", "Used to make wine and raisins", "Can be red, green, or purple"],
+            "Strawberry":     ["Red fruit with seeds on the outside", "Heart-shaped", "Popular in desserts and jam"],
+            "Watermelon":     ["Large green fruit, red inside", "About 92% water", "Very popular in summer"],
+            "Mango":          ["Tropical fruit", "Yellow or orange flesh", "National fruit of India", "Called the 'king of fruits'"],
+            "Pineapple":      ["Tropical fruit with spiky exterior", "Yellow sweet flesh inside", "Grows from a plant on the ground, not a tree"],
+            "Peach":          ["Fuzzy skin, orange-yellow flesh", "Georgia (USA) is known for growing this", "Related to plums and cherries"],
+            "Pear":           ["Light green or yellow fruit", "Similar to an apple but pear-shaped", "Has a gritty, sweet flesh"],
+            "Cherry":         ["Small round red fruit", "Grows on trees", "Has a hard stone/pit inside"],
+            "Kiwi":           ["Brown fuzzy exterior, bright green inside", "Named after the New Zealand bird", "High in vitamin C"],
+            "Lemon":          ["Yellow citrus fruit", "Very sour taste", "Used in cooking, baking, and cleaning"],
+            "Lime":           ["Small green citrus fruit", "Used in cocktails and cooking", "Related to lemons and oranges"],
+            "Coconut":        ["Large brown tropical fruit", "White flesh and coconut water inside", "Grows on palm trees"],
+            "Avocado":        ["Technically a fruit (berry)", "Green creamy flesh", "Used to make guacamole", "High in healthy fats"],
+            "Blueberry":      ["Small blue/purple berry", "Very high in antioxidants", "Often used in muffins and pancakes"],
+            "Raspberry":      ["Small red or black berry", "Made up of small drupelets", "Tart and sweet flavor"],
+            "Pomegranate":    ["Red fruit full of seeds", "High in antioxidants", "Ancient fruit; originated in the Middle East"],
+            "Papaya":         ["Tropical fruit with orange flesh", "Contains the enzyme papain", "Common in tropical regions"],
+            "Plum":           ["Purple or red smooth-skinned fruit", "Dried plums are called prunes", "Has a single hard stone inside"],
+            "Apricot":        ["Small orange fruit", "Related to peaches and plums", "Often dried or made into jam"],
+            "Fig":            ["Soft fruit with many tiny seeds inside", "Ancient fruit mentioned in the Bible", "Can be fresh or dried"],
+            "Passion fruit":  ["Round tropical fruit, yellow or purple", "Intensely fragrant and flavorful", "Seeds are edible"],
+            "Guava":          ["Tropical fruit, pink or white flesh", "Very high in vitamin C", "Common in Latin America and Asia"],
+            "Lychee":         ["Small tropical fruit", "White translucent flesh", "Sweet and floral flavor"],
+            "Dragon fruit":   ["Cactus fruit", "Pink or yellow exterior", "White or red flesh with black seeds"],
+            "Jackfruit":      ["Very large tropical fruit", "Can weigh up to 80 pounds (36 kg)", "Used as a meat substitute"],
+            "Durian":         ["Southeast Asian fruit", "Known for its extremely strong smell", "Called the 'king of fruits' in Southeast Asia"],
+            "Mandarin":       ["Small citrus fruit", "Easy to peel", "Sweeter and less acidic than an orange"],
+        }
+    },
+
+    # ── Vegetables ───────────────────────────────────────────────────────
+    "vegetables": {
+        "description": "Common vegetables",
+        "answers_hints": {
+            "Carrot":           ["Orange root vegetable", "Rich in vitamin A; good for eyesight", "Rabbits famously love this vegetable"],
+            "Broccoli":         ["Green vegetable that looks like a tiny tree", "Member of the cabbage family", "High in vitamins C and K"],
+            "Potato":           ["Starchy root vegetable", "Used for chips, fries, and mash", "Originated in South America"],
+            "Tomato":           ["Technically a fruit but used as a vegetable", "Key ingredient in pizza sauce and ketchup", "Can be red, yellow, or green"],
+            "Onion":            ["Makes your eyes water when cutting it", "Pungent smell and flavor", "Used as a base in almost every cuisine"],
+            "Garlic":           ["Related to the onion family", "Strong flavor and smell used in cooking", "Folklore says it repels vampires"],
+            "Spinach":          ["Dark green leafy vegetable", "High in iron and folate", "Popeye the Sailor Man eats this for strength"],
+            "Lettuce":          ["Leafy green vegetable", "Main ingredient in salads", "Mostly water by weight"],
+            "Cucumber":         ["Long green vegetable", "Very high water content", "Often pickled to make pickles/gherkins"],
+            "Bell pepper":      ["Can be red, green, or yellow", "Sweet and crunchy texture", "High in vitamin C"],
+            "Corn":             ["Also called maize", "Yellow kernels on a cob", "Can be popped into popcorn"],
+            "Peas":             ["Small green spheres that grow in pods", "High in protein and fiber", "Often frozen and sold year-round"],
+            "Beans":            ["Legume vegetable", "Comes in many varieties (kidney, black, green)", "High in protein and fiber"],
+            "Cauliflower":      ["White vegetable", "Related to broccoli and cabbage", "Can be used as a low-carb pizza base"],
+            "Cabbage":          ["Round leafy vegetable", "Used to make sauerkraut and coleslaw", "Related to broccoli and kale"],
+            "Eggplant":         ["Purple vegetable", "Also called aubergine in British English", "Used in moussaka and ratatouille"],
+            "Zucchini":         ["Long green vegetable", "Also called courgette", "A type of summer squash"],
+            "Asparagus":        ["Long green stalks", "A spring vegetable", "Famous for causing a distinctive urine smell"],
+            "Celery":           ["Long, crunchy green stalks", "Very low in calories", "Often used in soups, stews, and stocks"],
+            "Mushroom":         ["Technically a fungus, not a plant", "Comes in many edible varieties", "Has a savory umami flavor"],
+            "Kale":             ["Dark leafy green", "Considered a 'superfood'", "High in vitamins K, A, and C"],
+            "Sweet potato":     ["Orange root vegetable", "Sweeter than a regular potato", "High in beta-carotene and fiber"],
+            "Beetroot":         ["Round red root vegetable", "Used in borscht soup", "Can stain your hands and urine red"],
+            "Artichoke":        ["Edible flower bud", "The heart is the most prized edible part", "Often used in dips"],
+            "Brussels sprouts": ["Look like tiny cabbages", "Member of the cabbage family", "Often roasted or steamed as a side dish"],
+            "Leek":             ["Related to onions and garlic", "Milder flavor than onion", "National vegetable of Wales"],
+            "Radish":           ["Small red root vegetable", "Spicy and peppery flavor", "Eaten raw in salads"],
+            "Turnip":           ["White and purple root vegetable", "Used in soups and stews", "Has a slightly bitter taste"],
+            "Parsnip":          ["Pale white root vegetable", "Similar in shape to a carrot but white", "Sweeter when roasted"],
+            "Pumpkin":          ["Large orange squash", "Used in pies and carved for Halloween", "Very high in beta-carotene"],
+        }
+    },
+}
+
+# Build the world countries preset from all five continents
+_PRESET_DATA["countries_world"] = {
+    "description": "All countries in the world",
+    "answers_hints": {
+        **_PRESET_DATA["countries_africa"]["answers_hints"],
+        **_PRESET_DATA["countries_americas"]["answers_hints"],
+        **_PRESET_DATA["countries_asia"]["answers_hints"],
+        **_PRESET_DATA["countries_europe"]["answers_hints"],
+        **_PRESET_DATA["countries_oceania"]["answers_hints"],
+    },
+}
+
+_PRESET_CHOICES = [app_commands.Choice(name=f"{k} ({len(v['answers_hints'])} entries)", value=k)
+                   for k, v in _PRESET_DATA.items()]
+
+# ═══════════════════════════════════════════════════════
 # RANDOM GAMES SYSTEM
 # ═══════════════════════════════════════════════════════
 
 @bot.tree.command(name="addgame", description="Add a random game to the pool")
-@app_commands.describe(name="The question shown to players",
-                       reward_balance="Coin reward for winner",
-                       reward_exp="EXP reward for winner")
+@app_commands.describe(
+    name="The question/prompt shown to players",
+    reward_balance="Coin reward for winner",
+    reward_exp="EXP reward for winner",
+    reward_tickets="Raffle ticket reward",
+    reward_gamble_tokens="Gamble token reward",
+    reward_vip_keys="VIP Chest Key reward",
+    reward_item="Item or box name reward (optional)",
+    reward_item_qty="Quantity of item reward (default 1)",
+    reward_role="Role to give the winner (optional)",
+    chance="Selection weight — higher = chosen more often (default 1.0)",
+    answer_time="Seconds players have to answer this specific game (default 30)"
+)
 @command_enabled()
 async def addgame(interaction: discord.Interaction, name: str,
-                  reward_balance: int = 0, reward_exp: int = 0):
+                  reward_balance: int = 0, reward_exp: int = 0,
+                  reward_tickets: int = 0, reward_gamble_tokens: int = 0,
+                  reward_vip_keys: int = 0, reward_item: str = None,
+                  reward_item_qty: int = 1, reward_role: discord.Role = None,
+                  chance: float = 1.0, answer_time: int = 30):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if chance <= 0:
+        await interaction.response.send_message("❌ Chance must be > 0.", ephemeral=True); return
+    if answer_time < 5:
+        await interaction.response.send_message("❌ Answer time must be ≥ 5 seconds.", ephemeral=True); return
     async with db_lock:
         async with get_db() as db:
             try:
                 await db.execute(
-                    "INSERT INTO games(guild_id,game_name,reward_balance,reward_exp) VALUES(?,?,?,?)",
-                    (interaction.guild.id, name, reward_balance, reward_exp))
+                    "INSERT INTO games(guild_id,game_name,reward_balance,reward_exp,"
+                    "reward_tickets,reward_gamble_tokens,reward_vip_keys,"
+                    "reward_item,reward_item_qty,reward_role_id,chance,answer_time) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (interaction.guild.id, name, reward_balance, reward_exp,
+                     reward_tickets, reward_gamble_tokens, reward_vip_keys,
+                     reward_item, reward_item_qty,
+                     reward_role.id if reward_role else 0, chance, answer_time))
                 await db.commit()
             except aiosqlite.IntegrityError:
                 await interaction.response.send_message(f"❌ Game **{name}** already exists.",
                                                         ephemeral=True); return
+    parts = []
+    if reward_balance > 0:        parts.append(f"💰 {reward_balance:,}")
+    if reward_exp > 0:            parts.append(f"⭐ {reward_exp:,} EXP")
+    if reward_tickets > 0:        parts.append(f"🎟 {reward_tickets}")
+    if reward_gamble_tokens > 0:  parts.append(f"🎲 {reward_gamble_tokens}")
+    if reward_vip_keys > 0:       parts.append(f"🔑 {reward_vip_keys}")
+    if reward_item:               parts.append(f"🎒 {reward_item_qty}x {reward_item}")
+    if reward_role:               parts.append(f"👑 {reward_role.mention}")
     await interaction.response.send_message(
-        f"✅ Added game **{name}** (💰 {reward_balance:,} + ⭐ {reward_exp:,} EXP).\n"
-        f"Use `/addgameanswer` to add valid answers.")
+        f"✅ Added game **{name}**\n"
+        f"Reward: {' + '.join(parts) or 'None'} | Chance weight: {chance} | Answer time: {answer_time}s\n"
+        f"Use `/addgameanswer` or `/addgamepreset` to add answers.")
+
+
+@bot.tree.command(name="editgame", description="Edit a game's rewards, chance weight, or answer time")
+@app_commands.describe(
+    name="Game to edit",
+    reward_balance="New coin reward",
+    reward_exp="New EXP reward",
+    reward_tickets="New ticket reward",
+    reward_gamble_tokens="New gamble token reward",
+    reward_vip_keys="New VIP key reward",
+    reward_item="New item/box reward (type 'none' to clear)",
+    reward_item_qty="New item quantity",
+    reward_role="New role reward (leave empty to keep current)",
+    clear_role="Set True to remove the role reward",
+    chance="New selection weight",
+    answer_time="New answer time in seconds"
+)
+@command_enabled()
+async def editgame(interaction: discord.Interaction, name: str,
+                   reward_balance:        Optional[int]          = None,
+                   reward_exp:            Optional[int]          = None,
+                   reward_tickets:        Optional[int]          = None,
+                   reward_gamble_tokens:  Optional[int]          = None,
+                   reward_vip_keys:       Optional[int]          = None,
+                   reward_item:           Optional[str]          = None,
+                   reward_item_qty:       Optional[int]          = None,
+                   reward_role:           Optional[discord.Role] = None,
+                   clear_role:            Optional[bool]         = None,
+                   chance:                Optional[float]        = None,
+                   answer_time:           Optional[int]          = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+
+    async with get_db() as db:
+        async with db.execute("SELECT game_name FROM games WHERE guild_id=? AND game_name=?",
+                              (interaction.guild.id, name)) as cur:
+            if not await cur.fetchone():
+                await interaction.response.send_message(f"❌ Game **{name}** not found.",
+                                                        ephemeral=True); return
+
+    updates: dict = {}
+    if reward_balance is not None:       updates["reward_balance"]        = max(0, reward_balance)
+    if reward_exp is not None:           updates["reward_exp"]            = max(0, reward_exp)
+    if reward_tickets is not None:       updates["reward_tickets"]        = max(0, reward_tickets)
+    if reward_gamble_tokens is not None: updates["reward_gamble_tokens"]  = max(0, reward_gamble_tokens)
+    if reward_vip_keys is not None:      updates["reward_vip_keys"]       = max(0, reward_vip_keys)
+    if reward_item is not None:
+        updates["reward_item"] = None if reward_item.strip().lower() == "none" else reward_item.strip()
+    if reward_item_qty is not None:      updates["reward_item_qty"]       = max(1, reward_item_qty)
+    if reward_role is not None:          updates["reward_role_id"]        = reward_role.id
+    if clear_role:                       updates["reward_role_id"]        = 0
+    if chance is not None:
+        if chance <= 0:
+            await interaction.response.send_message("❌ Chance must be > 0.", ephemeral=True); return
+        updates["chance"] = chance
+    if answer_time is not None:
+        if answer_time < 5:
+            await interaction.response.send_message("❌ Answer time must be ≥ 5 seconds.", ephemeral=True); return
+        updates["answer_time"] = answer_time
+
+    if not updates:
+        await interaction.response.send_message("❌ No changes provided.", ephemeral=True); return
+
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [interaction.guild.id, name]
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(f"UPDATE games SET {set_clause} WHERE guild_id=? AND game_name=?", values)
+            await db.commit()
+
+    changed = ", ".join(f"**{k}** → `{v}`" for k, v in updates.items())
+    await interaction.response.send_message(f"✅ Updated game **{name}**: {changed}")
+
 
 @bot.tree.command(name="removegame", description="Remove a game and all its answers")
 @command_enabled()
@@ -3249,8 +3802,11 @@ async def removegame(interaction: discord.Interaction, name: str):
                              (interaction.guild.id, name))
             await db.execute("DELETE FROM game_answers WHERE guild_id=? AND game_name=?",
                              (interaction.guild.id, name))
+            await db.execute("DELETE FROM game_hints WHERE guild_id=? AND game_name=?",
+                             (interaction.guild.id, name))
             await db.commit()
-    await interaction.response.send_message(f"🗑 Removed game **{name}**.")
+    await interaction.response.send_message(f"🗑 Removed game **{name}** and all its answers and hints.")
+
 
 @bot.tree.command(name="enablegame", description="Enable a game so it appears in automatic games")
 @command_enabled()
@@ -3269,6 +3825,7 @@ async def enablegame(interaction: discord.Interaction, name: str):
             await db.commit()
     await interaction.response.send_message(f"✅ Game **{name}** enabled.")
 
+
 @bot.tree.command(name="disablegame", description="Disable a game without deleting it")
 @command_enabled()
 async def disablegame(interaction: discord.Interaction, name: str):
@@ -3286,6 +3843,7 @@ async def disablegame(interaction: discord.Interaction, name: str):
             await db.commit()
     await interaction.response.send_message(f"🔒 Game **{name}** disabled.")
 
+
 @bot.tree.command(name="addgameanswer", description="Add a valid answer to a game")
 @command_enabled()
 async def addgameanswer(interaction: discord.Interaction, game_name: str, answer: str):
@@ -3299,10 +3857,13 @@ async def addgameanswer(interaction: discord.Interaction, game_name: str, answer
                                                         ephemeral=True); return
     async with db_lock:
         async with get_db() as db:
-            await db.execute("INSERT INTO game_answers(guild_id,game_name,answer) VALUES(?,?,?)",
+            cur = await db.execute("INSERT INTO game_answers(guild_id,game_name,answer) VALUES(?,?,?)",
                              (interaction.guild.id, game_name, answer))
+            new_id = cur.lastrowid
             await db.commit()
-    await interaction.response.send_message(f"✅ Added answer `{answer}` to **{game_name}**.")
+    await interaction.response.send_message(f"✅ Added answer `{answer}` to **{game_name}** (ID: #{new_id}).\n"
+                                            f"Use `/addhint {game_name} {new_id} <hint>` to add hints for it.")
+
 
 @bot.tree.command(name="removegameanswer", description="Remove an answer from a game by ID (see /listgames)")
 @command_enabled()
@@ -3318,103 +3879,326 @@ async def removegameanswer(interaction: discord.Interaction, game_name: str, ans
                     await interaction.response.send_message(f"❌ Answer #{answer_id} not found.",
                                                             ephemeral=True); return
             await db.execute("DELETE FROM game_answers WHERE id=?", (answer_id,))
+            await db.execute("DELETE FROM game_hints WHERE guild_id=? AND game_name=? AND answer_id=?",
+                             (interaction.guild.id, game_name, answer_id))
             await db.commit()
-    await interaction.response.send_message(f"🗑 Removed answer #{answer_id} from **{game_name}**.")
+    await interaction.response.send_message(f"🗑 Removed answer #{answer_id} and its hints from **{game_name}**.")
 
-@bot.tree.command(name="listgames", description="List all games and their answers")
+
+# ── Hint management ───────────────────────────────────────────────────────────
+
+@bot.tree.command(name="addhint", description="Add a hint to a specific answer in a game")
+@app_commands.describe(
+    game_name="Name of the game",
+    answer_id="ID of the answer (from /listgames)",
+    hint="The hint text to show during the game",
+    order="Hint number 1–5 (determines reveal order; auto-assigned if omitted)"
+)
+@command_enabled()
+async def addhint(interaction: discord.Interaction, game_name: str, answer_id: int,
+                  hint: str, order: Optional[int] = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT answer FROM game_answers WHERE id=? AND guild_id=? AND game_name=?",
+            (answer_id, interaction.guild.id, game_name)) as cur:
+            ans_row = await cur.fetchone()
+        if not ans_row:
+            await interaction.response.send_message(
+                f"❌ Answer #{answer_id} not found in **{game_name}**.", ephemeral=True); return
+        # Auto-assign order if not given
+        if order is None:
+            async with db.execute(
+                "SELECT MAX(hint_order) FROM game_hints "
+                "WHERE guild_id=? AND game_name=? AND answer_id=?",
+                (interaction.guild.id, game_name, answer_id)) as cur:
+                row = await cur.fetchone()
+            order = (row[0] or 0) + 1
+    if not (1 <= order <= 5):
+        await interaction.response.send_message("❌ Order must be between 1 and 5.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            # Replace existing hint at this order slot if present
+            await db.execute(
+                "DELETE FROM game_hints "
+                "WHERE guild_id=? AND game_name=? AND answer_id=? AND hint_order=?",
+                (interaction.guild.id, game_name, answer_id, order))
+            await db.execute(
+                "INSERT INTO game_hints(guild_id,game_name,answer_id,hint_text,hint_order) "
+                "VALUES(?,?,?,?,?)",
+                (interaction.guild.id, game_name, answer_id, hint, order))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Hint #{order} set for answer **{ans_row[0]}** (#{answer_id}) in **{game_name}**.")
+
+
+@bot.tree.command(name="removehint", description="Remove a hint by its ID (from /listhints)")
+@app_commands.describe(hint_id="Hint ID to remove")
+@command_enabled()
+async def removehint(interaction: discord.Interaction, hint_id: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT hint_text FROM game_hints WHERE id=? AND guild_id=?",
+                (hint_id, interaction.guild.id)) as cur:
+                if not await cur.fetchone():
+                    await interaction.response.send_message(f"❌ Hint #{hint_id} not found.",
+                                                            ephemeral=True); return
+            await db.execute("DELETE FROM game_hints WHERE id=?", (hint_id,))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 Removed hint #{hint_id}.")
+
+
+@bot.tree.command(name="listhints", description="List hints for a game, optionally filtered to one answer")
+@app_commands.describe(
+    game_name="Name of the game",
+    answer_id="Only show hints for this answer ID (optional)"
+)
+@command_enabled()
+async def listhints(interaction: discord.Interaction, game_name: str,
+                    answer_id: Optional[int] = None):
+    async with get_db() as db:
+        if answer_id is not None:
+            async with db.execute(
+                "SELECT h.id, a.answer, h.hint_order, h.hint_text "
+                "FROM game_hints h JOIN game_answers a ON h.answer_id=a.id "
+                "WHERE h.guild_id=? AND h.game_name=? AND h.answer_id=? ORDER BY h.hint_order",
+                (interaction.guild.id, game_name, answer_id)) as cur:
+                rows = await cur.fetchall()
+        else:
+            async with db.execute(
+                "SELECT h.id, a.answer, h.hint_order, h.hint_text "
+                "FROM game_hints h JOIN game_answers a ON h.answer_id=a.id "
+                "WHERE h.guild_id=? AND h.game_name=? ORDER BY a.answer, h.hint_order",
+                (interaction.guild.id, game_name)) as cur:
+                rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message(
+            f"❌ No hints found for **{game_name}**" +
+            (f" answer #{answer_id}" if answer_id else "") + ".", ephemeral=True); return
+
+    embed = discord.Embed(title=f"💡 Hints — {game_name}", color=discord.Color.teal())
+    current_ans = None
+    block = []
+    for h_id, answer, h_order, h_text in rows:
+        if answer != current_ans:
+            if block:
+                val = "\n".join(block)
+                if len(val) > 1024: val = val[:1021] + "..."
+                embed.add_field(name=f"📝 {current_ans}", value=val, inline=False)
+                block = []
+            current_ans = answer
+        block.append(f"`#{h_id}` **[{h_order}]** {h_text}")
+    if block:
+        val = "\n".join(block)
+        if len(val) > 1024: val = val[:1021] + "..."
+        embed.add_field(name=f"📝 {current_ans}", value=val, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── List games (paginated) ────────────────────────────────────────────────────
+
+class GameListView(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed], user_id: int):
+        super().__init__(timeout=120)
+        self.pages   = pages
+        self.current = 0
+        self.user_id = user_id
+        self._sync()
+
+    def _sync(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.label == "◀":
+                    item.disabled = (self.current == 0)
+                elif item.label == "▶":
+                    item.disabled = (self.current >= len(self.pages) - 1)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, disabled=True)
+    async def prev_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your menu.", ephemeral=True); return
+        self.current -= 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your menu.", ephemeral=True); return
+        self.current += 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+@bot.tree.command(name="listgames", description="List all games or paginate a specific game's answers")
+@app_commands.describe(game_name="Specific game to inspect (shows all answers, paginated)")
 @command_enabled()
 async def listgames(interaction: discord.Interaction, game_name: str = None):
     await interaction.response.defer()
-    async with get_db() as db:
-        if game_name:
-            async with db.execute(
-                "SELECT game_name,enabled,reward_balance,reward_exp FROM games WHERE guild_id=? AND game_name=?",
-                (interaction.guild.id, game_name)) as cur:
-                games = await cur.fetchall()
-        else:
-            async with db.execute(
-                "SELECT game_name,enabled,reward_balance,reward_exp FROM games WHERE guild_id=?",
-                (interaction.guild.id,)) as cur:
-                games = await cur.fetchall()
-    if not games:
-        await interaction.followup.send("❌ No games configured."); return
+    gid = interaction.guild.id
 
-    embed = discord.Embed(title="🎮 Random Games", color=discord.Color.teal())
-
-    for (gname, enabled, reward_bal, reward_exp) in games:
+    # ── Show all games (summary mode) ─────────────────────────────────────────
+    if game_name is None:
         async with get_db() as db:
             async with db.execute(
-                "SELECT id,answer FROM game_answers WHERE guild_id=? AND game_name=? ORDER BY id",
-                (interaction.guild.id, gname)) as cur:
-                answers = await cur.fetchall()
+                "SELECT game_name,enabled,reward_balance,reward_exp,reward_tickets,"
+                "reward_gamble_tokens,reward_vip_keys,reward_item,reward_item_qty,"
+                "reward_role_id,chance,answer_time FROM games WHERE guild_id=?",
+                (gid,)) as cur:
+                games = await cur.fetchall()
+        if not games:
+            await interaction.followup.send("❌ No games configured."); return
 
-        status = "✅ Enabled" if enabled else "🔒 Disabled"
-        parts  = []
-        if reward_bal > 0: parts.append(f"💰 {reward_bal:,}")
-        if reward_exp > 0: parts.append(f"⭐ {reward_exp:,}")
+        GAMES_PER_PAGE = 5
+        pages: list[discord.Embed] = []
+        total_pages = max(1, (len(games) + GAMES_PER_PAGE - 1) // GAMES_PER_PAGE)
 
-        header = f"Reward: {' + '.join(parts) or 'None'}\nAnswers ({len(answers)} total):\n"
+        for page_idx in range(total_pages):
+            chunk = games[page_idx * GAMES_PER_PAGE: (page_idx + 1) * GAMES_PER_PAGE]
+            embed = discord.Embed(title="🎮 Random Games",
+                                  color=discord.Color.teal(),
+                                  description=f"Page {page_idx+1}/{total_pages}")
+            for (gname, enabled, rb, re, rt, rgt, rvk, ri, riq, rrole, chance, atime) in chunk:
+                async with get_db() as db:
+                    async with db.execute(
+                        "SELECT COUNT(*) FROM game_answers WHERE guild_id=? AND game_name=?",
+                        (gid, gname)) as cur:
+                        ans_count = (await cur.fetchone())[0]
+                    async with db.execute(
+                        "SELECT COUNT(DISTINCT answer_id) FROM game_hints WHERE guild_id=? AND game_name=?",
+                        (gid, gname)) as cur:
+                        hinted_count = (await cur.fetchone())[0]
+                status = "✅" if enabled else "🔒"
+                parts = []
+                if rb:   parts.append(f"💰{rb:,}")
+                if re:   parts.append(f"⭐{re:,}")
+                if rt:   parts.append(f"🎟{rt}")
+                if rgt:  parts.append(f"🎲{rgt}")
+                if rvk:  parts.append(f"🔑{rvk}")
+                if ri:   parts.append(f"🎒{riq}x {ri}")
+                val = (f"{status} | ⚖️ Weight: {chance} | ⏱ {atime}s\n"
+                       f"Reward: {' + '.join(parts) or 'None'}\n"
+                       f"Answers: **{ans_count}** ({hinted_count} with hints)\n"
+                       f"Use `/listgames {gname}` to see all answers")
+                if len(val) > 1024: val = val[:1021] + "..."
+                embed.add_field(name=f"🎯 {gname}", value=val, inline=False)
+            pages.append(embed)
 
-        if not answers:
-            ans_block = "  *No answers yet*"
-        else:
-            all_lines = [f"  `#{aid}` {ans}" for aid, ans in answers]
-            shown = []
-            truncated = False
+        view = GameListView(pages, interaction.user.id)
+        await interaction.followup.send(embed=pages[0], view=view if len(pages) > 1 else None)
+        return
 
-            for i, line in enumerate(all_lines):
-                remaining = len(all_lines) - i - 1
-                # When more lines follow, reserve space for the truncation note
-                if remaining > 0:
-                    test = header + "\n".join(shown + [line]) + f"\n  *... and {remaining} more*"
-                else:
-                    test = header + "\n".join(shown + [line])
+    # ── Paginated answer view for a specific game ─────────────────────────────
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled,reward_balance,reward_exp,reward_tickets,reward_gamble_tokens,"
+            "reward_vip_keys,reward_item,reward_item_qty,reward_role_id,chance,answer_time "
+            "FROM games WHERE guild_id=? AND game_name=?", (gid, game_name)) as cur:
+            game_row = await cur.fetchone()
+        if not game_row:
+            await interaction.followup.send(f"❌ Game **{game_name}** not found."); return
 
-                if len(test) > 1024:
-                    truncated = True
-                    break
-                shown.append(line)
+        async with db.execute(
+            "SELECT a.id, a.answer, COUNT(h.id) AS hint_count "
+            "FROM game_answers a "
+            "LEFT JOIN game_hints h ON h.answer_id=a.id AND h.guild_id=a.guild_id AND h.game_name=a.game_name "
+            "WHERE a.guild_id=? AND a.game_name=? "
+            "GROUP BY a.id ORDER BY a.id",
+            (gid, game_name)) as cur:
+            answers = await cur.fetchall()
 
-            if truncated:
-                left = len(all_lines) - len(shown)
-                if shown:
-                    ans_block = "\n".join(shown) + f"\n  *... and {left} more*"
-                else:
-                    # Even the first answer is too long (extremely unlikely)
-                    ans_block = f"  *{len(all_lines)} answers — use `/listgames {gname}` to browse*"
-            else:
-                ans_block = "\n".join(shown)
+    (enabled, rb, re, rt, rgt, rvk, ri, riq, rrole, chance, atime) = game_row
+    status = "✅ Enabled" if enabled else "🔒 Disabled"
+    parts = []
+    if rb:  parts.append(f"💰{rb:,}")
+    if re:  parts.append(f"⭐{re:,}")
+    if rt:  parts.append(f"🎟{rt}")
+    if rgt: parts.append(f"🎲{rgt}")
+    if rvk: parts.append(f"🔑{rvk}")
+    if ri:  parts.append(f"🎒{riq}x {ri}")
+    reward_str = " + ".join(parts) or "None"
 
-        embed.add_field(
-            name=f"🎯 {gname} [{status}]",
-            value=header + ans_block,
-            inline=False)
+    if not answers:
+        embed = discord.Embed(title=f"🎯 {game_name}",
+                              description=f"{status} | Weight: {chance} | {atime}s\nReward: {reward_str}\n\n*No answers yet.*",
+                              color=discord.Color.teal())
+        await interaction.followup.send(embed=embed); return
 
-    await interaction.followup.send(embed=embed)
+    ANSWERS_PER_PAGE = 20
+    total_pages = max(1, (len(answers) + ANSWERS_PER_PAGE - 1) // ANSWERS_PER_PAGE)
+    pages = []
 
-@bot.tree.command(name="setgamechannel", description="Set the channel for random games and configure timing")
-@app_commands.describe(channel="Channel for games",
-                       answer_time="Seconds to answer (default 30)",
-                       interval_seconds="Seconds between games (default 60)")
+    for page_idx in range(total_pages):
+        chunk = answers[page_idx * ANSWERS_PER_PAGE: (page_idx + 1) * ANSWERS_PER_PAGE]
+        lines = [f"`#{aid}` {'🔔' * h_cnt if h_cnt else '·'} {ans}"
+                 for aid, ans, h_cnt in chunk]
+        # Truncate if needed
+        body = "\n".join(lines)
+        header = (f"{status} | ⚖️ Weight: {chance} | ⏱ {atime}s | Reward: {reward_str}\n"
+                  f"{len(answers)} answers total | Page {page_idx+1}/{total_pages}\n\n"
+                  f"(🔔 = has hints)\n")
+        if len(header) + len(body) > 4090:
+            body = body[:4090 - len(header) - 3] + "..."
+        embed = discord.Embed(title=f"🎯 {game_name}",
+                              description=header + body,
+                              color=discord.Color.teal())
+        pages.append(embed)
+
+    view = GameListView(pages, interaction.user.id)
+    await interaction.followup.send(embed=pages[0], view=view if len(pages) > 1 else None)
+
+
+# ── Channel setup ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setgamechannel",
+                  description="Set the channel for random games, interval, and hint timing")
+@app_commands.describe(
+    channel="Channel for games",
+    interval_seconds="Seconds between one game ENDING and the next one STARTING (default 60)",
+    hint1_delay="Seconds after question to reveal hint 1 (omit to disable hints)",
+    hint2_delay="Seconds after question to reveal hint 2",
+    hint3_delay="Seconds after question to reveal hint 3",
+    hint4_delay="Seconds after question to reveal hint 4",
+    hint5_delay="Seconds after question to reveal hint 5"
+)
 @command_enabled()
 async def setgamechannel(interaction: discord.Interaction, channel: discord.TextChannel,
-                         answer_time: int = 30, interval_seconds: int = 60):
+                         interval_seconds: int = 60,
+                         hint1_delay: Optional[int] = None,
+                         hint2_delay: Optional[int] = None,
+                         hint3_delay: Optional[int] = None,
+                         hint4_delay: Optional[int] = None,
+                         hint5_delay: Optional[int] = None):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    if answer_time < 5:
-        await interaction.response.send_message("❌ Answer time ≥ 5s.", ephemeral=True); return
-    if interval_seconds < 10:
-        await interaction.response.send_message("❌ Interval ≥ 10s.", ephemeral=True); return
+    if interval_seconds < 5:
+        await interaction.response.send_message("❌ Interval must be ≥ 5 seconds.", ephemeral=True); return
+
+    delays = [d for d in [hint1_delay, hint2_delay, hint3_delay, hint4_delay, hint5_delay]
+              if d is not None]
+    hint_delays_json = json.dumps(delays) if delays else None
+
     async with db_lock:
         async with get_db() as db:
             await db.execute(
-                "INSERT OR REPLACE INTO game_config(guild_id,channel_id,answer_time,interval_seconds) "
+                "INSERT OR REPLACE INTO game_config(guild_id,channel_id,interval_seconds,hint_delays) "
                 "VALUES(?,?,?,?)",
-                (interaction.guild.id, channel.id, answer_time, interval_seconds))
+                (interaction.guild.id, channel.id, interval_seconds, hint_delays_json))
             await db.commit()
+
+    hint_info = (f" | Hints at: {', '.join(str(d)+'s' for d in delays)}" if delays
+                 else " | No hints configured")
     await interaction.response.send_message(
-        f"✅ Game channel: {channel.mention} | Answer time: **{answer_time}s** | "
-        f"Interval: **{interval_seconds}s**")
+        f"✅ Game channel: {channel.mention} | Interval: **{interval_seconds}s** (after game ends){hint_info}")
+
 
 @bot.tree.command(name="startgames", description="Start automatic random games")
 @command_enabled()
@@ -3429,13 +4213,13 @@ async def startgames(interaction: discord.Interaction):
             if not await cur.fetchone():
                 await interaction.response.send_message("❌ Use `/setgamechannel` first.",
                                                         ephemeral=True); return
-        async with db.execute("SELECT game_name FROM games WHERE guild_id=? AND enabled=1",
-                              (gid,)) as cur:
+        async with db.execute("SELECT game_name FROM games WHERE guild_id=? AND enabled=1", (gid,)) as cur:
             if not await cur.fetchall():
                 await interaction.response.send_message("❌ No enabled games. Use `/addgame`.",
                                                         ephemeral=True); return
     game_tasks[gid] = asyncio.create_task(guild_game_loop(gid))
     await interaction.response.send_message("🎮 Random games started!")
+
 
 @bot.tree.command(name="stopgames", description="Stop automatic random games")
 @command_enabled()
@@ -3448,75 +4232,235 @@ async def stopgames(interaction: discord.Interaction):
     active_game_sessions.pop(gid, None)
     await interaction.response.send_message("🛑 Random games stopped.")
 
+
+# ── Game presets ──────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="addgamepreset",
+                  description="Bulk-add a preset of answers (and hints) to a game")
+@app_commands.describe(
+    game_name="Game to add answers to",
+    preset="Which preset to load"
+)
+@app_commands.choices(preset=_PRESET_CHOICES)
+@command_enabled()
+async def addgamepreset(interaction: discord.Interaction, game_name: str, preset: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+
+    async with get_db() as db:
+        async with db.execute("SELECT game_name FROM games WHERE guild_id=? AND game_name=?",
+                              (interaction.guild.id, game_name)) as cur:
+            if not await cur.fetchone():
+                await interaction.followup.send(f"❌ Game **{game_name}** not found."); return
+
+    preset_data = _PRESET_DATA[preset]
+    added = skipped = hints_added = 0
+
+    async with db_lock:
+        async with get_db() as db:
+            for answer, hints in preset_data["answers_hints"].items():
+                # Check if answer already exists
+                async with db.execute(
+                    "SELECT id FROM game_answers WHERE guild_id=? AND game_name=? AND answer=?",
+                    (interaction.guild.id, game_name, answer)) as cur:
+                    existing = await cur.fetchone()
+
+                if existing:
+                    ans_id = existing[0]
+                    skipped += 1
+                else:
+                    cur = await db.execute(
+                        "INSERT INTO game_answers(guild_id,game_name,answer) VALUES(?,?,?)",
+                        (interaction.guild.id, game_name, answer))
+                    ans_id = cur.lastrowid
+                    added += 1
+
+                # Replace all hints for this answer with the preset hints
+                await db.execute(
+                    "DELETE FROM game_hints WHERE guild_id=? AND game_name=? AND answer_id=?",
+                    (interaction.guild.id, game_name, ans_id))
+                for order, hint_text in enumerate(hints[:5], 1):
+                    await db.execute(
+                        "INSERT INTO game_hints(guild_id,game_name,answer_id,hint_text,hint_order) "
+                        "VALUES(?,?,?,?,?)",
+                        (interaction.guild.id, game_name, ans_id, hint_text, order))
+                    hints_added += 1
+
+            await db.commit()
+
+    total = len(preset_data["answers_hints"])
+    await interaction.followup.send(
+        f"✅ Preset **{preset}** loaded into **{game_name}**!\n"
+        f"Added: **{added}** answers | Skipped (already existed): **{skipped}** | "
+        f"Hints written: **{hints_added}** (across {total} total entries)")
+
+
+# ── Game loop ─────────────────────────────────────────────────────────────────
+
 async def guild_game_loop(guild_id: int):
     await bot.wait_until_ready()
     while not bot.is_closed():
+        # Fetch config
         async with get_db() as db:
             async with db.execute(
-                "SELECT channel_id,answer_time,interval_seconds FROM game_config WHERE guild_id=?",
-                (guild_id,)) as cur:
+                "SELECT channel_id, interval_seconds, hint_delays "
+                "FROM game_config WHERE guild_id=?", (guild_id,)) as cur:
                 config = await cur.fetchone()
         if not config: break
-        channel_id, answer_time, interval_seconds = config
+        channel_id, interval_seconds, hint_delays_json = config
         channel = bot.get_channel(channel_id)
         if not channel: await asyncio.sleep(30); continue
 
+        hint_delays: list[int] = []
+        if hint_delays_json:
+            try:
+                hint_delays = json.loads(hint_delays_json)
+            except Exception:
+                hint_delays = []
+
+        # Fetch enabled games with all reward columns
         async with get_db() as db:
             async with db.execute(
-                "SELECT game_name,reward_balance,reward_exp FROM games WHERE guild_id=? AND enabled=1",
+                "SELECT game_name, reward_balance, reward_exp, reward_tickets, "
+                "reward_gamble_tokens, reward_vip_keys, reward_item, reward_item_qty, "
+                "reward_role_id, chance, answer_time "
+                "FROM games WHERE guild_id=? AND enabled=1",
                 (guild_id,)) as cur:
-                games = await cur.fetchall()
-        eligible = []
-        for gname, rb, re in games:
+                game_rows = await cur.fetchall()
+
+        eligible: list[dict] = []
+        for row in game_rows:
+            (gname, rb, re, rt, rgt, rvk, ri, riq, rrole, chance, atime) = row
             async with get_db() as db:
                 async with db.execute(
-                    "SELECT answer FROM game_answers WHERE guild_id=? AND game_name=?",
+                    "SELECT id, answer FROM game_answers WHERE guild_id=? AND game_name=?",
                     (guild_id, gname)) as cur:
-                    answers = [r[0] for r in await cur.fetchall()]
-            if answers: eligible.append((gname, rb, re, answers))
+                    answers = await cur.fetchall()
+            if answers:
+                eligible.append({
+                    "name":                 gname,
+                    "reward_balance":       rb   or 0,
+                    "reward_exp":           re   or 0,
+                    "reward_tickets":       rt   or 0,
+                    "reward_gamble_tokens": rgt  or 0,
+                    "reward_vip_keys":      rvk  or 0,
+                    "reward_item":          ri,
+                    "reward_item_qty":      riq  or 1,
+                    "reward_role_id":       rrole or 0,
+                    "chance":               chance or 1.0,
+                    "answer_time":          atime  or 30,
+                    "answers":              answers,
+                })
 
-        if not eligible: await asyncio.sleep(interval_seconds); continue
+        if not eligible:
+            await asyncio.sleep(interval_seconds)
+            continue
 
-        gname, rb, re, answers = random.choice(eligible)
-        correct = random.choice(answers)
+        # Weighted random game selection
+        game = random.choices(eligible, weights=[g["chance"] for g in eligible], k=1)[0]
+        correct_id, correct_ans = random.choice(game["answers"])
+        answer_time = game["answer_time"]
 
+        # Build reward summary
+        guild_obj = bot.get_guild(guild_id)
         reward_parts = []
-        if rb > 0: reward_parts.append(f"💰 {rb:,} coins")
-        if re > 0: reward_parts.append(f"⭐ {re:,} EXP")
+        if game["reward_balance"] > 0:        reward_parts.append(f"💰 {game['reward_balance']:,} coins")
+        if game["reward_exp"] > 0:            reward_parts.append(f"⭐ {game['reward_exp']:,} EXP")
+        if game["reward_tickets"] > 0:        reward_parts.append(f"🎟 {game['reward_tickets']} ticket(s)")
+        if game["reward_gamble_tokens"] > 0:  reward_parts.append(f"🎲 {game['reward_gamble_tokens']} token(s)")
+        if game["reward_vip_keys"] > 0:       reward_parts.append(f"🔑 {game['reward_vip_keys']} key(s)")
+        if game["reward_item"]:               reward_parts.append(f"🎒 {game['reward_item_qty']}x {game['reward_item']}")
+        if game["reward_role_id"] and guild_obj:
+            role = guild_obj.get_role(game["reward_role_id"])
+            if role: reward_parts.append(f"👑 {role.mention}")
 
-        embed = discord.Embed(title="🎮 Random Game!", color=discord.Color.teal(),
-            description=f"**{gname}**\n\nType your answer in chat!\n⏰ You have **{answer_time} seconds**.")
-        if reward_parts: embed.add_field(name="🏆 Winner gets", value=" + ".join(reward_parts), inline=False)
+        embed = discord.Embed(
+            title="🎮 Random Game!",
+            color=discord.Color.teal(),
+            description=f"**{game['name']}**\n\nType your answer in chat!\n⏰ You have **{answer_time} seconds**.")
+        if reward_parts:
+            embed.add_field(name="🏆 Winner gets", value=" + ".join(reward_parts), inline=False)
         embed.set_footer(text=f"Answer within {answer_time} seconds!")
         await channel.send(embed=embed)
 
         answered_event = asyncio.Event()
         active_game_sessions[guild_id] = {
-            "game_name": gname, "answer": correct,
-            "channel_id": channel_id, "answered": False, "winner": None,
-            "event": answered_event
+            "game_name":  game["name"],
+            "answer":     correct_ans,
+            "channel_id": channel_id,
+            "answered":   False,
+            "winner":     None,
+            "event":      answered_event,
         }
 
+        # Fetch hints for the selected answer and schedule them
+        hints: list[str] = []
+        if hint_delays:
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT hint_text FROM game_hints "
+                    "WHERE guild_id=? AND game_name=? AND answer_id=? ORDER BY hint_order",
+                    (guild_id, game["name"], correct_id)) as cur:
+                    hints = [r[0] for r in await cur.fetchall()]
+
+        hint_tasks = []
+        for i, delay in enumerate(hint_delays):
+            if i < len(hints) and 0 < delay < answer_time:
+                task = asyncio.create_task(
+                    _send_hint_at(channel, f"{i+1}: {hints[i]}", delay, answered_event))
+                hint_tasks.append(task)
+
+        # Wait for a correct answer or timeout
         try:
             await asyncio.wait_for(answered_event.wait(), timeout=answer_time)
         except asyncio.TimeoutError:
             pass
+
+        # Cancel any hints that haven't fired yet
+        for task in hint_tasks:
+            task.cancel()
+
         session = active_game_sessions.pop(guild_id, None)
-        if not session: await asyncio.sleep(max(0, interval_seconds - answer_time)); continue
+        if not session:
+            await asyncio.sleep(interval_seconds)
+            continue
 
         if session.get("answered") and session.get("winner"):
             winner = session["winner"]
-            if rb > 0: await add_balance(guild_id, winner.id, rb)
-            if re > 0: await add_exp(guild_id, winner.id, re)
-            result_embed = discord.Embed(title="🎉 Correct!", color=discord.Color.green(),
-                description=f"{winner.mention} got it right! The answer was **{correct}**.")
-            if reward_parts: result_embed.add_field(name="Reward given",
-                                                    value=" + ".join(reward_parts), inline=False)
+            if game["reward_balance"] > 0:
+                await add_balance(guild_id, winner.id, game["reward_balance"])
+            if game["reward_exp"] > 0:
+                await add_exp(guild_id, winner.id, game["reward_exp"])
+            if game["reward_tickets"] > 0:
+                await add_tickets(guild_id, winner.id, game["reward_tickets"])
+            if game["reward_gamble_tokens"] > 0:
+                await inventory_add(guild_id, winner.id, GAMBLE_TOKEN, game["reward_gamble_tokens"])
+            if game["reward_vip_keys"] > 0:
+                await inventory_add(guild_id, winner.id, VIP_CHEST_KEY, game["reward_vip_keys"])
+            if game["reward_item"]:
+                await inventory_add(guild_id, winner.id, game["reward_item"], game["reward_item_qty"])
+            if game["reward_role_id"] and guild_obj:
+                role   = guild_obj.get_role(game["reward_role_id"])
+                member = guild_obj.get_member(winner.id)
+                if role and member:
+                    try: await member.add_roles(role)
+                    except Exception: pass
+            result_embed = discord.Embed(
+                title="🎉 Correct!", color=discord.Color.green(),
+                description=f"{winner.mention} got it! The answer was **{correct_ans}**.")
+            if reward_parts:
+                result_embed.add_field(name="Reward given", value=" + ".join(reward_parts), inline=False)
         else:
-            result_embed = discord.Embed(title="⏰ Time's Up!", color=discord.Color.red(),
-                description=f"Nobody got it. The answer was **{correct}**.")
+            result_embed = discord.Embed(
+                title="⏰ Time's Up!", color=discord.Color.red(),
+                description=f"Nobody got it. The answer was **{correct_ans}**.")
+
         await channel.send(embed=result_embed)
-        await asyncio.sleep(max(0, interval_seconds - answer_time))
+
+        # Interval is the gap between THIS game ENDING and the NEXT one STARTING
+        await asyncio.sleep(interval_seconds)
+
 
 async def game_loop():
     await bot.wait_until_ready()
@@ -3524,8 +4468,10 @@ async def game_loop():
         for gid, task in list(game_tasks.items()):
             if task.done():
                 try:
-                    if exc := task.exception(): print(f"[GameLoop] Guild {gid} died: {exc}")
-                except Exception: pass
+                    if exc := task.exception():
+                        print(f"[GameLoop] Guild {gid} crashed: {exc}")
+                except Exception:
+                    pass
                 game_tasks[gid] = asyncio.create_task(guild_game_loop(gid))
         await asyncio.sleep(30)
 
