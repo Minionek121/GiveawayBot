@@ -1452,6 +1452,32 @@ async def givekey(interaction: discord.Interaction, user: discord.Member, amount
     await inventory_add(interaction.guild.id, user.id, VIP_CHEST_KEY, amount)
     await interaction.response.send_message(f"🔑 Gave **{amount}x {VIP_CHEST_KEY}** to {user.mention}.")
 
+@bot.tree.command(name="givekeyrole", description="Give VIP Chest Key(s) to every member with a specific role")
+@app_commands.describe(role="Role whose members receive keys", amount="Number of keys each (default 1)")
+@command_enabled()
+async def givekeyrole(interaction: discord.Interaction, role: discord.Role, amount: int = 1):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be ≥ 1.", ephemeral=True); return
+    members = [m for m in interaction.guild.members if role in m.roles and not m.bot]
+    if not members:
+        await interaction.response.send_message(
+            f"❌ No non-bot members found with {role.mention}.", ephemeral=True); return
+    await interaction.response.defer()
+    for m in members:
+        await inventory_add(interaction.guild.id, m.id, VIP_CHEST_KEY, amount)
+    await interaction.followup.send(
+        f"🔑 Gave **{amount}x {VIP_CHEST_KEY}** to **{len(members)}** member(s) with {role.mention}.")
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Keys Given (Role)", discord.Color.green(),
+        Admin=interaction.user.mention, Role=role.name,
+        Members=str(len(members)), Keys_Each=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ givekeyrole", discord.Color.orange(),
+        By=interaction.user.mention, Role=role.name,
+        Members=str(len(members)), Amount=f"{amount}x each"))
+
 @bot.tree.command(name="takekey", description="Take VIP Chest Key(s) from a user")
 @app_commands.describe(user="Target user", amount="Number of keys (default 1)")
 @command_enabled()
