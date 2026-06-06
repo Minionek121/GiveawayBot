@@ -948,11 +948,14 @@ async def end_giveaway(message_id, reroll=False):
                 await db.commit()
 
     try:
-        meta        = json.loads(prize_raw)
+        _parsed = json.loads(prize_raw)
+        if not isinstance(_parsed, dict):
+            raise TypeError
+        meta        = _parsed
         prize_label = meta.get("label", prize_raw)
-    except (json.JSONDecodeError, TypeError):
-        meta        = {"label": prize_raw, "balance": legacy_reward}
-        prize_label = prize_raw
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        meta        = {"label": str(prize_raw), "balance": legacy_reward}
+        prize_label = str(prize_raw)
 
     channel = bot.get_channel(channel_id)
     if not channel: print(f"[Giveaway] Channel not found: {channel_id}"); return
@@ -1061,11 +1064,14 @@ async def reroll(interaction: discord.Interaction, message_id: str):
     new_winner = random.choice(weighted)
 
     try:
-        meta        = json.loads(prize_raw)
+        _parsed = json.loads(prize_raw)
+        if not isinstance(_parsed, dict):
+            raise TypeError
+        meta        = _parsed
         prize_label = meta.get("label", prize_raw)
-    except (json.JSONDecodeError, TypeError):
-        meta        = {"label": prize_raw, "balance": legacy_reward}
-        prize_label = prize_raw
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        meta        = {"label": str(prize_raw), "balance": legacy_reward}
+        prize_label = str(prize_raw)
 
     if old_data:
         await add_balance(channel.guild.id, old_data[0], -old_data[1])
