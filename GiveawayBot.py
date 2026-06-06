@@ -218,6 +218,10 @@ async def setup_database():
                 PRIMARY KEY(guild_id, log_type))""")
             await db.execute("""CREATE TABLE IF NOT EXISTS disabled_commands_persist(
                 command_name TEXT PRIMARY KEY)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS welcome_config(
+                guild_id INTEGER PRIMARY KEY,
+                enabled  INTEGER DEFAULT 0,
+                message  TEXT)""")
             # ── Per-guild schemas (migration: drop & recreate if guild_id column is missing) ──
 
             for table, new_sql in [
@@ -587,6 +591,33 @@ async def on_message(message):
         await add_exp(message.guild.id, message.author.id, gained)
         last_message_exp[key] = now
     await bot.process_commands(message)
+
+# WELCOME MESSAGE
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled, message FROM welcome_config WHERE guild_id=?",
+            (member.guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0] or not row[1]:
+        return  # disabled or not configured
+    text = (row[1]
+            .replace("{member}", member.mention)
+            .replace("{server}", member.guild.name))
+    embed = discord.Embed(description=text, color=discord.Color.blurple())
+    embed.set_author(
+        name=member.guild.name,
+        icon_url=member.guild.icon.url if member.guild.icon else None)
+    try:
+        await member.send(embed=embed, view=_WelcomeView(member.guild.name))
+    except discord.Forbidden:
+        pass  # user has DMs closed — silently skip
+    except Exception as e:
+        print(f"[Welcome] {member} / {member.guild.name}: {e}")
 
 # ═══════════════════════════════════════════════════════
 # READY EVENT
@@ -2392,6 +2423,131 @@ async def trade(interaction: discord.Interaction, user: discord.Member):
         f"then **Confirm**.",
         embed=session.build_embed(interaction.guild), view=TradeView(session))
     session.message = await interaction.original_response()
+
+# ═══════════════════════════════════════════════════════
+# WELCOME DM SYSTEM
+# ═══════════════════════════════════════════════════════
+
+class _WelcomeView(discord.ui.View):
+    """Non-interactive footer button that shows which server sent the DM."""
+    def __init__(self, guild_name: str):
+        super().__init__(timeout=None)
+        label = f"Sent from {guild_name}"
+        if len(label) > 80:
+            label = label[:77] + "..."
+        self.add_item(discord.ui.Button(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            disabled=True))
+
+
+class WelcomeMessageModal(discord.ui.Modal, title="Set Welcome DM Message"):
+    message_input = discord.ui.TextInput(
+        label="Welcome message",
+        style=discord.TextStyle.long,
+        placeholder=(
+            "Welcome to {server}, {member}! 🎉\n\n"
+            "Tip: use {member} for a mention and {server} for the server name.\n"
+            "This box supports multiple lines."
+        ),
+        max_length=1800,
+        required=True)
+
+    def __init__(self, existing: str = ""):
+        super().__init__()
+        if existing:
+            self.message_input.default = existing
+
+    async def on_submit(self, interaction: discord.Interaction):
+        msg = self.message_input.value.strip()
+        async with db_lock:
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO welcome_config(guild_id, enabled, message) VALUES(?,?,?)",
+                    (interaction.guild.id, 1, msg))
+                await db.commit()
+        await interaction.response.send_message(
+            "✅ Welcome message saved and **enabled**!\n"
+            "Use `/previewwelcome` to see how it looks, or `/disablewelcome` to turn it off.",
+            ephemeral=True)
+
+@bot.tree.command(name="setwelcome",
+                  description="Set or edit the DM new members receive — opens a text editor")
+@command_enabled()
+async def setwelcome(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute("SELECT message FROM welcome_config WHERE guild_id=?",
+                              (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    await interaction.response.send_modal(
+        WelcomeMessageModal(existing=row[0] if row and row[0] else ""))
+
+
+@bot.tree.command(name="enablewelcome", description="Enable welcome DMs for new members")
+@command_enabled()
+async def enablewelcome(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute("SELECT message FROM welcome_config WHERE guild_id=?",
+                              (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        await interaction.response.send_message(
+            "❌ No welcome message set yet. Use `/setwelcome` to write one first.",
+            ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("UPDATE welcome_config SET enabled=1 WHERE guild_id=?",
+                             (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("✅ Welcome DMs enabled.")
+
+
+@bot.tree.command(name="disablewelcome",
+                  description="Disable welcome DMs (the message is kept, not deleted)")
+@command_enabled()
+async def disablewelcome(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("UPDATE welcome_config SET enabled=0 WHERE guild_id=?",
+                             (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message(
+        "🔕 Welcome DMs disabled. The message is preserved — use `/enablewelcome` to turn it back on.")
+
+
+@bot.tree.command(name="previewwelcome",
+                  description="Preview the welcome DM as it would appear to a new member")
+@command_enabled()
+async def previewwelcome(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute("SELECT enabled, message FROM welcome_config WHERE guild_id=?",
+                              (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[1]:
+        await interaction.response.send_message(
+            "❌ No welcome message configured yet. Use `/setwelcome` to create one.",
+            ephemeral=True); return
+    enabled, message = row
+    text = (message
+            .replace("{member}", interaction.user.mention)
+            .replace("{server}", interaction.guild.name))
+    embed = discord.Embed(description=text, color=discord.Color.blurple())
+    embed.set_author(
+        name=interaction.guild.name,
+        icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+    status = "✅ Enabled" if enabled else "🔒 Disabled"
+    await interaction.response.send_message(
+        f"📬 **Welcome DM Preview** — Status: {status}\n"
+        f"*(your mention is used as the example member)*",
+        embed=embed,
+        view=_WelcomeView(interaction.guild.name),
+        ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
 # ADMIN ABUSE BOX SYSTEM
