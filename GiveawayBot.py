@@ -1522,6 +1522,53 @@ async def takekey(interaction: discord.Interaction, user: discord.Member, amount
                                                 ephemeral=True); return
     await interaction.response.send_message(f"🗑 Took **{amount}x {VIP_CHEST_KEY}** from {user.mention}.")
 
+@bot.tree.command(name="takekeyrole", description="Take VIP Chest Key(s) from every member with a specific role")
+@app_commands.describe(role="Role whose members lose keys", amount="Number of keys to take from each (default 1)")
+@command_enabled()
+async def takekeyrole(interaction: discord.Interaction, role: discord.Role, amount: int = 1):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if amount <= 0:
+        await interaction.response.send_message("❌ Amount must be ≥ 1.", ephemeral=True); return
+    members = [m for m in interaction.guild.members if role in m.roles and not m.bot]
+    if not members:
+        await interaction.response.send_message(
+            f"❌ No non-bot members found with {role.mention}.", ephemeral=True); return
+    await interaction.response.defer()
+
+    full_taken    = 0  # had >= amount keys
+    partial_taken = 0  # had some keys but fewer than amount — lost all
+    skipped       = 0  # had 0 keys
+
+    for m in members:
+        inv     = await inventory_get(interaction.guild.id, m.id)
+        owned   = {n.lower(): q for n, q in inv}
+        current = owned.get(VIP_CHEST_KEY.lower(), 0)
+        if current == 0:
+            skipped += 1
+            continue
+        to_take = min(amount, current)
+        await inventory_remove(interaction.guild.id, m.id, VIP_CHEST_KEY, to_take)
+        if to_take == amount:
+            full_taken += 1
+        else:
+            partial_taken += 1
+
+    lines = [f"🗑 Processed **{len(members)}** member(s) with {role.mention}:"]
+    if full_taken:    lines.append(f"• **{full_taken}** lost the full **{amount}x** key(s)")
+    if partial_taken: lines.append(f"• **{partial_taken}** had fewer than {amount} — lost all their keys")
+    if skipped:       lines.append(f"• **{skipped}** had no keys (skipped)")
+
+    await interaction.followup.send("\n".join(lines))
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Keys Taken (Role)", discord.Color.red(),
+        Admin=interaction.user.mention, Role=role.name,
+        Full=str(full_taken), Partial=str(partial_taken), Skipped=str(skipped)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ takekeyrole", discord.Color.orange(),
+        By=interaction.user.mention, Role=role.name,
+        Amount=f"{amount}x each", Full=str(full_taken), Partial=str(partial_taken)))
+
 async def daily_key_loop():
     """1 VIP Chest Key per day per Nitro Booster."""
     await bot.wait_until_ready()
