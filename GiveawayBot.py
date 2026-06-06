@@ -2445,11 +2445,7 @@ class WelcomeMessageModal(discord.ui.Modal, title="Set Welcome DM Message"):
     message_input = discord.ui.TextInput(
         label="Welcome message",
         style=discord.TextStyle.long,
-        placeholder=(
-            "Welcome to {server}, {member}! 🎉\n\n"
-            "Tip: use {member} for a mention and {server} for the server name.\n"
-            "This box supports multiple lines."
-        ),
+        placeholder="Welcome to {server}, {member}! 🎉  — use {member} and {server} as placeholders",
         max_length=1800,
         required=True)
 
