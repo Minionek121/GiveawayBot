@@ -1121,6 +1121,20 @@ async def removeautogiveaway(interaction: discord.Interaction, prize: str):
     else:
         await interaction.response.send_message(f"🗑 Removed: {prize}")
 
+@bot.tree.command(name="listautogiveaways", description="List all giveaways in the auto pool")
+@command_enabled()
+async def listautogiveaways(interaction: discord.Interaction):
+    if not AUTO_GIVEAWAY_POOL:
+        await interaction.response.send_message("❌ The auto giveaway pool is empty."); return
+    embed = discord.Embed(title="🎉 Auto Giveaway Pool", color=discord.Color.gold())
+    for i, g in enumerate(AUTO_GIVEAWAY_POOL, 1):
+        embed.add_field(
+            name=f"#{i} — {g['prize']}",
+            value=f"💰 {g['reward']:,} coins | 🏆 {g['winners']} winner(s)",
+            inline=False)
+    embed.set_footer(text=f"{len(AUTO_GIVEAWAY_POOL)} item(s) in pool")
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="startgiveaways", description="Start automatic giveaways")
 @app_commands.describe(interval_seconds="Seconds between giveaways",
                        giveaway_duration_seconds="How long each lasts",
