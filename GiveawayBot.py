@@ -2095,62 +2095,151 @@ async def systemstatus(interaction: discord.Interaction):
 # LEADERBOARD
 # ═══════════════════════════════════════════════════════
 
+_LB_PER_PAGE = 10
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, all_data: list, guild: discord.Guild, caller_id: int,
+                 caller_rank: int | None, caller_amt: int | None,
+                 title: str, current_page: int, total_pages: int):
+        super().__init__(timeout=120)
+        self.all_data    = all_data
+        self.guild       = guild
+        self.caller_id   = caller_id
+        self.caller_rank = caller_rank
+        self.caller_amt  = caller_amt
+        self.title       = title
+        self.current     = current_page   # 1-indexed
+        self.total       = total_pages
+        self._sync()
+
+    def _sync(self):
+        for btn in self.children:
+            if isinstance(btn, discord.ui.Button):
+                if btn.label == "◀": btn.disabled = self.current <= 1
+                elif btn.label == "▶": btn.disabled = self.current >= self.total
+
+    def build_embed(self, page: int) -> discord.Embed:
+        medals = ["🥇", "🥈", "🥉"]
+        start  = (page - 1) * _LB_PER_PAGE
+        chunk  = self.all_data[start:start + _LB_PER_PAGE]
+        embed  = discord.Embed(title=self.title, color=discord.Color.gold())
+        lines  = []
+        for i, (uid, amt) in enumerate(chunk):
+            rank   = start + i + 1
+            m      = self.guild.get_member(uid)
+            name   = m.display_name if m else "*[Left Server]*"
+            star   = " ★" if uid == self.caller_id else ""
+            prefix = medals[rank - 1] if rank <= 3 else f"**#{rank}**"
+            lines.append(f"{prefix} {name}{star} — {amt:,}")
+        embed.description = "\n".join(lines) if lines else "*No entries on this page.*"
+        # Always show caller's rank in the footer
+        page_info = f"Page {page}/{self.total} · {len(self.all_data)} entries"
+        if self.caller_rank is not None:
+            embed.set_footer(text=f"{page_info} · Your rank: #{self.caller_rank} ({self.caller_amt:,})")
+        else:
+            embed.set_footer(text=f"{page_info} · You have no entry yet")
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, disabled=True)
+    async def prev_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.caller_id:
+            await interaction.response.send_message("❌ Not your leaderboard.", ephemeral=True); return
+        self.current -= 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.build_embed(self.current), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.caller_id:
+            await interaction.response.send_message("❌ Not your leaderboard.", ephemeral=True); return
+        self.current += 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.build_embed(self.current), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
 @bot.tree.command(name="leaderboard", description="View leaderboards")
 @app_commands.choices(category=[
     app_commands.Choice(name="Total EXP",              value="total_exp"),
-    app_commands.Choice(name="Current EXP",            value="current_exp"),
+    app_commands.Choice(name="Usable EXP",             value="current_exp"),
     app_commands.Choice(name="Balance",                value="balance"),
     app_commands.Choice(name="Lifetime Tickets",       value="raffle_tickets_bought"),
     app_commands.Choice(name="Current Raffle Tickets", value="current_tickets"),
     app_commands.Choice(name="Chests Opened",          value="chests_opened"),
     app_commands.Choice(name="Gifted Balance",         value="gifted_balance"),
 ])
+@app_commands.describe(
+    category="Which leaderboard to view",
+    page="Jump directly to this page number (default: 1)"
+)
 @command_enabled()
-async def leaderboard(interaction: discord.Interaction, category: app_commands.Choice[str]):
-    value = category.value
-    leaderboard_data = []
+async def leaderboard(interaction: discord.Interaction,
+                      category: app_commands.Choice[str],
+                      page: int = 1):
+    value    = category.value
+    gid      = interaction.guild.id
+    week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    await interaction.response.defer()
+
+    all_data: list[tuple[int, int]] = []
     async with get_db() as db:
         if value == "current_exp":
+            # One efficient query instead of per-user calls
             async with db.execute(
-                "SELECT DISTINCT user_id FROM exp_history WHERE guild_id=?",
-                (interaction.guild.id,)) as cur:
-                users = await cur.fetchall()
-            for (uid,) in users:
-                leaderboard_data.append((uid, await get_exp(interaction.guild.id, uid)))
+                "SELECT user_id, SUM(amount) FROM exp_history "
+                "WHERE guild_id=? AND timestamp>=? GROUP BY user_id "
+                "HAVING SUM(amount)>0 ORDER BY SUM(amount) DESC",
+                (gid, week_ago)) as cur:
+                all_data = [(uid, int(amt)) for uid, amt in await cur.fetchall()]
         elif value == "current_tickets":
             async with db.execute(
-                "SELECT user_id,tickets FROM raffle WHERE guild_id=? ORDER BY tickets DESC LIMIT 10",
-                (interaction.guild.id,)) as cur:
-                leaderboard_data = await cur.fetchall()
+                "SELECT user_id, tickets FROM raffle "
+                "WHERE guild_id=? AND tickets>0 ORDER BY tickets DESC",
+                (gid,)) as cur:
+                all_data = list(await cur.fetchall())
         elif value == "balance":
             async with db.execute(
-                "SELECT user_id,balance FROM balances WHERE guild_id=? ORDER BY balance DESC LIMIT 10",
-                (interaction.guild.id,)) as cur:
-                leaderboard_data = await cur.fetchall()
+                "SELECT user_id, balance FROM balances "
+                "WHERE guild_id=? AND balance>0 ORDER BY balance DESC",
+                (gid,)) as cur:
+                all_data = list(await cur.fetchall())
         else:
             async with db.execute(
-                f"SELECT user_id,{value} FROM user_stats WHERE guild_id=? ORDER BY {value} DESC LIMIT 10",
-                (interaction.guild.id,)) as cur:
-                leaderboard_data = await cur.fetchall()
-    if value == "current_exp":
-        leaderboard_data.sort(key=lambda x: x[1], reverse=True)
-        leaderboard_data = leaderboard_data[:10]
-    if not leaderboard_data:
-        await interaction.response.send_message("❌ No data found."); return
+                f"SELECT user_id, {value} FROM user_stats "
+                f"WHERE guild_id=? AND {value}>0 ORDER BY {value} DESC",
+                (gid,)) as cur:
+                all_data = list(await cur.fetchall())
+
+    if not all_data:
+        await interaction.followup.send("❌ No data found."); return
+
+    # Find the caller's rank (None if they have no entry)
+    caller_rank = caller_amt = None
+    for rank, (uid, amt) in enumerate(all_data, 1):
+        if uid == interaction.user.id:
+            caller_rank, caller_amt = rank, amt
+            break
+
     title_map = {
-        "total_exp": "🏆 Total EXP", "current_exp": "⭐ Current EXP",
-        "balance": "💰 Balance", "raffle_tickets_bought": "🎟 Lifetime Tickets",
-        "current_tickets": "🎫 Current Tickets", "chests_opened": "📦 Chests Opened",
-        "gifted_balance": "💸 Gifted Balance"
+        "total_exp":             "🏆 Total EXP",
+        "current_exp":           "⭐ Usable EXP",
+        "balance":               "💰 Balance",
+        "raffle_tickets_bought": "🎟 Lifetime Tickets",
+        "current_tickets":       "🎫 Current Tickets",
+        "chests_opened":         "📦 Chests Opened",
+        "gifted_balance":        "💸 Gifted Balance",
     }
-    embed  = discord.Embed(title=title_map[value] + " Leaderboard", color=discord.Color.gold())
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (uid, amt) in enumerate(leaderboard_data, 1):
-        u = interaction.guild.get_member(uid)
-        if not u: continue
-        embed.add_field(name=f"{medals[i-1] if i<=3 else '#'+str(i)} {u.display_name}",
-                        value=f"{amt:,}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    title       = title_map[value] + " Leaderboard"
+    total_pages = max(1, (len(all_data) + _LB_PER_PAGE - 1) // _LB_PER_PAGE)
+    page        = max(1, min(page, total_pages))
+
+    view  = LeaderboardView(all_data, interaction.guild, interaction.user.id,
+                            caller_rank, caller_amt, title, page, total_pages)
+    await interaction.followup.send(
+        embed=view.build_embed(page),
+        view=view if total_pages > 1 else None)
 
 # ═══════════════════════════════════════════════════════
 # RARE DROP CHANNEL
@@ -4314,11 +4403,11 @@ async def removehint(interaction: discord.Interaction, hint_id: int):
 @bot.tree.command(name="listhints", description="List hints for a game, optionally filtered to one answer")
 @app_commands.describe(
     game_name="Name of the game",
-    answer_id="Only show hints for this answer ID (optional)"
-)
+    answer_id="Only show hints for this answer ID (optional)",
+    page="Jump directly to this page (default: 1)")
 @command_enabled()
 async def listhints(interaction: discord.Interaction, game_name: str,
-                    answer_id: Optional[int] = None):
+                    answer_id: Optional[int] = None, page: int = 1):
     await interaction.response.defer(ephemeral=True)
     async with get_db() as db:
         if answer_id is not None:
@@ -4373,9 +4462,10 @@ async def listhints(interaction: discord.Interaction, game_name: str,
                  " | Use /removehint <ID> to delete a hint")
         pages.append(embed)
 
-    view = GameListView(pages, interaction.user.id)
+    _initial = max(0, min(page - 1, len(pages) - 1))
+    view = GameListView(pages, interaction.user.id, initial_page=_initial)
     await interaction.followup.send(
-        embed=pages[0],
+        embed=pages[_initial],
         view=view if len(pages) > 1 else None,
         ephemeral=True)
 
@@ -4383,10 +4473,10 @@ async def listhints(interaction: discord.Interaction, game_name: str,
 # ── List games (paginated) ────────────────────────────────────────────────────
 
 class GameListView(discord.ui.View):
-    def __init__(self, pages: list[discord.Embed], user_id: int):
+    def __init__(self, pages: list[discord.Embed], user_id: int, initial_page: int = 0):
         super().__init__(timeout=120)
         self.pages   = pages
-        self.current = 0
+        self.current = max(0, min(initial_page, len(pages) - 1))
         self.user_id = user_id
         self._sync()
 
@@ -4420,9 +4510,11 @@ class GameListView(discord.ui.View):
 
 
 @bot.tree.command(name="listgames", description="List all games or paginate a specific game's answers")
-@app_commands.describe(game_name="Specific game to inspect (shows all answers, paginated)")
+@app_commands.describe(
+    game_name="Specific game to inspect (shows all answers, paginated)",
+    page="Jump directly to this page (default: 1)")
 @command_enabled()
-async def listgames(interaction: discord.Interaction, game_name: str = None):
+async def listgames(interaction: discord.Interaction, game_name: str = None, page: int = 1):
     await interaction.response.defer()
     gid = interaction.guild.id
 
@@ -4473,8 +4565,9 @@ async def listgames(interaction: discord.Interaction, game_name: str = None):
                 embed.add_field(name=f"🎯 {gname}", value=val, inline=False)
             pages.append(embed)
 
-        view = GameListView(pages, interaction.user.id)
-        await interaction.followup.send(embed=pages[0], view=view if len(pages) > 1 else None)
+        _initial = max(0, min(page - 1, len(pages) - 1))
+        view = GameListView(pages, interaction.user.id, initial_page=_initial)
+        await interaction.followup.send(embed=pages[_initial], view=view if len(pages) > 1 else None)
         return
 
     # ── Paginated answer view for a specific game ─────────────────────────────
@@ -4533,8 +4626,9 @@ async def listgames(interaction: discord.Interaction, game_name: str = None):
                               color=discord.Color.teal())
         pages.append(embed)
 
-    view = GameListView(pages, interaction.user.id)
-    await interaction.followup.send(embed=pages[0], view=view if len(pages) > 1 else None)
+    _initial = max(0, min(page - 1, len(pages) - 1))
+    view = GameListView(pages, interaction.user.id, initial_page=_initial)
+    await interaction.followup.send(embed=pages[_initial], view=view if len(pages) > 1 else None)
 
 
 # ── Channel setup ─────────────────────────────────────────────────────────────
