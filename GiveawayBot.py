@@ -222,6 +222,27 @@ async def setup_database():
                 guild_id INTEGER PRIMARY KEY,
                 enabled  INTEGER DEFAULT 0,
                 message  TEXT)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_giveaway_pool(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                prize TEXT,
+                winners INTEGER DEFAULT 1,
+                chance REAL DEFAULT 1.0,
+                reward_balance INTEGER DEFAULT 0,
+                reward_exp INTEGER DEFAULT 0,
+                reward_tickets INTEGER DEFAULT 0,
+                reward_gamble_tokens INTEGER DEFAULT 0,
+                reward_vip_keys INTEGER DEFAULT 0,
+                reward_role_id INTEGER DEFAULT 0,
+                reward_item TEXT,
+                reward_item_qty INTEGER DEFAULT 1)""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_giveaway_config(
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                interval_seconds INTEGER NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                running INTEGER DEFAULT 0)""")
             # ── Per-guild schemas (migration: drop & recreate if guild_id column is missing) ──
 
             for table, new_sql in [
@@ -674,7 +695,14 @@ async def on_member_join(member: discord.Member):
 async def on_ready():
     await setup_database()
     await load_disabled_commands()   # ← restore persisted disabled commands
-
+    # Resume any auto giveaway loops that were running before the restart
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT guild_id FROM auto_giveaway_config WHERE running=1") as cur:
+            _ag_guilds = [r[0] for r in await cur.fetchall()]
+    for _gid in _ag_guilds:
+        auto_giveaway_tasks[_gid] = asyncio.create_task(auto_giveaway_loop(_gid))
+        print(f"[AutoGiveaway] Resumed for guild {_gid}")
     # Sync to every guild the bot is currently in.
     # Guild-scoped syncs appear instantly (no 1-hour delay).
     # For 2–10 servers this completes in a few seconds total.
@@ -1143,94 +1171,247 @@ async def reroll(interaction: discord.Interaction, message_id: str):
 # AUTO GIVEAWAY
 # ═══════════════════════════════════════════════════════
 
-AUTO_GIVEAWAY_ENABLED = False
-AUTO_GIVEAWAY_POOL    = []
-auto_giveaway_task    = None
+auto_giveaway_tasks: dict[int, asyncio.Task] = {}   # guild_id → task
+
+async def auto_giveaway_loop(guild_id: int):
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        # Load config fresh each cycle (handles /stopgiveaways gracefully)
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id, interval_seconds, duration_seconds, running "
+                "FROM auto_giveaway_config WHERE guild_id=?", (guild_id,)) as cur:
+                cfg = await cur.fetchone()
+        if not cfg or not cfg[3]:   # config gone or running=0
+            auto_giveaway_tasks.pop(guild_id, None)
+            break
+        channel_id, interval_secs, duration_secs, _ = cfg
+
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            await asyncio.sleep(30); continue
+
+        # Load pool and pick one entry by weight
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT id,prize,winners,chance,reward_balance,reward_exp,"
+                "reward_tickets,reward_gamble_tokens,reward_vip_keys,"
+                "reward_role_id,reward_item,reward_item_qty "
+                "FROM auto_giveaway_pool WHERE guild_id=?", (guild_id,)) as cur:
+                pool = await cur.fetchall()
+        if not pool:
+            await asyncio.sleep(interval_secs); continue
+
+        gd = random.choices(pool, weights=[r[3] for r in pool], k=1)[0]
+        (_id, prize, winners, chance,
+         rb, re, rt, rgt, rvk, rrole, ri, riq) = gd
+
+        guild      = bot.get_guild(guild_id)
+        end_time   = datetime.now(UTC) + timedelta(seconds=duration_secs)
+
+        reward_parts = []
+        if rb  > 0: reward_parts.append(f"💰 {rb:,} coins")
+        if re  > 0: reward_parts.append(f"⭐ {re:,} EXP")
+        if rt  > 0: reward_parts.append(f"🎟 {rt} ticket(s)")
+        if rgt > 0: reward_parts.append(f"🎲 {rgt} gamble token(s)")
+        if rvk > 0: reward_parts.append(f"🔑 {rvk} VIP key(s)")
+        if rrole and guild:
+            role = guild.get_role(rrole)
+            if role: reward_parts.append(f"👑 {role.mention}")
+        if ri:      reward_parts.append(f"🎒 {riq}x {ri}")
+        reward_summary = " + ".join(reward_parts) if reward_parts else "No reward"
+
+        embed = discord.Embed(
+            title="🎉 AUTOMATIC GIVEAWAY 🎉",
+            description=(
+                f"React with 🎉 to enter\n\n"
+                f"**Prize:** {prize}\n**Reward:** {reward_summary}\n"
+                f"**Winners:** {winners}\n**Ends:** <t:{int(end_time.timestamp())}:R>"
+            ),
+            color=discord.Color.gold())
+        msg = await channel.send(embed=embed)
+        await msg.add_reaction("🎉")
+
+        prize_meta = json.dumps({
+            "label": prize, "balance": rb, "exp": re,
+            "tickets": rt, "gamble_tokens": rgt, "vip_keys": rvk,
+            "role_id": rrole, "item": ri, "item_qty": riq if ri else 0,
+        })
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO giveaways(message_id,channel_id,prize,winners,reward,"
+                "end_time,required_role,template,ended) VALUES(?,?,?,?,?,?,?,?,?)",
+                (msg.id, channel_id, prize_meta, winners, rb,
+                 int(end_time.timestamp()), 0, "gold", 0))
+            await db.commit()
+
+        asyncio.create_task(giveaway_timer(msg.id, duration_secs))
+        await asyncio.sleep(interval_secs)
 
 @bot.tree.command(name="addautogiveaway", description="Add a giveaway to the auto pool")
+@app_commands.describe(
+    prize="Prize description",
+    winners="Number of winners (default 1)",
+    chance="Selection weight — higher = picked more often (default 1.0)",
+    reward_balance="Coin reward per winner",
+    reward_exp="EXP reward per winner",
+    reward_tickets="Raffle tickets per winner",
+    reward_gamble_tokens="Gamble tokens per winner",
+    reward_vip_keys="VIP Chest Keys per winner",
+    reward_role="Role to give each winner",
+    reward_item="Item or box name per winner",
+    reward_item_qty="Quantity of item reward (default 1)"
+)
 @command_enabled()
-async def addautogiveaway(interaction: discord.Interaction, prize: str, reward: int, winners: int):
+async def addautogiveaway(
+    interaction: discord.Interaction,
+    prize: str, winners: int = 1, chance: float = 1.0,
+    reward_balance: int = 0, reward_exp: int = 0,
+    reward_tickets: int = 0, reward_gamble_tokens: int = 0,
+    reward_vip_keys: int = 0, reward_role: discord.Role = None,
+    reward_item: str = None, reward_item_qty: int = 1
+):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    AUTO_GIVEAWAY_POOL.append({"prize": prize, "reward": reward, "winners": winners})
-    await interaction.response.send_message(f"✅ Added: {prize} | Reward: {reward} | Winners: {winners}")
+    if winners < 1:
+        await interaction.response.send_message("❌ Winners must be ≥ 1.", ephemeral=True); return
+    if chance <= 0:
+        await interaction.response.send_message("❌ Chance must be > 0.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            cur = await db.execute(
+                "INSERT INTO auto_giveaway_pool(guild_id,prize,winners,chance,"
+                "reward_balance,reward_exp,reward_tickets,reward_gamble_tokens,"
+                "reward_vip_keys,reward_role_id,reward_item,reward_item_qty) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (interaction.guild.id, prize, winners, chance,
+                 reward_balance, reward_exp, reward_tickets, reward_gamble_tokens,
+                 reward_vip_keys, reward_role.id if reward_role else 0,
+                 reward_item, reward_item_qty))
+            new_id = cur.lastrowid
+            await db.commit()
+    parts = []
+    if reward_balance > 0:       parts.append(f"💰 {reward_balance:,}")
+    if reward_exp > 0:           parts.append(f"⭐ {reward_exp:,} EXP")
+    if reward_tickets > 0:       parts.append(f"🎟 {reward_tickets}")
+    if reward_gamble_tokens > 0: parts.append(f"🎲 {reward_gamble_tokens}")
+    if reward_vip_keys > 0:      parts.append(f"🔑 {reward_vip_keys}")
+    if reward_role:              parts.append(f"👑 {reward_role.mention}")
+    if reward_item:              parts.append(f"🎒 {reward_item_qty}x {reward_item}")
+    await interaction.response.send_message(
+        f"✅ Added **{prize}** to auto pool (`#{new_id}`)\n"
+        f"Winners: {winners} | Weight: {chance} | Reward: {' + '.join(parts) or 'None'}")
 
-@bot.tree.command(name="removeautogiveaway", description="Remove auto giveaway by prize name")
+
+@bot.tree.command(name="removeautogiveaway",
+                  description="Remove an auto giveaway by its ID (see /listautogiveaways)")
+@app_commands.describe(entry_id="ID shown in /listautogiveaways")
 @command_enabled()
-async def removeautogiveaway(interaction: discord.Interaction, prize: str):
+async def removeautogiveaway(interaction: discord.Interaction, entry_id: int):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    global AUTO_GIVEAWAY_POOL
-    before = len(AUTO_GIVEAWAY_POOL)
-    AUTO_GIVEAWAY_POOL = [g for g in AUTO_GIVEAWAY_POOL if g["prize"].lower() != prize.lower()]
-    if len(AUTO_GIVEAWAY_POOL) == before:
-        await interaction.response.send_message("❌ Not found.")
-    else:
-        await interaction.response.send_message(f"🗑 Removed: {prize}")
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT prize FROM auto_giveaway_pool WHERE id=? AND guild_id=?",
+                (entry_id, interaction.guild.id)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await interaction.response.send_message(
+                    f"❌ No auto giveaway with ID `#{entry_id}` in this server.",
+                    ephemeral=True); return
+            await db.execute("DELETE FROM auto_giveaway_pool WHERE id=?", (entry_id,))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 Removed **{row[0]}** (ID `#{entry_id}`) from the auto pool.")
+
 
 @bot.tree.command(name="listautogiveaways", description="List all giveaways in the auto pool")
 @command_enabled()
 async def listautogiveaways(interaction: discord.Interaction):
-    if not AUTO_GIVEAWAY_POOL:
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT id,prize,winners,chance,reward_balance,reward_exp,"
+            "reward_tickets,reward_gamble_tokens,reward_vip_keys,"
+            "reward_role_id,reward_item,reward_item_qty "
+            "FROM auto_giveaway_pool WHERE guild_id=? ORDER BY id",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
         await interaction.response.send_message("❌ The auto giveaway pool is empty."); return
+
+    total_weight = sum(r[3] for r in rows)
     embed = discord.Embed(title="🎉 Auto Giveaway Pool", color=discord.Color.gold())
-    for i, g in enumerate(AUTO_GIVEAWAY_POOL, 1):
+    for (row_id, prize, winners, chance,
+         rb, re, rt, rgt, rvk, rrole, ri, riq) in rows:
+        pct   = (chance / total_weight * 100) if total_weight > 0 else 0
+        parts = []
+        if rb:   parts.append(f"💰 {rb:,}")
+        if re:   parts.append(f"⭐ {re:,}")
+        if rt:   parts.append(f"🎟 {rt}")
+        if rgt:  parts.append(f"🎲 {rgt}")
+        if rvk:  parts.append(f"🔑 {rvk}")
+        if rrole:
+            role = interaction.guild.get_role(rrole)
+            if role: parts.append(f"👑 {role.mention}")
+        if ri:   parts.append(f"🎒 {riq}x {ri}")
         embed.add_field(
-            name=f"#{i} — {g['prize']}",
-            value=f"💰 {g['reward']:,} coins | 🏆 {g['winners']} winner(s)",
+            name=f"`#{row_id}` {prize}",
+            value=(f"Winners: {winners} | **{pct:.1f}%** (weight: {chance})\n"
+                   f"Reward: {' + '.join(parts) or 'None'}"),
             inline=False)
-    embed.set_footer(text=f"{len(AUTO_GIVEAWAY_POOL)} item(s) in pool")
+    embed.set_footer(text=f"{len(rows)} item(s) | total weight: {total_weight}")
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="startgiveaways", description="Start automatic giveaways")
 @app_commands.describe(interval_seconds="Seconds between giveaways",
                        giveaway_duration_seconds="How long each lasts",
                        channel="Channel (default current)")
 @command_enabled()
-async def startgiveaways(interaction: discord.Interaction, interval_seconds: int,
-                         giveaway_duration_seconds: int, channel: discord.TextChannel = None):
+async def startgiveaways(interaction: discord.Interaction,
+                         interval_seconds: int, giveaway_duration_seconds: int,
+                         channel: discord.TextChannel = None):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    global AUTO_GIVEAWAY_ENABLED, auto_giveaway_task
-    if auto_giveaway_task and not auto_giveaway_task.done():
-        await interaction.response.send_message("Already running.", ephemeral=True); return
-    if not AUTO_GIVEAWAY_POOL:
-        await interaction.response.send_message("❌ No auto giveaways added.", ephemeral=True); return
-    target_channel = channel or interaction.channel
-    AUTO_GIVEAWAY_ENABLED = True
-    async def auto_loop():
-        global AUTO_GIVEAWAY_ENABLED
-        while AUTO_GIVEAWAY_ENABLED:
-            gd = random.choice(AUTO_GIVEAWAY_POOL)
-            end_time = datetime.now(UTC) + timedelta(seconds=giveaway_duration_seconds)
-            embed = discord.Embed(title="🎉 AUTOMATIC GIVEAWAY 🎉",
-                description=(f"React with 🎉 to enter\n\nPrize: **{gd['prize']}**\n"
-                             f"Winners: **{gd['winners']}**\nReward: **{gd['reward']} coins**\n"
-                             f"Ends: <t:{int(end_time.timestamp())}:R>"),
-                color=discord.Color.gold())
-            msg = await target_channel.send(embed=embed)
-            await msg.add_reaction("🎉")
-            async with get_db() as db:
-                await db.execute(
-                    "INSERT INTO giveaways(message_id,channel_id,prize,winners,reward,end_time,required_role,template,ended) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (msg.id, target_channel.id, gd["prize"], gd["winners"], gd["reward"],
-                     int(end_time.timestamp()), 0, "gold", 0))
-                await db.commit()
-            asyncio.create_task(giveaway_timer(msg.id, giveaway_duration_seconds))
-            await asyncio.sleep(interval_seconds)
-    auto_giveaway_task = asyncio.create_task(auto_loop())
-    await interaction.response.send_message("✅ Automatic giveaways started.")
+    gid = interaction.guild.id
+    if gid in auto_giveaway_tasks and not auto_giveaway_tasks[gid].done():
+        await interaction.response.send_message("❌ Already running.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM auto_giveaway_pool WHERE guild_id=?", (gid,)) as cur:
+            if (await cur.fetchone())[0] == 0:
+                await interaction.response.send_message(
+                    "❌ No auto giveaways in the pool. Use `/addautogiveaway` first.",
+                    ephemeral=True); return
+    target = channel or interaction.channel
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_giveaway_config VALUES(?,?,?,?,?)",
+                (gid, target.id, interval_seconds, giveaway_duration_seconds, 1))
+            await db.commit()
+    auto_giveaway_tasks[gid] = asyncio.create_task(auto_giveaway_loop(gid))
+    await interaction.response.send_message(
+        f"✅ Automatic giveaways started in {target.mention}!\n"
+        f"Interval: **{interval_seconds}s** | Duration: **{giveaway_duration_seconds}s**")
+
 
 @bot.tree.command(name="stopgiveaways", description="Stop automatic giveaways")
 @command_enabled()
 async def stopgiveaways(interaction: discord.Interaction):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    global AUTO_GIVEAWAY_ENABLED, auto_giveaway_task
-    AUTO_GIVEAWAY_ENABLED = False
-    if auto_giveaway_task:
-        auto_giveaway_task.cancel(); auto_giveaway_task = None
+    gid  = interaction.guild.id
+    task = auto_giveaway_tasks.pop(gid, None)
+    if task:
+        task.cancel()
+    # Mark as not running so it doesn't resume on next restart
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE auto_giveaway_config SET running=0 WHERE guild_id=?", (gid,))
+            await db.commit()
     await interaction.response.send_message("🛑 Automatic giveaways stopped.")
 
 # ═══════════════════════════════════════════════════════
