@@ -249,6 +249,19 @@ async def setup_database():
                 elif not cols:
                     await db.execute(new_sql)
 
+            async with db.execute("PRAGMA table_info(exp_boosts)") as cur:
+                _eb_cols = {row[1] for row in await cur.fetchall()}
+            if _eb_cols and "channel_id" not in _eb_cols:
+                await db.execute("ALTER TABLE exp_boosts RENAME TO exp_boosts_old")
+                await db.execute("""CREATE TABLE exp_boosts(
+                    guild_id INTEGER, role_id INTEGER, boost_percent REAL,
+                    channel_id INTEGER DEFAULT 0, category_id INTEGER DEFAULT 0,
+                    PRIMARY KEY(guild_id, role_id, channel_id, category_id))""")
+                await db.execute(
+                    "INSERT OR IGNORE INTO exp_boosts "
+                    "SELECT guild_id, role_id, boost_percent, 0, 0 FROM exp_boosts_old")
+                await db.execute("DROP TABLE exp_boosts_old")
+
             # ── Global tables (new) ──
             await db.execute("""CREATE TABLE IF NOT EXISTS global_disabled_commands(
                 command_name TEXT PRIMARY KEY)""")
@@ -416,6 +429,34 @@ async def get_level_exp(guild_id: int, user_id: int) -> int:
 async def get_level(guild_id: int, user_id: int) -> int:
     return min((await get_level_exp(guild_id, user_id)) // LEVEL_DIVISOR + 1, 100)
 
+async def _add_chest_spending(guild_id: int, user_id: int, amount: int):
+    """
+    Record chest-spending by inserting negative entries whose timestamps
+    match the oldest positive entries they consume, so both sides of the
+    deduction expire at the same time and can never leave a phantom
+    negative balance.
+    """
+    week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    remaining = amount
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT rowid, amount, timestamp FROM exp_history "
+                "WHERE guild_id=? AND user_id=? AND timestamp>=? AND amount>0 "
+                "ORDER BY timestamp ASC",
+                (guild_id, user_id, week_ago)) as cur:
+                entries = await cur.fetchall()
+            for rowid, entry_amount, entry_ts in entries:
+                if remaining <= 0:
+                    break
+                consume = min(entry_amount, remaining)
+                await db.execute(
+                    "INSERT INTO exp_history(guild_id,user_id,amount,timestamp,is_bonus) "
+                    "VALUES(?,?,?,?,?)",
+                    (guild_id, user_id, -consume, entry_ts, 0))
+                remaining -= consume
+            await db.commit()
+
 # ═══════════════════════════════════════════════════════
 # INVENTORY  (now guild-scoped)
 # ═══════════════════════════════════════════════════════
@@ -581,9 +622,15 @@ async def on_message(message):
             if member_role_ids:
                 placeholders = ",".join("?" * len(member_role_ids))
                 async with get_db() as db:
+                    _ch_id  = message.channel.id
+                    _cat_id = message.channel.category_id or 0
                     async with db.execute(
-                        f"SELECT boost_percent FROM exp_boosts WHERE guild_id=? AND role_id IN ({placeholders})",
-                        (message.guild.id, *member_role_ids)) as cur:
+                        f"SELECT boost_percent FROM exp_boosts "
+                        f"WHERE guild_id=? AND role_id IN ({placeholders}) "
+                        f"AND ((channel_id=0 AND category_id=0)"      # global
+                        f"  OR channel_id=?"                           # this channel
+                        f"  OR (category_id!=0 AND category_id=?))",   # this category (!=0 avoids false match)
+                        (message.guild.id, *member_role_ids, _ch_id, _cat_id)) as cur:
                         boost_rows = await cur.fetchall()
                 if boost_rows:
                     total_boost = sum(r[0] for r in boost_rows)
@@ -1405,7 +1452,7 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
         total_exp_won += prize["exp"]
 
     gid = interaction.guild.id
-    await add_exp(gid, interaction.user.id, -total_cost)
+    await _add_chest_spending(gid, interaction.user.id, total_cost)
     if total_balance > 0: await add_balance(gid, interaction.user.id, total_balance)
     if total_exp_won > 0: await add_exp(gid, interaction.user.id, total_exp_won)
     await add_stat(gid, interaction.user.id, "chests_opened", amount)
@@ -2235,53 +2282,98 @@ async def raffle_info_loop():
 # EXP BOOSTS
 # ═══════════════════════════════════════════════════════
 
-@bot.tree.command(name="expboost", description="Set an EXP boost for a role (decimals and negatives supported)")
-@app_commands.describe(role="Role to boost",
-                       boost="e.g. 1.5 = +1.5%, -25 = penalty. All matching roles are summed.")
+@bot.tree.command(name="expboost",
+                  description="Set an EXP boost for a role — optionally limit it to a channel or category")
+@app_commands.describe(
+    role="Role to boost",
+    boost="e.g. 1.5 = +1.5%, -25 = penalty. All matching boosts are summed.",
+    channel="Only apply in this channel (omit for global or category-wide scope)",
+    category="Only apply in this category (omit for global or single-channel scope)"
+)
 @command_enabled()
-async def expboost(interaction: discord.Interaction, role: discord.Role, boost: float):
+async def expboost(interaction: discord.Interaction, role: discord.Role, boost: float,
+                   channel:  discord.TextChannel    = None,
+                   category: discord.CategoryChannel = None):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     if boost == 0:
         await interaction.response.send_message("❌ Boost cannot be 0%.", ephemeral=True); return
+    if channel and category:
+        await interaction.response.send_message(
+            "❌ Specify a channel OR a category, not both.", ephemeral=True); return
+    channel_id  = channel.id  if channel  else 0
+    category_id = category.id if category else 0
     async with db_lock:
         async with get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO exp_boosts VALUES(?,?,?)",
-                             (interaction.guild.id, role.id, boost))
+            await db.execute(
+                "INSERT OR REPLACE INTO exp_boosts VALUES(?,?,?,?,?)",
+                (interaction.guild.id, role.id, boost, channel_id, category_id))
             await db.commit()
-    sign = "+" if boost > 0 else ""
-    await interaction.response.send_message(f"✅ {role.mention} now earns **{sign}{boost}% EXP** per message.")
+    sign  = "+" if boost > 0 else ""
+    scope = "globally"
+    if channel:   scope = f"in {channel.mention} only"
+    elif category: scope = f"in the **{category.name}** category only"
+    await interaction.response.send_message(
+        f"✅ {role.mention} now earns **{sign}{boost}% EXP** per message {scope}.")
 
-@bot.tree.command(name="removeexpboost", description="Remove an EXP boost from a role")
+@bot.tree.command(name="removeexpboost",
+                  description="Remove an EXP boost — specify the same scope used when it was set")
+@app_commands.describe(
+    role="Role to remove boost from",
+    channel="Remove the boost specific to this channel (omit for global/category boost)",
+    category="Remove the boost specific to this category (omit for global/channel boost)"
+)
 @command_enabled()
-async def removeexpboost(interaction: discord.Interaction, role: discord.Role):
+async def removeexpboost(interaction: discord.Interaction, role: discord.Role,
+                          channel:  discord.TextChannel    = None,
+                          category: discord.CategoryChannel = None):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if channel and category:
+        await interaction.response.send_message(
+            "❌ Specify a channel OR a category, not both.", ephemeral=True); return
+    channel_id  = channel.id  if channel  else 0
+    category_id = category.id if category else 0
     async with db_lock:
         async with get_db() as db:
-            await db.execute("DELETE FROM exp_boosts WHERE guild_id=? AND role_id=?",
-                             (interaction.guild.id, role.id))
+            await db.execute(
+                "DELETE FROM exp_boosts "
+                "WHERE guild_id=? AND role_id=? AND channel_id=? AND category_id=?",
+                (interaction.guild.id, role.id, channel_id, category_id))
             await db.commit()
-    await interaction.response.send_message(f"🗑 Removed EXP boost from {role.mention}.")
+    scope = "global"
+    if channel:   scope = f"channel {channel.mention}"
+    elif category: scope = f"category **{category.name}**"
+    await interaction.response.send_message(
+        f"🗑 Removed {scope} EXP boost from {role.mention}.")
 
 @bot.tree.command(name="listexpboosts", description="List all active EXP boosts")
 @command_enabled()
 async def listexpboosts(interaction: discord.Interaction):
     async with get_db() as db:
         async with db.execute(
-            "SELECT role_id,boost_percent FROM exp_boosts WHERE guild_id=? ORDER BY boost_percent DESC",
+            "SELECT role_id, boost_percent, channel_id, category_id "
+            "FROM exp_boosts WHERE guild_id=? ORDER BY boost_percent DESC",
             (interaction.guild.id,)) as cur:
             rows = await cur.fetchall()
     if not rows:
         await interaction.response.send_message("❌ No EXP boosts configured."); return
     embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
-    for role_id, boost in rows:
+    for role_id, boost, channel_id, category_id in rows:
         role = interaction.guild.get_role(role_id)
         name = role.mention if role else f"<deleted role {role_id}>"
         sign = "+" if boost > 0 else ""
-        embed.add_field(name=name, value=f"{sign}{boost}%", inline=False)
+        if channel_id:
+            ch    = interaction.guild.get_channel(channel_id)
+            scope = ch.mention if ch else f"<#deleted {channel_id}>"
+        elif category_id:
+            cat   = interaction.guild.get_channel(category_id)
+            scope = f"📁 {cat.name}" if cat else f"📁 <deleted category {category_id}>"
+        else:
+            scope = "🌐 Global"
+        embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
     await interaction.response.send_message(embed=embed)
-
+    
 # ═══════════════════════════════════════════════════════
 # TRADE SYSTEM
 # ═══════════════════════════════════════════════════════
@@ -5578,6 +5670,34 @@ end_giveaway = _end_giveaway_logged
 
 def _owner_only(interaction: discord.Interaction) -> bool:
     return interaction.user.id == BOT_OWNER_ID
+
+# -- FIX EXP ------------------------------------------------------------------
+
+@bot.tree.command(name="fixexp",
+                  description="[Owner] Fix a user's hidden negative usable EXP balance")
+@app_commands.describe(user="User to inspect and fix")
+async def fixexp(interaction: discord.Interaction, user: discord.Member):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    gid      = interaction.guild.id
+    week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT SUM(amount) FROM exp_history "
+            "WHERE guild_id=? AND user_id=? AND timestamp>=?",
+            (gid, user.id, week_ago)) as cur:
+            row = await cur.fetchone()
+    raw = row[0] or 0
+    if raw >= 0:
+        await interaction.response.send_message(
+            f"✅ {user.mention}'s underlying usable EXP is **{raw:,}** — no fix needed.",
+            ephemeral=True); return
+    # Compensate the negative hole with a bonus entry
+    await add_exp(gid, user.id, -raw, is_bonus=True)
+    await interaction.response.send_message(
+        f"✅ Fixed {user.mention}: underlying balance was **{raw:,}** (shown as 0). "
+        f"Added **{-raw:,}** bonus EXP to bring it to 0.",
+        ephemeral=True)
 
 # ── Global command disable / enable ──────────────────────────────────────────
 
