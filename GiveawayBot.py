@@ -4492,866 +4492,6 @@ async def help_cmd(interaction: discord.Interaction, command: str = None):
     )
 
 # ═══════════════════════════════════════════════════════
-# LOGGING SYSTEM
-# ═══════════════════════════════════════════════════════
-
-_LOG_CHOICES = [
-    app_commands.Choice(name="💰 Balance  — add/remove/gift/wins",        value="balance"),
-    app_commands.Choice(name="⭐ EXP      — add/remove/chest spend",      value="exp"),
-    app_commands.Choice(name="🎒 Items    — buy/use/give/take/keys",      value="item"),
-    app_commands.Choice(name="🎟 Raffle   — ticket purchases, daily draw",value="raffle"),
-    app_commands.Choice(name="🎉 Giveaway — create/end/reroll",           value="giveaway"),
-    app_commands.Choice(name="📦 Chests   — open results",                value="chest"),
-    app_commands.Choice(name="🎁 Boxes    — open results",                value="box"),
-    app_commands.Choice(name="🎲 Gamble   — blackjack/roulette results",  value="gamble"),
-    app_commands.Choice(name="🎫 Codes    — create/redeem",               value="code"),
-    app_commands.Choice(name="🤝 Trades   — executed trades",             value="trade"),
-    app_commands.Choice(name="💬 Commands — every slash command used",    value="command"),
-    app_commands.Choice(name="⚙️ Admin    — all admin-only actions",      value="admin"),
-]
-
-async def log_event(guild_id: int, log_type: str, embed: discord.Embed):
-    """Send embed to the configured log channel, silently no-op if not configured."""
-    try:
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT channel_id FROM log_channels WHERE guild_id=? AND log_type=?",
-                (guild_id, log_type)) as cur:
-                row = await cur.fetchone()
-        if not row:
-            return
-        ch = bot.get_channel(row[0])
-        if ch:
-            await ch.send(embed=embed)
-    except Exception as e:
-        print(f"[Log:{log_type}] {e}")
-
-def _log_embed(title: str, color: discord.Color, **fields) -> discord.Embed:
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(UTC))
-    for name, value in fields.items():
-        embed.add_field(name=name, value=str(value), inline=True)
-    return embed
-
-# ── /setlogchannel ────────────────────────────────────────────────────────────
-
-@bot.tree.command(name="setlogchannel", description="Set a channel for a specific log type")
-@app_commands.describe(log_type="Which events to send here", channel="Destination channel")
-@app_commands.choices(log_type=_LOG_CHOICES)
-@command_enabled()
-async def setlogchannel(interaction: discord.Interaction,
-                        log_type: str, channel: discord.TextChannel):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO log_channels(guild_id,log_type,channel_id) VALUES(?,?,?)",
-                (interaction.guild.id, log_type, channel.id))
-            await db.commit()
-    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
-    await interaction.response.send_message(f"✅ **{label}** logs → {channel.mention}")
-
-@bot.tree.command(name="removelogchannel", description="Disable logging for a specific type")
-@app_commands.describe(log_type="Which log type to disable")
-@app_commands.choices(log_type=_LOG_CHOICES)
-@command_enabled()
-async def removelogchannel(interaction: discord.Interaction, log_type: str):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute("DELETE FROM log_channels WHERE guild_id=? AND log_type=?",
-                             (interaction.guild.id, log_type))
-            await db.commit()
-    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
-    await interaction.response.send_message(f"🗑 **{label}** logs disabled.")
-
-# ── Command log via interaction listener ──────────────────────────────────────
-# Uses bot.listen so it doesn't override on_message / on_ready.
-
-@bot.listen("on_interaction")
-async def _log_command_use(interaction: discord.Interaction):
-    if interaction.type != discord.InteractionType.application_command:
-        return
-    if not interaction.guild:
-        return
-    cmd  = interaction.data.get("name", "?")
-    opts = interaction.data.get("options", [])
-    # Resolve sub-command name if present (type 1 = SUB_COMMAND, type 2 = SUB_COMMAND_GROUP)
-    if opts and opts[0].get("type") in (1, 2):
-        cmd += f" {opts[0]['name']}"
-    embed = discord.Embed(
-        description=f"{interaction.user.mention} used **`/{cmd}`**",
-        color=discord.Color.light_grey(),
-        timestamp=datetime.now(UTC))
-    embed.set_author(name=str(interaction.user),
-                     icon_url=interaction.user.display_avatar.url)
-    embed.set_footer(text=(f"#{interaction.channel.name}" if interaction.channel else "?")
-                     + f" | UID: {interaction.user.id}")
-    await log_event(interaction.guild.id, "command", embed)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING PATCHES
-# Rules:
-#   • Admin-only commands: check is_allowed_to_giveaway BEFORE logging so
-#     denied attempts don't appear as successful actions in the log.
-#   • User commands (buy, use, redeem): pre-check all early-return conditions
-#     before the original call so we know whether it will succeed.
-#   • chest / vipchest / roulette / blackjack: logged inline inside the command
-#     bodies (so the actual amount/outcome is used). No patches for those.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Balance ───────────────────────────────────────────────────────────────────
-
-_orig_addbalance = add_balance._callback
-async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_addbalance(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "💰 Balance Added", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ addbalance", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addbalance._callback = _addbalance_logged
-
-_orig_removebalance = removebalance._callback
-async def _removebalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_removebalance(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "💸 Balance Removed", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ removebalance", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removebalance._callback = _removebalance_logged
-
-_orig_gift = gift._callback
-async def _gift_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    # Pre-check every condition that causes gift() to return early without acting
-    if (amount <= 0 or
-            user.id == interaction.user.id or
-            await get_balance(interaction.guild.id, interaction.user.id) < amount):
-        await _orig_gift(interaction, user, amount)
-        return
-    await _orig_gift(interaction, user, amount)
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "🎁 Gift Sent", discord.Color.green(),
-        From=interaction.user.mention, To=user.mention, Amount=f"{amount:,}"))
-gift._callback = _gift_logged
-
-# ── EXP ───────────────────────────────────────────────────────────────────────
-
-_orig_addexp = addexp._callback
-async def _addexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_addexp(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "exp", _log_embed(
-        "⭐ Usable EXP Added", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ addexp (usable)", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addexp._callback = _addexp_logged
-
-_orig_removeexp = removeexp._callback
-async def _removeexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_removeexp(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "exp", _log_embed(
-        "📉 EXP Removed", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ removeexp", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removeexp._callback = _removeexp_logged
-
-# NOTE: addtotalexp and removetotalexp already call log_event inline.
-
-# ── Items / keys / tokens ─────────────────────────────────────────────────────
-
-_orig_item_give = item_give._callback
-async def _item_give_logged(interaction: discord.Interaction,
-                             user: discord.Member, name: str, quantity: int = 1):
-    await _orig_item_give(interaction, user, name, quantity)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎒 Item Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ item give", discord.Color.orange(),
-        By=interaction.user.mention, To=user.mention, Item=f"{quantity}x {name}"))
-item_give._callback = _item_give_logged
-
-_orig_item_take = item_take._callback
-async def _item_take_logged(interaction: discord.Interaction,
-                             user: discord.Member, name: str, quantity: int = 1):
-    await _orig_item_take(interaction, user, name, quantity)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎒 Item Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ item take", discord.Color.orange(),
-        By=interaction.user.mention, From=user.mention, Item=f"{quantity}x {name}"))
-item_take._callback = _item_take_logged
-
-_orig_item_buy = item_buy._callback
-async def _item_buy_logged(interaction: discord.Interaction, name: str):
-    # Pre-check: item must exist, role must exist, user must afford it
-    item = await get_item(interaction.guild.id, name)
-    should_log = (
-        item is not None and
-        interaction.guild.get_role(item[3]) is not None and
-        await get_balance(interaction.guild.id, interaction.user.id) >= item[2]
-    )
-    await _orig_item_buy(interaction, name)
-    if should_log:
-        await log_event(interaction.guild.id, "item", _log_embed(
-            "🛒 Item Purchased", discord.Color.blue(),
-            User=interaction.user.mention, Item=name))
-item_buy._callback = _item_buy_logged
-
-_orig_item_use = item_use._callback
-async def _item_use_logged(interaction: discord.Interaction, name: str):
-    # Pre-check every early-return condition inside item_use()
-    item = await get_item(interaction.guild.id, name)
-    if item:
-        _, item_name, _, role_id, _ = item
-        inv    = {n.lower(): q for n, q in await inventory_get(interaction.guild.id, interaction.user.id)}
-        role   = interaction.guild.get_role(role_id)
-        member = interaction.guild.get_member(interaction.user.id)
-        should_log = (
-            inv.get(item_name.lower(), 0) >= 1 and
-            role is not None and
-            member is not None and
-            role not in member.roles
-        )
-    else:
-        should_log = False
-    await _orig_item_use(interaction, name)
-    if should_log:
-        await log_event(interaction.guild.id, "item", _log_embed(
-            "✅ Item Used (Role Claimed)", discord.Color.blue(),
-            User=interaction.user.mention, Item=name))
-item_use._callback = _item_use_logged
-
-_orig_givekey = givekey._callback
-async def _givekey_logged(interaction: discord.Interaction,
-                           user: discord.Member, amount: int = 1):
-    await _orig_givekey(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🔑 VIP Key Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ givekey", discord.Color.orange(),
-        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givekey._callback = _givekey_logged
-
-_orig_takekey = takekey._callback
-async def _takekey_logged(interaction: discord.Interaction,
-                           user: discord.Member, amount: int = 1):
-    await _orig_takekey(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🔑 VIP Key Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ takekey", discord.Color.orange(),
-        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takekey._callback = _takekey_logged
-
-_orig_givegambletoken = givegambletoken._callback
-async def _givegambletoken_logged(interaction: discord.Interaction,
-                                   user: discord.Member, amount: int = 1):
-    await _orig_givegambletoken(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎲 Gamble Token Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ givegambletoken", discord.Color.orange(),
-        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givegambletoken._callback = _givegambletoken_logged
-
-_orig_takegambletoken = takegambletoken._callback
-async def _takegambletoken_logged(interaction: discord.Interaction,
-                                   user: discord.Member, amount: int = 1):
-    await _orig_takegambletoken(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎲 Gamble Token Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ takegambletoken", discord.Color.orange(),
-        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takegambletoken._callback = _takegambletoken_logged
-
-# ── Raffle ────────────────────────────────────────────────────────────────────
-
-_orig_buytickets = buytickets._callback
-async def _buytickets_logged(interaction: discord.Interaction, amount: int):
-    # Pre-check: system on, positive amount, sufficient balance
-    price = amount * RAFFLE_TICKET_PRICE
-    should_log = (
-        amount > 0 and
-        await is_system_enabled(interaction.guild.id, "raffle") and
-        await get_balance(interaction.guild.id, interaction.user.id) >= price
-    )
-    await _orig_buytickets(interaction, amount)
-    if should_log:
-        await log_event(interaction.guild.id, "raffle", _log_embed(
-            "🎟 Tickets Purchased", discord.Color.gold(),
-            User=interaction.user.mention, Tickets=str(amount),
-            Cost=f"{price:,} coins"))
-buytickets._callback = _buytickets_logged
-
-# ── Giveaway ──────────────────────────────────────────────────────────────────
-
-_orig_giveaway_cmd = giveaway._callback
-async def _giveaway_logged(
-    interaction: discord.Interaction,
-    prize: str, seconds: int, winners: int,
-    reward_balance: int = 0, reward_exp: int = 0, reward_tickets: int = 0,
-    reward_gamble_tokens: int = 0, reward_vip_keys: int = 0,
-    reward_role: discord.Role = None, reward_item: str = None,
-    reward_item_qty: int = 1, channel: discord.TextChannel = None,
-    required_role: discord.Role = None, template: str = "gold"
-):
-    await _orig_giveaway_cmd(
-        interaction, prize, seconds, winners, reward_balance, reward_exp,
-        reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role,
-        reward_item, reward_item_qty, channel, required_role, template)
-    if not await is_allowed_to_giveaway(interaction): return
-    ch = channel or interaction.channel
-    embed = _log_embed("🎉 Giveaway Created", discord.Color.gold(),
-        By=interaction.user.mention, Prize=prize,
-        Duration=f"{seconds}s", Winners=str(winners),
-        Channel=ch.mention if ch else "?")
-    await log_event(interaction.guild.id, "giveaway", embed)
-    await log_event(interaction.guild.id, "admin", embed)
-giveaway._callback = _giveaway_logged
-
-# ── Codes ─────────────────────────────────────────────────────────────────────
-
-_orig_createcode = createcode._callback
-async def _createcode_logged(
-    interaction: discord.Interaction, code: str, prize_json: str,
-    uses: int = -1, min_activity_rank: int = 0, min_balance: int = 0,
-    required_role: discord.Role = None
-):
-    await _orig_createcode(interaction, code, prize_json, uses,
-                            min_activity_rank, min_balance, required_role)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "code", _log_embed(
-        "🎫 Code Created", discord.Color.green(),
-        By=interaction.user.mention, Code=code.upper().strip(),
-        Uses="∞" if uses == -1 else str(uses), MinRank=str(min_activity_rank)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ createcode", discord.Color.orange(),
-        By=interaction.user.mention, Code=code.upper().strip(),
-        Uses="∞" if uses == -1 else str(uses)))
-createcode._callback = _createcode_logged
-
-_orig_redeem = redeem._callback
-async def _redeem_logged(interaction: discord.Interaction, code: str):
-    code_upper = code.upper().strip()
-    # Pre-check: code must exist and not yet used by this person
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT uses_left FROM redeem_codes WHERE guild_id=? AND code=?",
-            (interaction.guild.id, code_upper)) as cur:
-            guild_row = await cur.fetchone()
-        async with db.execute(
-            "SELECT uses_left FROM global_redeem_codes WHERE code=?",
-            (code_upper,)) as cur:
-            global_row = await cur.fetchone()
-    # Determine if a successful redemption is possible
-    should_log = False
-    if guild_row and guild_row[0] != 0:
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT 1 FROM code_uses WHERE guild_id=? AND code=? AND user_id=?",
-                (interaction.guild.id, code_upper, interaction.user.id)) as cur:
-                should_log = (await cur.fetchone() is None)
-    elif global_row and global_row[0] != 0:
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT 1 FROM global_code_uses WHERE code=? AND user_id=?",
-                (code_upper, interaction.user.id)) as cur:
-                should_log = (await cur.fetchone() is None)
-    await _orig_redeem(interaction, code)
-    if should_log:
-        await log_event(interaction.guild.id, "code", _log_embed(
-            "🎫 Code Redeemed", discord.Color.green(),
-            User=interaction.user.mention, Code=code_upper))
-redeem._callback = _redeem_logged
-
-# ── Chests / boxes ───────────────────────────────────────────────────────────
-# chest and vipchest: log_event moved inline into the command bodies (Fixes 2 & 3).
-# openbox stays as a patch — amount can't change inside openbox.
-
-_orig_openbox = openbox._callback
-async def _openbox_logged(interaction: discord.Interaction, box: str, amount: int = 1):
-    if amount <= 0:
-        await _orig_openbox(interaction, box, amount); return
-    inv   = await inventory_get(interaction.guild.id, interaction.user.id)
-    owned = {n.lower(): q for n, q in inv}
-    if owned.get(box.lower(), 0) < amount:
-        await _orig_openbox(interaction, box, amount); return
-    await _orig_openbox(interaction, box, amount)
-    await log_event(interaction.guild.id, "box", _log_embed(
-        "🎁 Box Opened", discord.Color.orange(),
-        User=interaction.user.mention, Box=box, Amount=str(amount)))
-openbox._callback = _openbox_logged
-
-# ── Gambling ─────────────────────────────────────────────────────────────────
-# roulette and blackjack: logged inline (Fixes 4 & 5). No patches here.
-
-# ── Trade ─────────────────────────────────────────────────────────────────────
-
-_orig_execute_trade = execute_trade
-async def _execute_trade_logged(session) -> tuple[bool, str]:
-    success, err = await _orig_execute_trade(session)
-    if success:
-        for guild in bot.guilds:
-            if guild.id == session.guild_id:
-                init = guild.get_member(session.initiator_id)
-                tgt  = guild.get_member(session.target_id)
-                io   = session.offers[session.initiator_id]
-                to_  = session.offers[session.target_id]
-                embed = discord.Embed(title="🤝 Trade Executed",
-                                      color=discord.Color.blurple(),
-                                      timestamp=datetime.now(UTC))
-                embed.add_field(name=f"{init.display_name if init else '?'} gave",
-                                value=io.display() if io else "*Nothing*", inline=True)
-                embed.add_field(name=f"{tgt.display_name if tgt else '?'} gave",
-                                value=to_.display() if to_ else "*Nothing*", inline=True)
-                await log_event(guild.id, "trade", embed)
-                break
-    return success, err
-execute_trade = _execute_trade_logged
-
-_orig_end_giveaway = end_giveaway
-async def _end_giveaway_logged(message_id, reroll=False):
-    await _orig_end_giveaway(message_id, reroll)
-    for guild in bot.guilds:
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT channel_id, prize FROM giveaways WHERE message_id=?",
-                (message_id,)) as cur:
-                row = await cur.fetchone()
-        if row:
-            channel_id, prize_raw = row
-            ch = bot.get_channel(channel_id)
-            if ch and ch.guild.id == guild.id:
-                try:
-                    label = json.loads(prize_raw).get("label", prize_raw)
-                except Exception:
-                    label = prize_raw
-                event_title = "🔄 Giveaway Rerolled" if reroll else "🎊 Giveaway Ended"
-                await log_event(guild.id, "giveaway", _log_embed(
-                    event_title, discord.Color.green(),
-                    Prize=label, Channel=ch.mention))
-                break
-end_giveaway = _end_giveaway_logged
-
-# ═══════════════════════════════════════════════════════
-# GLOBAL OWNER COMMANDS  (bot owner only — user 906291437895843901)
-# ═══════════════════════════════════════════════════════
-
-def _owner_only(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == BOT_OWNER_ID
-
-# -- FIX EXP ------------------------------------------------------------------
-
-@bot.tree.command(name="fixexp",
-                  description="[Owner] Fix a user's hidden negative usable EXP balance")
-@app_commands.describe(user="User to inspect and fix")
-async def fixexp(interaction: discord.Interaction, user: discord.Member):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    gid      = interaction.guild.id
-    week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT SUM(amount) FROM exp_history "
-            "WHERE guild_id=? AND user_id=? AND timestamp>=?",
-            (gid, user.id, week_ago)) as cur:
-            row = await cur.fetchone()
-    raw = row[0] or 0
-    if raw >= 0:
-        await interaction.response.send_message(
-            f"✅ {user.mention}'s underlying usable EXP is **{raw:,}** — no fix needed.",
-            ephemeral=True); return
-    # Compensate the negative hole with a bonus entry
-    await add_exp(gid, user.id, -raw, is_bonus=True)
-    await interaction.response.send_message(
-        f"✅ Fixed {user.mention}: underlying balance was **{raw:,}** (shown as 0). "
-        f"Added **{-raw:,}** bonus EXP to bring it to 0.",
-        ephemeral=True)
-
-# ── Global command disable / enable ──────────────────────────────────────────
-
-@bot.tree.command(name="gdisablecmd",
-                  description="[Owner] Globally disable a command in ALL servers")
-@app_commands.describe(command_name="Command to disable globally")
-async def gdisablecmd(interaction: discord.Interaction, command_name: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    if command_name in _UNDISABLEABLE:
-        await interaction.response.send_message(
-            "❌ That command cannot be disabled.", ephemeral=True); return
-    global_disabled_commands.add(command_name)
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO global_disabled_commands VALUES(?)", (command_name,))
-            await db.commit()
-    await interaction.response.send_message(
-        f"🌐🔒 `/{command_name}` disabled in **all** servers.")
-
-@bot.tree.command(name="genablecmd",
-                  description="[Owner] Re-enable a globally disabled command")
-@app_commands.describe(command_name="Command to re-enable globally")
-async def genablecmd(interaction: discord.Interaction, command_name: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    if command_name not in global_disabled_commands:
-        await interaction.response.send_message(
-            f"ℹ️ `/{command_name}` is not globally disabled.", ephemeral=True); return
-    global_disabled_commands.discard(command_name)
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "DELETE FROM global_disabled_commands WHERE command_name=?", (command_name,))
-            await db.commit()
-    await interaction.response.send_message(
-        f"🌐🔓 `/{command_name}` re-enabled in **all** servers.")
-
-# ── Global system disable / enable ───────────────────────────────────────────
-
-@bot.tree.command(name="gdisablesystem",
-                  description="[Owner] Globally disable a system in ALL servers")
-@app_commands.describe(system="System to disable")
-@app_commands.choices(system=_SYSTEM_CHOICES)
-async def gdisablesystem(interaction: discord.Interaction, system: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO global_system_flags VALUES(?,?)", (system, 0))
-            await db.commit()
-    await interaction.response.send_message(
-        f"🌐🔒 **{_SYSTEM_LABELS[system]}** disabled in **all** servers.")
-
-@bot.tree.command(name="genablesystem",
-                  description="[Owner] Re-enable a globally disabled system")
-@app_commands.describe(system="System to re-enable")
-@app_commands.choices(system=_SYSTEM_CHOICES)
-async def genablesystem(interaction: discord.Interaction, system: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO global_system_flags VALUES(?,?)", (system, 1))
-            await db.commit()
-    await interaction.response.send_message(
-        f"🌐✅ **{_SYSTEM_LABELS[system]}** re-enabled in **all** servers.")
-
-# ── Global status ─────────────────────────────────────────────────────────────
-
-@bot.tree.command(name="gstatus",
-                  description="[Owner] Show all globally disabled commands and systems")
-async def gstatus(interaction: discord.Interaction):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT flag_name, enabled FROM global_system_flags") as cur:
-            sys_rows = await cur.fetchall()
-    embed = discord.Embed(title="🌐 Global Overrides", color=discord.Color.dark_red())
-    g_cmds = sorted(global_disabled_commands)
-    embed.add_field(
-        name="🔒 Globally disabled commands",
-        value="\n".join(f"• `/{c}`" for c in g_cmds) if g_cmds else "None",
-        inline=False)
-    sys_lines = []
-    for flag, enabled in sys_rows:
-        label = _SYSTEM_LABELS.get(flag, flag)
-        sys_lines.append(f"{'✅' if enabled else '🔒'} {label}")
-    embed.add_field(
-        name="⚙️ Global system overrides",
-        value="\n".join(sys_lines) if sys_lines else "No overrides set",
-        inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ── Global codes ──────────────────────────────────────────────────────────────
-
-@bot.tree.command(name="gcreate",
-                  description="[Owner] Create a global redeemable code (works in all servers)")
-@app_commands.describe(
-    code="Code name (auto-uppercased)",
-    prize_json='e.g. {"balance":500,"exp":1000,"vip_keys":1}',
-    uses="Max uses total across all servers (-1 = unlimited)",
-    min_level="Minimum Activity Rank required",
-    min_balance="Minimum balance required (per-server balance)"
-)
-async def gcreate(interaction: discord.Interaction, code: str, prize_json: str,
-                  uses: int = -1, min_level: int = 0, min_balance: int = 0):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    code = code.upper().strip()
-    try:
-        prize = json.loads(prize_json)
-    except json.JSONDecodeError:
-        await interaction.response.send_message(
-            '❌ Invalid JSON. Example: `{"balance":500,"exp":1000}`', ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            try:
-                await db.execute(
-                    "INSERT INTO global_redeem_codes(code,prize_json,uses_left,min_level,min_balance) "
-                    "VALUES(?,?,?,?,?)",
-                    (code, json.dumps(prize), uses, min_level, min_balance))
-                await db.commit()
-            except aiosqlite.IntegrityError:
-                await interaction.response.send_message(
-                    f"❌ Global code **{code}** already exists.", ephemeral=True); return
-    parts = []
-    if prize.get("balance",0) > 0:       parts.append(f"💰 {prize['balance']:,}")
-    if prize.get("exp",0) > 0:           parts.append(f"⭐ {prize['exp']:,}")
-    if prize.get("tickets",0) > 0:       parts.append(f"🎟 {prize['tickets']}")
-    if prize.get("gamble_tokens",0) > 0: parts.append(f"🎲 {prize['gamble_tokens']}")
-    if prize.get("vip_keys",0) > 0:      parts.append(f"🔑 {prize['vip_keys']}")
-    if prize.get("item"):                 parts.append(f"🎒 {prize.get('item_qty',1)}x {prize['item']}")
-    uses_str = "∞" if uses == -1 else str(uses)
-    await interaction.response.send_message(
-        f"🌐✅ Global code **{code}** created!\n"
-        f"Prize: {' + '.join(parts) or 'None'} | Uses: {uses_str} | "
-        f"Min rank: {min_level} | Min balance: {min_balance:,}",
-        ephemeral=True)
-
-@bot.tree.command(name="gdelete", description="[Owner] Delete a global code")
-@app_commands.describe(code="Code to delete")
-async def gdelete(interaction: discord.Interaction, code: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    code = code.upper().strip()
-    async with db_lock:
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT code FROM global_redeem_codes WHERE code=?", (code,)) as cur:
-                if not await cur.fetchone():
-                    await interaction.response.send_message(
-                        f"❌ Global code **{code}** not found.", ephemeral=True); return
-            await db.execute("DELETE FROM global_redeem_codes WHERE code=?", (code,))
-            await db.execute("DELETE FROM global_code_uses WHERE code=?", (code,))
-            await db.commit()
-    await interaction.response.send_message(f"🗑 Global code **{code}** deleted.")
-
-@bot.tree.command(name="gcodes", description="[Owner] List all global codes")
-async def gcodes(interaction: discord.Interaction):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT code, prize_json, uses_left, min_level, min_balance "
-            "FROM global_redeem_codes") as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        await interaction.response.send_message("❌ No global codes.", ephemeral=True); return
-    embed = discord.Embed(title="🌐 Global Codes", color=discord.Color.gold())
-    for code, prize_json, uses_left, min_level, min_balance in rows:
-        try: prize = json.loads(prize_json)
-        except: prize = {}
-        parts = []
-        if prize.get("balance",0) > 0:       parts.append(f"💰 {prize['balance']:,}")
-        if prize.get("exp",0) > 0:           parts.append(f"⭐ {prize['exp']:,}")
-        if prize.get("tickets",0) > 0:       parts.append(f"🎟 {prize['tickets']}")
-        if prize.get("gamble_tokens",0) > 0: parts.append(f"🎲 {prize['gamble_tokens']}")
-        if prize.get("vip_keys",0) > 0:      parts.append(f"🔑 {prize['vip_keys']}")
-        if prize.get("item"):                 parts.append(f"🎒 {prize.get('item_qty',1)}x {prize['item']}")
-        async with get_db() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM global_code_uses WHERE code=?", (code,)) as cur:
-                used = (await cur.fetchone())[0]
-        uses_str = "∞" if uses_left == -1 else f"{uses_left - used if uses_left > 0 else uses_left} left"
-        embed.add_field(
-            name=f"🌐 `{code}`",
-            value=f"{' + '.join(parts) or 'No prize'} | Uses: {uses_str} | "
-                  f"Rank ≥ {min_level} | Bal ≥ {min_balance:,}",
-            inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# --- PREFIX ----------------------------------------
-
-@bot.tree.command(name="setprefix", description="[Owner] Set the bot's global command prefix")
-@app_commands.describe(prefix="New prefix (e.g. ! or ? or .)")
-async def setprefix(interaction: discord.Interaction, prefix: str):
-    if not _owner_only(interaction):
-        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
-    global _BOT_PREFIX
-    prefix = prefix.strip()
-    if not prefix or len(prefix) > 5:
-        await interaction.response.send_message("❌ Prefix must be 1–5 characters.", ephemeral=True); return
-    _BOT_PREFIX = prefix
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO bot_config VALUES('prefix',?)", (prefix,))
-            await db.commit()
-    await interaction.response.send_message(f"✅ Prefix set to `{prefix}` — all prefix commands now use `{prefix}<command>`")
-
-# ═══════════════════════════════════════════════════════
-# COUNTING SYSTEM
-# ═══════════════════════════════════════════════════════
-
-_CP_CHOICES = [
-    app_commands.Choice(name="Balance",              value="balance"),
-    app_commands.Choice(name="EXP",                  value="exp"),
-    app_commands.Choice(name="Raffle Tickets",       value="tickets"),
-    app_commands.Choice(name="Gamble Tokens",        value="gamble_tokens"),
-    app_commands.Choice(name="VIP Keys",             value="vip_keys"),
-    app_commands.Choice(name="Item / Box",           value="item"),
-    app_commands.Choice(name="Nothing (filler slot)",value="nothing"),
-    app_commands.Choice(name="Custom label only",    value="custom"),
-]
-
-@bot.tree.command(name="setcountingchannel",
-                  description="Set which channel to watch and where to announce prizes")
-@app_commands.describe(
-    counting_channel="Channel to watch for counts (leave empty = all channels)",
-    announce_channel="Where to post prize wins (leave empty = post in counting channel)"
-)
-@command_enabled()
-async def setcountingchannel(interaction: discord.Interaction,
-                               counting_channel:  discord.TextChannel = None,
-                               announce_channel:  discord.TextChannel = None):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    ch_id  = counting_channel.id  if counting_channel  else 0
-    ann_id = announce_channel.id  if announce_channel  else 0
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "INSERT INTO counting_config(guild_id,enabled,channel_id,announce_channel_id) "
-                "VALUES(?,1,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
-                "channel_id=excluded.channel_id, announce_channel_id=excluded.announce_channel_id",
-                (interaction.guild.id, ch_id, ann_id))
-            await db.commit()
-    parts = []
-    parts.append(f"Counting channel: {counting_channel.mention if counting_channel else '🌐 All channels'}")
-    parts.append(f"Announce channel: {announce_channel.mention if announce_channel else '↩️ Same as counting channel'}")
-    await interaction.response.send_message("✅ " + " | ".join(parts))
-
-
-@bot.tree.command(name="addcountingprize",
-                  description="Add a prize to the counting reward pool")
-@app_commands.describe(
-    prize_type="Type of prize",
-    amount="Amount for balance/EXP/tickets/tokens/keys prizes",
-    item_name="Item or box name (for 'item' type)",
-    label="Display label for 'nothing' or 'custom' type",
-    weight_formula=(
-        "Weight formula — fixed number OR math with {n} = count. "
-        "Examples: 1  |  {n}  |  sqrt({n})  |  max(1,100-{n})"
-    )
-)
-@app_commands.choices(prize_type=_CP_CHOICES)
-@command_enabled()
-async def addcountingprize(interaction: discord.Interaction,
-                            prize_type: str, amount: int = 0,
-                            item_name: str = None, label: str = None,
-                            weight_formula: str = "1"):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-
-    # Validate inputs
-    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
-        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
-    if prize_type == "item" and not item_name:
-        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
-
-    # Test formula
-    test_w = _eval_weight(weight_formula, 100)
-    if test_w <= 0:
-        await interaction.response.send_message(
-            "❌ Formula evaluates to ≤ 0 at n=100. Use a positive expression.",
-            ephemeral=True); return
-
-    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
-    p_amount = amount if prize_type != "item" else (amount or 1)
-
-    async with db_lock:
-        async with get_db() as db:
-            cur = await db.execute(
-                "INSERT INTO counting_prizes(guild_id,prize_type,prize_value,prize_amount,weight_formula) "
-                "VALUES(?,?,?,?,?)",
-                (interaction.guild.id, prize_type, p_value, p_amount, weight_formula))
-            new_id = cur.lastrowid
-            await db.commit()
-
-    prize_str = {
-        "balance":       f"💰 {amount:,} coins",
-        "exp":           f"⭐ {amount:,} EXP",
-        "tickets":       f"🎟 {amount} ticket(s)",
-        "gamble_tokens": f"🎲 {amount} Gamble Token(s)",
-        "vip_keys":      f"🔑 {amount} VIP Key(s)",
-        "item":          f"🎒 {p_amount}x {item_name}",
-        "nothing":       "nothing 😔",
-        "custom":        label or "custom",
-    }.get(prize_type, prize_type)
-
-    await interaction.response.send_message(
-        f"✅ Added counting prize `#{new_id}`: **{prize_str}**\n"
-        f"Weight formula: `{weight_formula}` "
-        f"*(evaluated at n=100: **{test_w:.2f}**)*")
-
-@bot.tree.command(name="addcountingspecial",
-                  description="Add a bonus prize given on top for a specific count number")
-@app_commands.describe(
-    number="The exact count that triggers this bonus",
-    prize_type="Type of prize",
-    amount="Amount for balance/EXP/tickets/tokens/keys",
-    item_name="Item or box name (for item prizes)",
-    label="How it's announced, e.g. '1k EXP milestone bonus'"
-)
-@app_commands.choices(prize_type=_CP_CHOICES)
-@command_enabled()
-async def addcountingspecial(interaction: discord.Interaction,
-                              number: int, prize_type: str,
-                              amount: int = 0, item_name: str = None,
-                              label: str = None):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    if number <= 0:
-        await interaction.response.send_message("❌ Number must be > 0.", ephemeral=True); return
-    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
-        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
-    if prize_type == "item" and not item_name:
-        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
-
-    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
-    p_amount = amount if prize_type != "item" else (amount or 1)
-    p_label  = label or p_value
-
-    async with db_lock:
-        async with get_db() as db:
-            cur = await db.execute(
-                "INSERT INTO counting_special_prizes"
-                "(guild_id,number,prize_type,prize_value,prize_amount,label) "
-                "VALUES(?,?,?,?,?,?)",
-                (interaction.guild.id, number, prize_type, p_value, p_amount, p_label))
-            new_id = cur.lastrowid
-            await db.commit()
-    await interaction.response.send_message(
-        f"✅ Special prize `#{new_id}` added: counting **{number:,}** gives bonus **{p_label}**.")
-
-# ═══════════════════════════════════════════════════════
 # PREFIX COMMANDS  (replaces removed slash commands)
 # ═══════════════════════════════════════════════════════
 
@@ -6264,6 +5404,866 @@ async def cmd_listexpboosts(ctx):
             scope = "🌐 Global"
         embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
     await ctx.send(embed=embed)
+
+# ═══════════════════════════════════════════════════════
+# LOGGING SYSTEM
+# ═══════════════════════════════════════════════════════
+
+_LOG_CHOICES = [
+    app_commands.Choice(name="💰 Balance  — add/remove/gift/wins",        value="balance"),
+    app_commands.Choice(name="⭐ EXP      — add/remove/chest spend",      value="exp"),
+    app_commands.Choice(name="🎒 Items    — buy/use/give/take/keys",      value="item"),
+    app_commands.Choice(name="🎟 Raffle   — ticket purchases, daily draw",value="raffle"),
+    app_commands.Choice(name="🎉 Giveaway — create/end/reroll",           value="giveaway"),
+    app_commands.Choice(name="📦 Chests   — open results",                value="chest"),
+    app_commands.Choice(name="🎁 Boxes    — open results",                value="box"),
+    app_commands.Choice(name="🎲 Gamble   — blackjack/roulette results",  value="gamble"),
+    app_commands.Choice(name="🎫 Codes    — create/redeem",               value="code"),
+    app_commands.Choice(name="🤝 Trades   — executed trades",             value="trade"),
+    app_commands.Choice(name="💬 Commands — every slash command used",    value="command"),
+    app_commands.Choice(name="⚙️ Admin    — all admin-only actions",      value="admin"),
+]
+
+async def log_event(guild_id: int, log_type: str, embed: discord.Embed):
+    """Send embed to the configured log channel, silently no-op if not configured."""
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id FROM log_channels WHERE guild_id=? AND log_type=?",
+                (guild_id, log_type)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return
+        ch = bot.get_channel(row[0])
+        if ch:
+            await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[Log:{log_type}] {e}")
+
+def _log_embed(title: str, color: discord.Color, **fields) -> discord.Embed:
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(UTC))
+    for name, value in fields.items():
+        embed.add_field(name=name, value=str(value), inline=True)
+    return embed
+
+# ── /setlogchannel ────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setlogchannel", description="Set a channel for a specific log type")
+@app_commands.describe(log_type="Which events to send here", channel="Destination channel")
+@app_commands.choices(log_type=_LOG_CHOICES)
+@command_enabled()
+async def setlogchannel(interaction: discord.Interaction,
+                        log_type: str, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO log_channels(guild_id,log_type,channel_id) VALUES(?,?,?)",
+                (interaction.guild.id, log_type, channel.id))
+            await db.commit()
+    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
+    await interaction.response.send_message(f"✅ **{label}** logs → {channel.mention}")
+
+@bot.tree.command(name="removelogchannel", description="Disable logging for a specific type")
+@app_commands.describe(log_type="Which log type to disable")
+@app_commands.choices(log_type=_LOG_CHOICES)
+@command_enabled()
+async def removelogchannel(interaction: discord.Interaction, log_type: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("DELETE FROM log_channels WHERE guild_id=? AND log_type=?",
+                             (interaction.guild.id, log_type))
+            await db.commit()
+    label = next(c.name for c in _LOG_CHOICES if c.value == log_type)
+    await interaction.response.send_message(f"🗑 **{label}** logs disabled.")
+
+# ── Command log via interaction listener ──────────────────────────────────────
+# Uses bot.listen so it doesn't override on_message / on_ready.
+
+@bot.listen("on_interaction")
+async def _log_command_use(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.application_command:
+        return
+    if not interaction.guild:
+        return
+    cmd  = interaction.data.get("name", "?")
+    opts = interaction.data.get("options", [])
+    # Resolve sub-command name if present (type 1 = SUB_COMMAND, type 2 = SUB_COMMAND_GROUP)
+    if opts and opts[0].get("type") in (1, 2):
+        cmd += f" {opts[0]['name']}"
+    embed = discord.Embed(
+        description=f"{interaction.user.mention} used **`/{cmd}`**",
+        color=discord.Color.light_grey(),
+        timestamp=datetime.now(UTC))
+    embed.set_author(name=str(interaction.user),
+                     icon_url=interaction.user.display_avatar.url)
+    embed.set_footer(text=(f"#{interaction.channel.name}" if interaction.channel else "?")
+                     + f" | UID: {interaction.user.id}")
+    await log_event(interaction.guild.id, "command", embed)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING PATCHES
+# Rules:
+#   • Admin-only commands: check is_allowed_to_giveaway BEFORE logging so
+#     denied attempts don't appear as successful actions in the log.
+#   • User commands (buy, use, redeem): pre-check all early-return conditions
+#     before the original call so we know whether it will succeed.
+#   • chest / vipchest / roulette / blackjack: logged inline inside the command
+#     bodies (so the actual amount/outcome is used). No patches for those.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Balance ───────────────────────────────────────────────────────────────────
+
+_orig_addbalance = addbalance._callback
+async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await _orig_addbalance(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "💰 Balance Added", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ addbalance", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+addbalance._callback = _addbalance_logged
+
+_orig_removebalance = removebalance._callback
+async def _removebalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await _orig_removebalance(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "💸 Balance Removed", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ removebalance", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+removebalance._callback = _removebalance_logged
+
+_orig_gift = gift._callback
+async def _gift_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    # Pre-check every condition that causes gift() to return early without acting
+    if (amount <= 0 or
+            user.id == interaction.user.id or
+            await get_balance(interaction.guild.id, interaction.user.id) < amount):
+        await _orig_gift(interaction, user, amount)
+        return
+    await _orig_gift(interaction, user, amount)
+    await log_event(interaction.guild.id, "balance", _log_embed(
+        "🎁 Gift Sent", discord.Color.green(),
+        From=interaction.user.mention, To=user.mention, Amount=f"{amount:,}"))
+gift._callback = _gift_logged
+
+# ── EXP ───────────────────────────────────────────────────────────────────────
+
+_orig_addexp = addexp._callback
+async def _addexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await _orig_addexp(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "⭐ Usable EXP Added", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ addexp (usable)", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
+addexp._callback = _addexp_logged
+
+_orig_removeexp = removeexp._callback
+async def _removeexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
+    await _orig_removeexp(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "exp", _log_embed(
+        "📉 EXP Removed", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ removeexp", discord.Color.orange(),
+        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
+removeexp._callback = _removeexp_logged
+
+# NOTE: addtotalexp and removetotalexp already call log_event inline.
+
+# ── Items / keys / tokens ─────────────────────────────────────────────────────
+
+_orig_item_give = item_give._callback
+async def _item_give_logged(interaction: discord.Interaction,
+                             user: discord.Member, name: str, quantity: int = 1):
+    await _orig_item_give(interaction, user, name, quantity)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎒 Item Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ item give", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Item=f"{quantity}x {name}"))
+item_give._callback = _item_give_logged
+
+_orig_item_take = item_take._callback
+async def _item_take_logged(interaction: discord.Interaction,
+                             user: discord.Member, name: str, quantity: int = 1):
+    await _orig_item_take(interaction, user, name, quantity)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎒 Item Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Item=name, Qty=str(quantity)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ item take", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Item=f"{quantity}x {name}"))
+item_take._callback = _item_take_logged
+
+_orig_item_buy = item_buy._callback
+async def _item_buy_logged(interaction: discord.Interaction, name: str):
+    # Pre-check: item must exist, role must exist, user must afford it
+    item = await get_item(interaction.guild.id, name)
+    should_log = (
+        item is not None and
+        interaction.guild.get_role(item[3]) is not None and
+        await get_balance(interaction.guild.id, interaction.user.id) >= item[2]
+    )
+    await _orig_item_buy(interaction, name)
+    if should_log:
+        await log_event(interaction.guild.id, "item", _log_embed(
+            "🛒 Item Purchased", discord.Color.blue(),
+            User=interaction.user.mention, Item=name))
+item_buy._callback = _item_buy_logged
+
+_orig_item_use = item_use._callback
+async def _item_use_logged(interaction: discord.Interaction, name: str):
+    # Pre-check every early-return condition inside item_use()
+    item = await get_item(interaction.guild.id, name)
+    if item:
+        _, item_name, _, role_id, _ = item
+        inv    = {n.lower(): q for n, q in await inventory_get(interaction.guild.id, interaction.user.id)}
+        role   = interaction.guild.get_role(role_id)
+        member = interaction.guild.get_member(interaction.user.id)
+        should_log = (
+            inv.get(item_name.lower(), 0) >= 1 and
+            role is not None and
+            member is not None and
+            role not in member.roles
+        )
+    else:
+        should_log = False
+    await _orig_item_use(interaction, name)
+    if should_log:
+        await log_event(interaction.guild.id, "item", _log_embed(
+            "✅ Item Used (Role Claimed)", discord.Color.blue(),
+            User=interaction.user.mention, Item=name))
+item_use._callback = _item_use_logged
+
+_orig_givekey = givekey._callback
+async def _givekey_logged(interaction: discord.Interaction,
+                           user: discord.Member, amount: int = 1):
+    await _orig_givekey(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Key Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ givekey", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
+givekey._callback = _givekey_logged
+
+_orig_takekey = takekey._callback
+async def _takekey_logged(interaction: discord.Interaction,
+                           user: discord.Member, amount: int = 1):
+    await _orig_takekey(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🔑 VIP Key Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ takekey", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
+takekey._callback = _takekey_logged
+
+_orig_givegambletoken = givegambletoken._callback
+async def _givegambletoken_logged(interaction: discord.Interaction,
+                                   user: discord.Member, amount: int = 1):
+    await _orig_givegambletoken(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎲 Gamble Token Given", discord.Color.green(),
+        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ givegambletoken", discord.Color.orange(),
+        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
+givegambletoken._callback = _givegambletoken_logged
+
+_orig_takegambletoken = takegambletoken._callback
+async def _takegambletoken_logged(interaction: discord.Interaction,
+                                   user: discord.Member, amount: int = 1):
+    await _orig_takegambletoken(interaction, user, amount)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "item", _log_embed(
+        "🎲 Gamble Token Taken", discord.Color.red(),
+        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ takegambletoken", discord.Color.orange(),
+        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
+takegambletoken._callback = _takegambletoken_logged
+
+# ── Raffle ────────────────────────────────────────────────────────────────────
+
+_orig_buytickets = buytickets._callback
+async def _buytickets_logged(interaction: discord.Interaction, amount: int):
+    # Pre-check: system on, positive amount, sufficient balance
+    price = amount * RAFFLE_TICKET_PRICE
+    should_log = (
+        amount > 0 and
+        await is_system_enabled(interaction.guild.id, "raffle") and
+        await get_balance(interaction.guild.id, interaction.user.id) >= price
+    )
+    await _orig_buytickets(interaction, amount)
+    if should_log:
+        await log_event(interaction.guild.id, "raffle", _log_embed(
+            "🎟 Tickets Purchased", discord.Color.gold(),
+            User=interaction.user.mention, Tickets=str(amount),
+            Cost=f"{price:,} coins"))
+buytickets._callback = _buytickets_logged
+
+# ── Giveaway ──────────────────────────────────────────────────────────────────
+
+_orig_giveaway_cmd = giveaway._callback
+async def _giveaway_logged(
+    interaction: discord.Interaction,
+    prize: str, seconds: int, winners: int,
+    reward_balance: int = 0, reward_exp: int = 0, reward_tickets: int = 0,
+    reward_gamble_tokens: int = 0, reward_vip_keys: int = 0,
+    reward_role: discord.Role = None, reward_item: str = None,
+    reward_item_qty: int = 1, channel: discord.TextChannel = None,
+    required_role: discord.Role = None, template: str = "gold"
+):
+    await _orig_giveaway_cmd(
+        interaction, prize, seconds, winners, reward_balance, reward_exp,
+        reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role,
+        reward_item, reward_item_qty, channel, required_role, template)
+    if not await is_allowed_to_giveaway(interaction): return
+    ch = channel or interaction.channel
+    embed = _log_embed("🎉 Giveaway Created", discord.Color.gold(),
+        By=interaction.user.mention, Prize=prize,
+        Duration=f"{seconds}s", Winners=str(winners),
+        Channel=ch.mention if ch else "?")
+    await log_event(interaction.guild.id, "giveaway", embed)
+    await log_event(interaction.guild.id, "admin", embed)
+giveaway._callback = _giveaway_logged
+
+# ── Codes ─────────────────────────────────────────────────────────────────────
+
+_orig_createcode = createcode._callback
+async def _createcode_logged(
+    interaction: discord.Interaction, code: str, prize_json: str,
+    uses: int = -1, min_activity_rank: int = 0, min_balance: int = 0,
+    required_role: discord.Role = None
+):
+    await _orig_createcode(interaction, code, prize_json, uses,
+                            min_activity_rank, min_balance, required_role)
+    if not await is_allowed_to_giveaway(interaction): return
+    await log_event(interaction.guild.id, "code", _log_embed(
+        "🎫 Code Created", discord.Color.green(),
+        By=interaction.user.mention, Code=code.upper().strip(),
+        Uses="∞" if uses == -1 else str(uses), MinRank=str(min_activity_rank)))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ createcode", discord.Color.orange(),
+        By=interaction.user.mention, Code=code.upper().strip(),
+        Uses="∞" if uses == -1 else str(uses)))
+createcode._callback = _createcode_logged
+
+_orig_redeem = redeem._callback
+async def _redeem_logged(interaction: discord.Interaction, code: str):
+    code_upper = code.upper().strip()
+    # Pre-check: code must exist and not yet used by this person
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT uses_left FROM redeem_codes WHERE guild_id=? AND code=?",
+            (interaction.guild.id, code_upper)) as cur:
+            guild_row = await cur.fetchone()
+        async with db.execute(
+            "SELECT uses_left FROM global_redeem_codes WHERE code=?",
+            (code_upper,)) as cur:
+            global_row = await cur.fetchone()
+    # Determine if a successful redemption is possible
+    should_log = False
+    if guild_row and guild_row[0] != 0:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT 1 FROM code_uses WHERE guild_id=? AND code=? AND user_id=?",
+                (interaction.guild.id, code_upper, interaction.user.id)) as cur:
+                should_log = (await cur.fetchone() is None)
+    elif global_row and global_row[0] != 0:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT 1 FROM global_code_uses WHERE code=? AND user_id=?",
+                (code_upper, interaction.user.id)) as cur:
+                should_log = (await cur.fetchone() is None)
+    await _orig_redeem(interaction, code)
+    if should_log:
+        await log_event(interaction.guild.id, "code", _log_embed(
+            "🎫 Code Redeemed", discord.Color.green(),
+            User=interaction.user.mention, Code=code_upper))
+redeem._callback = _redeem_logged
+
+# ── Chests / boxes ───────────────────────────────────────────────────────────
+# chest and vipchest: log_event moved inline into the command bodies (Fixes 2 & 3).
+# openbox stays as a patch — amount can't change inside openbox.
+
+_orig_openbox = openbox._callback
+async def _openbox_logged(interaction: discord.Interaction, box: str, amount: int = 1):
+    if amount <= 0:
+        await _orig_openbox(interaction, box, amount); return
+    inv   = await inventory_get(interaction.guild.id, interaction.user.id)
+    owned = {n.lower(): q for n, q in inv}
+    if owned.get(box.lower(), 0) < amount:
+        await _orig_openbox(interaction, box, amount); return
+    await _orig_openbox(interaction, box, amount)
+    await log_event(interaction.guild.id, "box", _log_embed(
+        "🎁 Box Opened", discord.Color.orange(),
+        User=interaction.user.mention, Box=box, Amount=str(amount)))
+openbox._callback = _openbox_logged
+
+# ── Gambling ─────────────────────────────────────────────────────────────────
+# roulette and blackjack: logged inline (Fixes 4 & 5). No patches here.
+
+# ── Trade ─────────────────────────────────────────────────────────────────────
+
+_orig_execute_trade = execute_trade
+async def _execute_trade_logged(session) -> tuple[bool, str]:
+    success, err = await _orig_execute_trade(session)
+    if success:
+        for guild in bot.guilds:
+            if guild.id == session.guild_id:
+                init = guild.get_member(session.initiator_id)
+                tgt  = guild.get_member(session.target_id)
+                io   = session.offers[session.initiator_id]
+                to_  = session.offers[session.target_id]
+                embed = discord.Embed(title="🤝 Trade Executed",
+                                      color=discord.Color.blurple(),
+                                      timestamp=datetime.now(UTC))
+                embed.add_field(name=f"{init.display_name if init else '?'} gave",
+                                value=io.display() if io else "*Nothing*", inline=True)
+                embed.add_field(name=f"{tgt.display_name if tgt else '?'} gave",
+                                value=to_.display() if to_ else "*Nothing*", inline=True)
+                await log_event(guild.id, "trade", embed)
+                break
+    return success, err
+execute_trade = _execute_trade_logged
+
+_orig_end_giveaway = end_giveaway
+async def _end_giveaway_logged(message_id, reroll=False):
+    await _orig_end_giveaway(message_id, reroll)
+    for guild in bot.guilds:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id, prize FROM giveaways WHERE message_id=?",
+                (message_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            channel_id, prize_raw = row
+            ch = bot.get_channel(channel_id)
+            if ch and ch.guild.id == guild.id:
+                try:
+                    label = json.loads(prize_raw).get("label", prize_raw)
+                except Exception:
+                    label = prize_raw
+                event_title = "🔄 Giveaway Rerolled" if reroll else "🎊 Giveaway Ended"
+                await log_event(guild.id, "giveaway", _log_embed(
+                    event_title, discord.Color.green(),
+                    Prize=label, Channel=ch.mention))
+                break
+end_giveaway = _end_giveaway_logged
+
+# ═══════════════════════════════════════════════════════
+# GLOBAL OWNER COMMANDS  (bot owner only — user 906291437895843901)
+# ═══════════════════════════════════════════════════════
+
+def _owner_only(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == BOT_OWNER_ID
+
+# -- FIX EXP ------------------------------------------------------------------
+
+@bot.tree.command(name="fixexp",
+                  description="[Owner] Fix a user's hidden negative usable EXP balance")
+@app_commands.describe(user="User to inspect and fix")
+async def fixexp(interaction: discord.Interaction, user: discord.Member):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    gid      = interaction.guild.id
+    week_ago = int((datetime.now(UTC) - timedelta(days=7)).timestamp())
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT SUM(amount) FROM exp_history "
+            "WHERE guild_id=? AND user_id=? AND timestamp>=?",
+            (gid, user.id, week_ago)) as cur:
+            row = await cur.fetchone()
+    raw = row[0] or 0
+    if raw >= 0:
+        await interaction.response.send_message(
+            f"✅ {user.mention}'s underlying usable EXP is **{raw:,}** — no fix needed.",
+            ephemeral=True); return
+    # Compensate the negative hole with a bonus entry
+    await add_exp(gid, user.id, -raw, is_bonus=True)
+    await interaction.response.send_message(
+        f"✅ Fixed {user.mention}: underlying balance was **{raw:,}** (shown as 0). "
+        f"Added **{-raw:,}** bonus EXP to bring it to 0.",
+        ephemeral=True)
+
+# ── Global command disable / enable ──────────────────────────────────────────
+
+@bot.tree.command(name="gdisablecmd",
+                  description="[Owner] Globally disable a command in ALL servers")
+@app_commands.describe(command_name="Command to disable globally")
+async def gdisablecmd(interaction: discord.Interaction, command_name: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    if command_name in _UNDISABLEABLE:
+        await interaction.response.send_message(
+            "❌ That command cannot be disabled.", ephemeral=True); return
+    global_disabled_commands.add(command_name)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO global_disabled_commands VALUES(?)", (command_name,))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🌐🔒 `/{command_name}` disabled in **all** servers.")
+
+@bot.tree.command(name="genablecmd",
+                  description="[Owner] Re-enable a globally disabled command")
+@app_commands.describe(command_name="Command to re-enable globally")
+async def genablecmd(interaction: discord.Interaction, command_name: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    if command_name not in global_disabled_commands:
+        await interaction.response.send_message(
+            f"ℹ️ `/{command_name}` is not globally disabled.", ephemeral=True); return
+    global_disabled_commands.discard(command_name)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM global_disabled_commands WHERE command_name=?", (command_name,))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🌐🔓 `/{command_name}` re-enabled in **all** servers.")
+
+# ── Global system disable / enable ───────────────────────────────────────────
+
+@bot.tree.command(name="gdisablesystem",
+                  description="[Owner] Globally disable a system in ALL servers")
+@app_commands.describe(system="System to disable")
+@app_commands.choices(system=_SYSTEM_CHOICES)
+async def gdisablesystem(interaction: discord.Interaction, system: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO global_system_flags VALUES(?,?)", (system, 0))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🌐🔒 **{_SYSTEM_LABELS[system]}** disabled in **all** servers.")
+
+@bot.tree.command(name="genablesystem",
+                  description="[Owner] Re-enable a globally disabled system")
+@app_commands.describe(system="System to re-enable")
+@app_commands.choices(system=_SYSTEM_CHOICES)
+async def genablesystem(interaction: discord.Interaction, system: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO global_system_flags VALUES(?,?)", (system, 1))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🌐✅ **{_SYSTEM_LABELS[system]}** re-enabled in **all** servers.")
+
+# ── Global status ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="gstatus",
+                  description="[Owner] Show all globally disabled commands and systems")
+async def gstatus(interaction: discord.Interaction):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT flag_name, enabled FROM global_system_flags") as cur:
+            sys_rows = await cur.fetchall()
+    embed = discord.Embed(title="🌐 Global Overrides", color=discord.Color.dark_red())
+    g_cmds = sorted(global_disabled_commands)
+    embed.add_field(
+        name="🔒 Globally disabled commands",
+        value="\n".join(f"• `/{c}`" for c in g_cmds) if g_cmds else "None",
+        inline=False)
+    sys_lines = []
+    for flag, enabled in sys_rows:
+        label = _SYSTEM_LABELS.get(flag, flag)
+        sys_lines.append(f"{'✅' if enabled else '🔒'} {label}")
+    embed.add_field(
+        name="⚙️ Global system overrides",
+        value="\n".join(sys_lines) if sys_lines else "No overrides set",
+        inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ── Global codes ──────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="gcreate",
+                  description="[Owner] Create a global redeemable code (works in all servers)")
+@app_commands.describe(
+    code="Code name (auto-uppercased)",
+    prize_json='e.g. {"balance":500,"exp":1000,"vip_keys":1}',
+    uses="Max uses total across all servers (-1 = unlimited)",
+    min_level="Minimum Activity Rank required",
+    min_balance="Minimum balance required (per-server balance)"
+)
+async def gcreate(interaction: discord.Interaction, code: str, prize_json: str,
+                  uses: int = -1, min_level: int = 0, min_balance: int = 0):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    code = code.upper().strip()
+    try:
+        prize = json.loads(prize_json)
+    except json.JSONDecodeError:
+        await interaction.response.send_message(
+            '❌ Invalid JSON. Example: `{"balance":500,"exp":1000}`', ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO global_redeem_codes(code,prize_json,uses_left,min_level,min_balance) "
+                    "VALUES(?,?,?,?,?)",
+                    (code, json.dumps(prize), uses, min_level, min_balance))
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    f"❌ Global code **{code}** already exists.", ephemeral=True); return
+    parts = []
+    if prize.get("balance",0) > 0:       parts.append(f"💰 {prize['balance']:,}")
+    if prize.get("exp",0) > 0:           parts.append(f"⭐ {prize['exp']:,}")
+    if prize.get("tickets",0) > 0:       parts.append(f"🎟 {prize['tickets']}")
+    if prize.get("gamble_tokens",0) > 0: parts.append(f"🎲 {prize['gamble_tokens']}")
+    if prize.get("vip_keys",0) > 0:      parts.append(f"🔑 {prize['vip_keys']}")
+    if prize.get("item"):                 parts.append(f"🎒 {prize.get('item_qty',1)}x {prize['item']}")
+    uses_str = "∞" if uses == -1 else str(uses)
+    await interaction.response.send_message(
+        f"🌐✅ Global code **{code}** created!\n"
+        f"Prize: {' + '.join(parts) or 'None'} | Uses: {uses_str} | "
+        f"Min rank: {min_level} | Min balance: {min_balance:,}",
+        ephemeral=True)
+
+@bot.tree.command(name="gdelete", description="[Owner] Delete a global code")
+@app_commands.describe(code="Code to delete")
+async def gdelete(interaction: discord.Interaction, code: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    code = code.upper().strip()
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT code FROM global_redeem_codes WHERE code=?", (code,)) as cur:
+                if not await cur.fetchone():
+                    await interaction.response.send_message(
+                        f"❌ Global code **{code}** not found.", ephemeral=True); return
+            await db.execute("DELETE FROM global_redeem_codes WHERE code=?", (code,))
+            await db.execute("DELETE FROM global_code_uses WHERE code=?", (code,))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 Global code **{code}** deleted.")
+
+@bot.tree.command(name="gcodes", description="[Owner] List all global codes")
+async def gcodes(interaction: discord.Interaction):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT code, prize_json, uses_left, min_level, min_balance "
+            "FROM global_redeem_codes") as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("❌ No global codes.", ephemeral=True); return
+    embed = discord.Embed(title="🌐 Global Codes", color=discord.Color.gold())
+    for code, prize_json, uses_left, min_level, min_balance in rows:
+        try: prize = json.loads(prize_json)
+        except: prize = {}
+        parts = []
+        if prize.get("balance",0) > 0:       parts.append(f"💰 {prize['balance']:,}")
+        if prize.get("exp",0) > 0:           parts.append(f"⭐ {prize['exp']:,}")
+        if prize.get("tickets",0) > 0:       parts.append(f"🎟 {prize['tickets']}")
+        if prize.get("gamble_tokens",0) > 0: parts.append(f"🎲 {prize['gamble_tokens']}")
+        if prize.get("vip_keys",0) > 0:      parts.append(f"🔑 {prize['vip_keys']}")
+        if prize.get("item"):                 parts.append(f"🎒 {prize.get('item_qty',1)}x {prize['item']}")
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM global_code_uses WHERE code=?", (code,)) as cur:
+                used = (await cur.fetchone())[0]
+        uses_str = "∞" if uses_left == -1 else f"{uses_left - used if uses_left > 0 else uses_left} left"
+        embed.add_field(
+            name=f"🌐 `{code}`",
+            value=f"{' + '.join(parts) or 'No prize'} | Uses: {uses_str} | "
+                  f"Rank ≥ {min_level} | Bal ≥ {min_balance:,}",
+            inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- PREFIX ----------------------------------------
+
+@bot.tree.command(name="setprefix", description="[Owner] Set the bot's global command prefix")
+@app_commands.describe(prefix="New prefix (e.g. ! or ? or .)")
+async def setprefix(interaction: discord.Interaction, prefix: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    global _BOT_PREFIX
+    prefix = prefix.strip()
+    if not prefix or len(prefix) > 5:
+        await interaction.response.send_message("❌ Prefix must be 1–5 characters.", ephemeral=True); return
+    _BOT_PREFIX = prefix
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO bot_config VALUES('prefix',?)", (prefix,))
+            await db.commit()
+    await interaction.response.send_message(f"✅ Prefix set to `{prefix}` — all prefix commands now use `{prefix}<command>`")
+
+# ═══════════════════════════════════════════════════════
+# COUNTING SYSTEM
+# ═══════════════════════════════════════════════════════
+
+_CP_CHOICES = [
+    app_commands.Choice(name="Balance",              value="balance"),
+    app_commands.Choice(name="EXP",                  value="exp"),
+    app_commands.Choice(name="Raffle Tickets",       value="tickets"),
+    app_commands.Choice(name="Gamble Tokens",        value="gamble_tokens"),
+    app_commands.Choice(name="VIP Keys",             value="vip_keys"),
+    app_commands.Choice(name="Item / Box",           value="item"),
+    app_commands.Choice(name="Nothing (filler slot)",value="nothing"),
+    app_commands.Choice(name="Custom label only",    value="custom"),
+]
+
+@bot.tree.command(name="setcountingchannel",
+                  description="Set which channel to watch and where to announce prizes")
+@app_commands.describe(
+    counting_channel="Channel to watch for counts (leave empty = all channels)",
+    announce_channel="Where to post prize wins (leave empty = post in counting channel)"
+)
+@command_enabled()
+async def setcountingchannel(interaction: discord.Interaction,
+                               counting_channel:  discord.TextChannel = None,
+                               announce_channel:  discord.TextChannel = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    ch_id  = counting_channel.id  if counting_channel  else 0
+    ann_id = announce_channel.id  if announce_channel  else 0
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO counting_config(guild_id,enabled,channel_id,announce_channel_id) "
+                "VALUES(?,1,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+                "channel_id=excluded.channel_id, announce_channel_id=excluded.announce_channel_id",
+                (interaction.guild.id, ch_id, ann_id))
+            await db.commit()
+    parts = []
+    parts.append(f"Counting channel: {counting_channel.mention if counting_channel else '🌐 All channels'}")
+    parts.append(f"Announce channel: {announce_channel.mention if announce_channel else '↩️ Same as counting channel'}")
+    await interaction.response.send_message("✅ " + " | ".join(parts))
+
+
+@bot.tree.command(name="addcountingprize",
+                  description="Add a prize to the counting reward pool")
+@app_commands.describe(
+    prize_type="Type of prize",
+    amount="Amount for balance/EXP/tickets/tokens/keys prizes",
+    item_name="Item or box name (for 'item' type)",
+    label="Display label for 'nothing' or 'custom' type",
+    weight_formula=(
+        "Weight formula — fixed number OR math with {n} = count. "
+        "Examples: 1  |  {n}  |  sqrt({n})  |  max(1,100-{n})"
+    )
+)
+@app_commands.choices(prize_type=_CP_CHOICES)
+@command_enabled()
+async def addcountingprize(interaction: discord.Interaction,
+                            prize_type: str, amount: int = 0,
+                            item_name: str = None, label: str = None,
+                            weight_formula: str = "1"):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+
+    # Validate inputs
+    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    if prize_type == "item" and not item_name:
+        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
+
+    # Test formula
+    test_w = _eval_weight(weight_formula, 100)
+    if test_w <= 0:
+        await interaction.response.send_message(
+            "❌ Formula evaluates to ≤ 0 at n=100. Use a positive expression.",
+            ephemeral=True); return
+
+    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
+    p_amount = amount if prize_type != "item" else (amount or 1)
+
+    async with db_lock:
+        async with get_db() as db:
+            cur = await db.execute(
+                "INSERT INTO counting_prizes(guild_id,prize_type,prize_value,prize_amount,weight_formula) "
+                "VALUES(?,?,?,?,?)",
+                (interaction.guild.id, prize_type, p_value, p_amount, weight_formula))
+            new_id = cur.lastrowid
+            await db.commit()
+
+    prize_str = {
+        "balance":       f"💰 {amount:,} coins",
+        "exp":           f"⭐ {amount:,} EXP",
+        "tickets":       f"🎟 {amount} ticket(s)",
+        "gamble_tokens": f"🎲 {amount} Gamble Token(s)",
+        "vip_keys":      f"🔑 {amount} VIP Key(s)",
+        "item":          f"🎒 {p_amount}x {item_name}",
+        "nothing":       "nothing 😔",
+        "custom":        label or "custom",
+    }.get(prize_type, prize_type)
+
+    await interaction.response.send_message(
+        f"✅ Added counting prize `#{new_id}`: **{prize_str}**\n"
+        f"Weight formula: `{weight_formula}` "
+        f"*(evaluated at n=100: **{test_w:.2f}**)*")
+
+@bot.tree.command(name="addcountingspecial",
+                  description="Add a bonus prize given on top for a specific count number")
+@app_commands.describe(
+    number="The exact count that triggers this bonus",
+    prize_type="Type of prize",
+    amount="Amount for balance/EXP/tickets/tokens/keys",
+    item_name="Item or box name (for item prizes)",
+    label="How it's announced, e.g. '1k EXP milestone bonus'"
+)
+@app_commands.choices(prize_type=_CP_CHOICES)
+@command_enabled()
+async def addcountingspecial(interaction: discord.Interaction,
+                              number: int, prize_type: str,
+                              amount: int = 0, item_name: str = None,
+                              label: str = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if number <= 0:
+        await interaction.response.send_message("❌ Number must be > 0.", ephemeral=True); return
+    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    if prize_type == "item" and not item_name:
+        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
+
+    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
+    p_amount = amount if prize_type != "item" else (amount or 1)
+    p_label  = label or p_value
+
+    async with db_lock:
+        async with get_db() as db:
+            cur = await db.execute(
+                "INSERT INTO counting_special_prizes"
+                "(guild_id,number,prize_type,prize_value,prize_amount,label) "
+                "VALUES(?,?,?,?,?,?)",
+                (interaction.guild.id, number, prize_type, p_value, p_amount, p_label))
+            new_id = cur.lastrowid
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Special prize `#{new_id}` added: counting **{number:,}** gives bonus **{p_label}**.")
 
 # ═══════════════════════════════════════════════════════
 # RUN BOT
