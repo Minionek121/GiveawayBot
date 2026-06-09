@@ -5517,7 +5517,7 @@ async def _log_command_use(interaction: discord.Interaction):
 
 # ── Balance ───────────────────────────────────────────────────────────────────
 
-_orig_addbalance = addbalance._callback
+_orig_addbalance = add_balance._callback
 async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
     await _orig_addbalance(interaction, user, amount)
     if not await is_allowed_to_giveaway(interaction): return
