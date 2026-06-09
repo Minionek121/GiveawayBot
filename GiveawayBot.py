@@ -1189,7 +1189,7 @@ async def end_giveaway(message_id, reroll=False):
     weighted = []
     for user in users:
         lvl = await get_level(channel.guild.id, user.id)
-        weighted.extend([user] * random.randint(1, max(1, lvl // 10))))
+        weighted.extend([user] * random.randint(1, max(1, lvl // 10)))
 
     winners = []
     while len(winners) < min(winner_count, len(users)) and weighted:
