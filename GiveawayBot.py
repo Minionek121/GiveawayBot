@@ -5515,74 +5515,6 @@ async def _log_command_use(interaction: discord.Interaction):
 #     bodies (so the actual amount/outcome is used). No patches for those.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Balance ───────────────────────────────────────────────────────────────────
-
-_orig_addbalance = add_balance._callback
-async def _addbalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_addbalance(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "💰 Balance Added", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ addbalance", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addbalance._callback = _addbalance_logged
-
-_orig_removebalance = removebalance._callback
-async def _removebalance_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_removebalance(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "💸 Balance Removed", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ removebalance", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removebalance._callback = _removebalance_logged
-
-_orig_gift = gift._callback
-async def _gift_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    # Pre-check every condition that causes gift() to return early without acting
-    if (amount <= 0 or
-            user.id == interaction.user.id or
-            await get_balance(interaction.guild.id, interaction.user.id) < amount):
-        await _orig_gift(interaction, user, amount)
-        return
-    await _orig_gift(interaction, user, amount)
-    await log_event(interaction.guild.id, "balance", _log_embed(
-        "🎁 Gift Sent", discord.Color.green(),
-        From=interaction.user.mention, To=user.mention, Amount=f"{amount:,}"))
-gift._callback = _gift_logged
-
-# ── EXP ───────────────────────────────────────────────────────────────────────
-
-_orig_addexp = addexp._callback
-async def _addexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_addexp(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "exp", _log_embed(
-        "⭐ Usable EXP Added", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ addexp (usable)", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"+{amount:,}"))
-addexp._callback = _addexp_logged
-
-_orig_removeexp = removeexp._callback
-async def _removeexp_logged(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await _orig_removeexp(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "exp", _log_embed(
-        "📉 EXP Removed", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ removeexp", discord.Color.orange(),
-        By=interaction.user.mention, User=user.mention, Amount=f"-{amount:,}"))
-removeexp._callback = _removeexp_logged
-
-# NOTE: addtotalexp and removetotalexp already call log_event inline.
-
 # ── Items / keys / tokens ─────────────────────────────────────────────────────
 
 _orig_item_give = item_give._callback
@@ -5650,58 +5582,6 @@ async def _item_use_logged(interaction: discord.Interaction, name: str):
             "✅ Item Used (Role Claimed)", discord.Color.blue(),
             User=interaction.user.mention, Item=name))
 item_use._callback = _item_use_logged
-
-_orig_givekey = givekey._callback
-async def _givekey_logged(interaction: discord.Interaction,
-                           user: discord.Member, amount: int = 1):
-    await _orig_givekey(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🔑 VIP Key Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ givekey", discord.Color.orange(),
-        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givekey._callback = _givekey_logged
-
-_orig_takekey = takekey._callback
-async def _takekey_logged(interaction: discord.Interaction,
-                           user: discord.Member, amount: int = 1):
-    await _orig_takekey(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🔑 VIP Key Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Keys=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ takekey", discord.Color.orange(),
-        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takekey._callback = _takekey_logged
-
-_orig_givegambletoken = givegambletoken._callback
-async def _givegambletoken_logged(interaction: discord.Interaction,
-                                   user: discord.Member, amount: int = 1):
-    await _orig_givegambletoken(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎲 Gamble Token Given", discord.Color.green(),
-        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ givegambletoken", discord.Color.orange(),
-        By=interaction.user.mention, To=user.mention, Amount=str(amount)))
-givegambletoken._callback = _givegambletoken_logged
-
-_orig_takegambletoken = takegambletoken._callback
-async def _takegambletoken_logged(interaction: discord.Interaction,
-                                   user: discord.Member, amount: int = 1):
-    await _orig_takegambletoken(interaction, user, amount)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "item", _log_embed(
-        "🎲 Gamble Token Taken", discord.Color.red(),
-        Admin=interaction.user.mention, User=user.mention, Tokens=str(amount)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ takegambletoken", discord.Color.orange(),
-        By=interaction.user.mention, From=user.mention, Amount=str(amount)))
-takegambletoken._callback = _takegambletoken_logged
 
 # ── Raffle ────────────────────────────────────────────────────────────────────
 
