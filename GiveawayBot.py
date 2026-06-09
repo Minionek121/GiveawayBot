@@ -36,6 +36,8 @@ RAFFLE_PRIZE        = 0
 CHEST_COST          = 1000
 LEVEL_DIVISOR       = 700
 BOT_OWNER_ID = 906291437895843901
+COUNTING_BOT_ID      = 510016054391734273
+_COUNTING_FAIL_EMOJI = frozenset({'❌', '⚠️', '⚠'})
 
 def is_owner(uid: int) -> bool:
     return uid == BOT_OWNER_ID
@@ -243,6 +245,36 @@ async def setup_database():
                 interval_seconds INTEGER NOT NULL,
                 duration_seconds INTEGER NOT NULL,
                 running INTEGER DEFAULT 0)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS raffle_history(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                draw_timestamp INTEGER,
+                winner_id INTEGER,
+                winner_tickets INTEGER,
+                total_tickets INTEGER,
+                top_json TEXT)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS counting_config(
+                guild_id INTEGER PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                channel_id INTEGER DEFAULT 0,
+                announce_channel_id INTEGER DEFAULT 0)""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS counting_prizes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                prize_type TEXT,
+                prize_value TEXT,
+                prize_amount INTEGER DEFAULT 0,
+                weight_formula TEXT DEFAULT '1')""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS counting_special_prizes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER,
+                number INTEGER,
+                prize_type TEXT,
+                prize_value TEXT,
+                prize_amount INTEGER DEFAULT 0,
+                label TEXT)""")
             # ── Per-guild schemas (migration: drop & recreate if guild_id column is missing) ──
 
             for table, new_sql in [
@@ -410,6 +442,60 @@ async def add_stat(guild_id: int, user_id: int, column: str, amount: int):
                 f"UPDATE user_stats SET {column}={column}+? WHERE guild_id=? AND user_id=?",
                 (amount, guild_id, user_id))
             await db.commit()
+
+# --- COUNTING STUFF -----------------------------
+
+import math as _math
+
+def _eval_weight(formula: str, n: int) -> float:
+    """Evaluate a weight formula where {n} is the count number. Returns ≥ 0."""
+    n = max(1, n)
+    try:
+        ns = {
+            '__builtins__': {}, 'n': float(n),
+            'sqrt': _math.sqrt, 'log': _math.log, 'log2': _math.log2,
+            'log10': _math.log10, 'pow': _math.pow,
+            'abs': abs, 'min': min, 'max': max,
+            'floor': _math.floor, 'ceil': _math.ceil, 'pi': _math.pi,
+        }
+        result = eval(formula.replace('{n}', 'n'), ns)
+        return max(0.0, float(result))
+    except Exception:
+        return 1.0
+
+def _extract_count(text: str) -> int | None:
+    """Pull the leading integer from a counting message, or None."""
+    import re
+    m = re.match(r'^\s*([0-9]+)', text.strip())
+    return int(m.group(1)) if m else None
+
+async def _give_counting_prize(guild_id: int, user_id: int,
+                                prize_type: str, prize_value: str,
+                                prize_amount: int) -> str:
+    """Distribute one counting prize. Returns a human-readable description."""
+    if prize_type == "balance":
+        await add_balance(guild_id, user_id, prize_amount)
+        return f"💰 {prize_amount:,} coins"
+    elif prize_type == "exp":
+        await add_exp(guild_id, user_id, prize_amount, is_bonus=True)
+        return f"⭐ {prize_amount:,} EXP"
+    elif prize_type == "tickets":
+        await add_tickets(guild_id, user_id, prize_amount)
+        return f"🎟 {prize_amount} ticket(s)"
+    elif prize_type == "gamble_tokens":
+        await inventory_add(guild_id, user_id, GAMBLE_TOKEN, prize_amount)
+        return f"🎲 {prize_amount} Gamble Token(s)"
+    elif prize_type == "vip_keys":
+        await inventory_add(guild_id, user_id, VIP_CHEST_KEY, prize_amount)
+        return f"🔑 {prize_amount} VIP Key(s)"
+    elif prize_type == "item":
+        qty = prize_amount or 1
+        await inventory_add(guild_id, user_id, prize_value, qty)
+        return f"🎒 {qty}x {prize_value}"
+    elif prize_type == "nothing":
+        return ""   # caller checks for empty string to stay silent
+    else:           # custom
+        return prize_value or "a special prize"
 
 # ═══════════════════════════════════════════════════════
 # EXP  (now guild-scoped)
@@ -686,6 +772,97 @@ async def on_member_join(member: discord.Member):
         pass  # user has DMs closed — silently skip
     except Exception as e:
         print(f"[Welcome] {member} / {member.guild.name}: {e}")
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # Only care about the counting bot
+    if payload.user_id != COUNTING_BOT_ID or not payload.guild_id:
+        return
+
+    # Fail emojis mean the count was wrong — no prize
+    e     = payload.emoji
+    e_str = str(e)
+    if e_str in _COUNTING_FAIL_EMOJI:
+        return
+    if e.name and e.name.lower() in ('x', 'cross_mark', 'warning'):
+        return
+
+    # Check counting config
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled, channel_id, announce_channel_id "
+            "FROM counting_config WHERE guild_id=?",
+            (payload.guild_id,)) as cur:
+            cfg = await cur.fetchone()
+    if not cfg or not cfg[0]:
+        return
+    _, cfg_channel, cfg_announce = cfg
+    if cfg_channel and payload.channel_id != cfg_channel:
+        return
+
+    # Fetch the message (to get author + content)
+    channel = bot.get_channel(payload.channel_id)
+    if not channel:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except Exception:
+        return
+    if message.author.bot:
+        return
+
+    count_n = _extract_count(message.content)
+    if count_n is None:
+        return
+
+    gid  = payload.guild_id
+    user = message.author
+
+    # Load prize pool and compute weights for this count
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT id, prize_type, prize_value, prize_amount, weight_formula "
+            "FROM counting_prizes WHERE guild_id=?", (gid,)) as cur:
+            pool = await cur.fetchall()
+    if not pool:
+        return
+
+    weights = [max(1e-9, _eval_weight(row[4], count_n)) for row in pool]
+    chosen  = random.choices(pool, weights=weights, k=1)[0]
+    _, p_type, p_value, p_amount, _ = chosen
+    prize_desc = await _give_counting_prize(gid, user.id, p_type, p_value, p_amount)
+
+    # Check for special prizes at this exact number
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT prize_type, prize_value, prize_amount, label "
+            "FROM counting_special_prizes WHERE guild_id=? AND number=?",
+            (gid, count_n)) as cur:
+            specials = await cur.fetchall()
+
+    special_parts = []
+    for sp_type, sp_value, sp_amount, sp_label in specials:
+        sp_desc = await _give_counting_prize(gid, user.id, sp_type, sp_value, sp_amount)
+        special_parts.append(sp_label or sp_desc)
+
+    # Nothing + no special → silent
+    if not prize_desc and not special_parts:
+        return
+
+    # Build announcement
+    if prize_desc:
+        lines = [f"🎉 {user.mention} counted **{count_n:,}** and won **{prize_desc}**!"]
+    else:
+        lines = [f"🎉 {user.mention} counted **{count_n:,}**!"]
+    for sp in special_parts:
+        lines.append(f"✨ **Special prize:** {sp}!")
+
+    announce_ch = bot.get_channel(cfg_announce) if cfg_announce else channel
+    if announce_ch:
+        try:
+            await announce_ch.send("\n".join(lines))
+        except Exception:
+            pass
 
 # ═══════════════════════════════════════════════════════
 # READY EVENT
@@ -1495,17 +1672,38 @@ async def raffle_loop():
         if now >= target: target += timedelta(days=1)
         print(f"[Raffle] Next draw in {(target-now).total_seconds():.0f}s")
         await asyncio.sleep((target - now).total_seconds())
+
         for guild in bot.guilds:
             if not await is_system_enabled(guild.id, "raffle"): continue
             async with get_db() as db:
-                async with db.execute("SELECT user_id,tickets FROM raffle WHERE guild_id=?",
-                                      (guild.id,)) as cur:
+                async with db.execute(
+                    "SELECT user_id,tickets FROM raffle WHERE guild_id=? ORDER BY tickets DESC",
+                    (guild.id,)) as cur:
                     entries = await cur.fetchall()
-            pool = []
+            if not entries:
+                continue
+
+            total   = sum(t for _, t in entries)
+            pool    = []
             for uid, t in entries: pool.extend([uid] * t)
-            if not pool: continue
-            winner_id = random.choice(pool)
+            winner_id      = random.choice(pool)
+            winner_tickets = next((t for uid, t in entries if uid == winner_id), 0)
+            top5           = entries[:5]   # already sorted desc by SQL
+
+            # ── Save history ─────────────────────────────────────────
+            async with db_lock:
+                async with get_db() as db:
+                    await db.execute(
+                        "INSERT INTO raffle_history"
+                        "(guild_id,draw_timestamp,winner_id,winner_tickets,total_tickets,top_json) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (guild.id, int(datetime.now(UTC).timestamp()),
+                         winner_id, winner_tickets, total,
+                         json.dumps([[uid, t] for uid, t in top5])))
+                    await db.commit()
+
             await add_balance(guild.id, winner_id, RAFFLE_PRIZE)
+
             async with get_db() as db:
                 async with db.execute("SELECT channel_id FROM raffle_config WHERE guild_id=?",
                                       (guild.id,)) as cur:
@@ -1513,13 +1711,14 @@ async def raffle_loop():
             ann = bot.get_channel(row[0]) if row else guild.system_channel
             if ann:
                 await ann.send(f"🎉 <@{winner_id}> won the daily raffle and will receive a huge pet!")
-                # ▼ ADD THIS LINE:
                 await log_event(guild.id, "raffle", _log_embed(
                     "🎟 Daily Raffle Draw", discord.Color.gold(),
                     Winner=f"<@{winner_id}>", Guild=guild.name))
-            async with get_db() as db:
-                await db.execute("DELETE FROM raffle WHERE guild_id=?", (guild.id,))
-                await db.commit()
+
+            async with db_lock:
+                async with get_db() as db:
+                    await db.execute("DELETE FROM raffle WHERE guild_id=?", (guild.id,))
+                    await db.commit()
 
 # ═══════════════════════════════════════════════════════
 # CHEST PRIZE MANAGEMENT
@@ -2469,15 +2668,16 @@ async def setraredropchannel(interaction: discord.Interaction, channel: discord.
 # RAFFLE INFO CHANNEL
 # ═══════════════════════════════════════════════════════
 
-def build_raffle_info_embed(guild, total_tickets, top_entries):
+def build_raffle_info_embed(guild, total_tickets, top_entries, prev=None):
     now    = datetime.now(UTC)
     target = now.replace(hour=16, minute=0, second=0, microsecond=0)
     if now >= target: target += timedelta(days=1)
     end_ts = int(target.timestamp())
     embed  = discord.Embed(title="🎟 Live Raffle Status", color=discord.Color.gold())
-    embed.add_field(name="⏰ Next Draw",          value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)",
-                    inline=False)
-    embed.add_field(name="🎫 Total Tickets",       value=f"{total_tickets:,}", inline=False)
+    embed.add_field(name="⏰ Next Draw",
+                    value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)", inline=False)
+    embed.add_field(name="🎫 Total Tickets", value=f"{total_tickets:,}", inline=False)
+
     if top_entries:
         medals = ["🥇", "🥈", "🥉"]
         lines  = []
@@ -2490,6 +2690,26 @@ def build_raffle_info_embed(guild, total_tickets, top_entries):
         embed.add_field(name="🏆 Top Participants", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="🏆 Top Participants", value="No tickets yet.", inline=False)
+
+    # ── Previous raffle ──────────────────────────────────────────────
+    if prev:
+        draw_dt   = datetime.fromtimestamp(prev["ts"], UTC)
+        date_str  = draw_dt.strftime("%Y-%m-%d %H:%M UTC")
+        winner    = guild.get_member(prev["winner_id"])
+        wname     = winner.display_name if winner else f"<@{prev['winner_id']}>"
+        wpct      = (prev["winner_tickets"] / prev["total"] * 100) if prev["total"] else 0
+        lines2    = [
+            f"🏆 **{wname}** — {prev['winner_tickets']:,} tickets ({wpct:.1f}%)",
+            f"📊 Pool: {prev['total']:,} tickets",
+        ]
+        for i, (uid, t) in enumerate(prev.get("top", [])[:3]):
+            m    = guild.get_member(uid)
+            mn   = m.display_name if m else f"<@{uid}>"
+            pct2 = (t / prev["total"] * 100) if prev["total"] else 0
+            lines2.append(f"{'🥇🥈🥉'[i]} {mn} — {t:,} ({pct2:.1f}%)")
+        embed.add_field(name=f"📜 Previous Draw ({date_str})",
+                        value="\n".join(lines2), inline=False)
+
     embed.set_footer(text=f"Updated: {datetime.now(UTC).strftime('%H:%M:%S UTC')}")
     return embed
 
@@ -2518,22 +2738,39 @@ async def raffle_info_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         async with get_db() as db:
-            async with db.execute("SELECT guild_id,channel_id,message_id FROM raffle_info_config") as cur:
+            async with db.execute(
+                "SELECT guild_id,channel_id,message_id FROM raffle_info_config") as cur:
                 configs = await cur.fetchall()
         for guild_id, channel_id, message_id in configs:
             try:
                 guild   = bot.get_guild(guild_id)
                 channel = bot.get_channel(channel_id)
                 if not guild or not channel: continue
+
                 async with get_db() as db:
                     async with db.execute(
-                        "SELECT user_id,tickets FROM raffle WHERE guild_id=? ORDER BY tickets DESC LIMIT 5",
-                        (guild_id,)) as cur:
+                        "SELECT user_id,tickets FROM raffle WHERE guild_id=? "
+                        "ORDER BY tickets DESC LIMIT 5", (guild_id,)) as cur:
                         top = await cur.fetchall()
-                    async with db.execute("SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
-                                          (guild_id,)) as cur:
+                    async with db.execute(
+                        "SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
+                        (guild_id,)) as cur:
                         total = (await cur.fetchone())[0] or 0
-                embed = build_raffle_info_embed(guild, total, top)
+                    # Fetch most recent history entry
+                    async with db.execute(
+                        "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
+                        "FROM raffle_history WHERE guild_id=? "
+                        "ORDER BY draw_timestamp DESC LIMIT 1",
+                        (guild_id,)) as cur:
+                        h = await cur.fetchone()
+
+                prev = None
+                if h:
+                    ts, wid, wt, tot, tj = h
+                    prev = {"ts": ts, "winner_id": wid, "winner_tickets": wt,
+                            "total": tot, "top": json.loads(tj) if tj else []}
+
+                embed = build_raffle_info_embed(guild, total, top, prev)
                 try:
                     msg = await channel.fetch_message(message_id)
                     await msg.edit(embed=embed)
@@ -2541,12 +2778,65 @@ async def raffle_info_loop():
                     new_msg = await channel.send(embed=embed)
                     async with db_lock:
                         async with get_db() as db:
-                            await db.execute("UPDATE raffle_info_config SET message_id=? WHERE guild_id=?",
-                                             (new_msg.id, guild_id))
+                            await db.execute(
+                                "UPDATE raffle_info_config SET message_id=? WHERE guild_id=?",
+                                (new_msg.id, guild_id))
                             await db.commit()
             except Exception as e:
                 print(f"[RaffleInfoLoop] {guild_id}: {e}")
         await asyncio.sleep(60)
+
+@bot.tree.command(name="checkrafflehistory",
+                  description="Browse the full history of past raffle draws")
+@app_commands.describe(page="Page to jump to (default 1)")
+@command_enabled()
+async def checkrafflehistory(interaction: discord.Interaction, page: int = 1):
+    await interaction.response.defer(ephemeral=True)
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
+            "FROM raffle_history WHERE guild_id=? ORDER BY draw_timestamp DESC",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.followup.send("❌ No raffle history yet.", ephemeral=True); return
+
+    PER_PAGE = 5
+    total_pages = max(1, (len(rows) + PER_PAGE - 1) // PER_PAGE)
+    page        = max(1, min(page, total_pages))
+    pages: list[discord.Embed] = []
+
+    for page_idx in range(total_pages):
+        chunk = rows[page_idx * PER_PAGE:(page_idx + 1) * PER_PAGE]
+        embed = discord.Embed(title="📜 Raffle History", color=discord.Color.gold())
+        for ts, wid, wt, tot, tj in chunk:
+            draw_dt  = datetime.fromtimestamp(ts, UTC)
+            date_str = draw_dt.strftime("%Y-%m-%d %H:%M UTC")
+            winner   = interaction.guild.get_member(wid)
+            wname    = winner.display_name if winner else f"*[Left Server]*"
+            wpct     = (wt / tot * 100) if tot else 0
+            lines    = [f"🏆 **{wname}** — {wt:,} tickets ({wpct:.1f}%)",
+                        f"📊 Pool: {tot:,} tickets"]
+            try:
+                top = json.loads(tj) if tj else []
+                medals = ["🥇", "🥈", "🥉"]
+                for i, (uid, t) in enumerate(top[:3]):
+                    m   = interaction.guild.get_member(int(uid))
+                    mn  = m.display_name if m else "*[Left Server]*"
+                    p2  = (t / tot * 100) if tot else 0
+                    lines.append(f"{medals[i]} {mn} — {t:,} ({p2:.1f}%)")
+            except Exception:
+                pass
+            embed.add_field(name=f"🗓 {date_str}", value="\n".join(lines), inline=False)
+        embed.set_footer(text=f"Page {page_idx+1}/{total_pages} · {len(rows)} draws total")
+        pages.append(embed)
+
+    initial = page - 1
+    view    = GameListView(pages, interaction.user.id, initial_page=initial)
+    await interaction.followup.send(
+        embed=pages[initial],
+        view=view if total_pages > 1 else None,
+        ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
 # EXP BOOSTS
@@ -6168,6 +6458,309 @@ async def gcodes(interaction: discord.Interaction):
                   f"Rank ≥ {min_level} | Bal ≥ {min_balance:,}",
             inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ═══════════════════════════════════════════════════════
+# COUNTING SYSTEM
+# ═══════════════════════════════════════════════════════
+
+_CP_CHOICES = [
+    app_commands.Choice(name="Balance",              value="balance"),
+    app_commands.Choice(name="EXP",                  value="exp"),
+    app_commands.Choice(name="Raffle Tickets",       value="tickets"),
+    app_commands.Choice(name="Gamble Tokens",        value="gamble_tokens"),
+    app_commands.Choice(name="VIP Keys",             value="vip_keys"),
+    app_commands.Choice(name="Item / Box",           value="item"),
+    app_commands.Choice(name="Nothing (filler slot)",value="nothing"),
+    app_commands.Choice(name="Custom label only",    value="custom"),
+]
+
+@bot.tree.command(name="enablecounting", description="Enable counting rewards in this server")
+@command_enabled()
+async def enablecounting(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO counting_config(guild_id,enabled) VALUES(?,1) "
+                "ON CONFLICT(guild_id) DO UPDATE SET enabled=1",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message(
+        "✅ Counting rewards enabled. Use `/setcountingchannel` to restrict to a specific channel.")
+
+@bot.tree.command(name="disablecounting", description="Disable counting rewards in this server")
+@command_enabled()
+async def disablecounting(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO counting_config(guild_id,enabled) VALUES(?,0) "
+                "ON CONFLICT(guild_id) DO UPDATE SET enabled=0",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("🔒 Counting rewards disabled.")
+
+@bot.tree.command(name="setcountingchannel",
+                  description="Set which channel to watch and where to announce prizes")
+@app_commands.describe(
+    counting_channel="Channel to watch for counts (leave empty = all channels)",
+    announce_channel="Where to post prize wins (leave empty = post in counting channel)"
+)
+@command_enabled()
+async def setcountingchannel(interaction: discord.Interaction,
+                               counting_channel:  discord.TextChannel = None,
+                               announce_channel:  discord.TextChannel = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    ch_id  = counting_channel.id  if counting_channel  else 0
+    ann_id = announce_channel.id  if announce_channel  else 0
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO counting_config(guild_id,enabled,channel_id,announce_channel_id) "
+                "VALUES(?,1,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+                "channel_id=excluded.channel_id, announce_channel_id=excluded.announce_channel_id",
+                (interaction.guild.id, ch_id, ann_id))
+            await db.commit()
+    parts = []
+    parts.append(f"Counting channel: {counting_channel.mention if counting_channel else '🌐 All channels'}")
+    parts.append(f"Announce channel: {announce_channel.mention if announce_channel else '↩️ Same as counting channel'}")
+    await interaction.response.send_message("✅ " + " | ".join(parts))
+
+
+@bot.tree.command(name="addcountingprize",
+                  description="Add a prize to the counting reward pool")
+@app_commands.describe(
+    prize_type="Type of prize",
+    amount="Amount for balance/EXP/tickets/tokens/keys prizes",
+    item_name="Item or box name (for 'item' type)",
+    label="Display label for 'nothing' or 'custom' type",
+    weight_formula=(
+        "Weight formula — fixed number OR math with {n} = count. "
+        "Examples: 1  |  {n}  |  sqrt({n})  |  max(1,100-{n})"
+    )
+)
+@app_commands.choices(prize_type=_CP_CHOICES)
+@command_enabled()
+async def addcountingprize(interaction: discord.Interaction,
+                            prize_type: str, amount: int = 0,
+                            item_name: str = None, label: str = None,
+                            weight_formula: str = "1"):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+
+    # Validate inputs
+    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    if prize_type == "item" and not item_name:
+        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
+
+    # Test formula
+    test_w = _eval_weight(weight_formula, 100)
+    if test_w <= 0:
+        await interaction.response.send_message(
+            "❌ Formula evaluates to ≤ 0 at n=100. Use a positive expression.",
+            ephemeral=True); return
+
+    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
+    p_amount = amount if prize_type != "item" else (amount or 1)
+
+    async with db_lock:
+        async with get_db() as db:
+            cur = await db.execute(
+                "INSERT INTO counting_prizes(guild_id,prize_type,prize_value,prize_amount,weight_formula) "
+                "VALUES(?,?,?,?,?)",
+                (interaction.guild.id, prize_type, p_value, p_amount, weight_formula))
+            new_id = cur.lastrowid
+            await db.commit()
+
+    prize_str = {
+        "balance":       f"💰 {amount:,} coins",
+        "exp":           f"⭐ {amount:,} EXP",
+        "tickets":       f"🎟 {amount} ticket(s)",
+        "gamble_tokens": f"🎲 {amount} Gamble Token(s)",
+        "vip_keys":      f"🔑 {amount} VIP Key(s)",
+        "item":          f"🎒 {p_amount}x {item_name}",
+        "nothing":       "nothing 😔",
+        "custom":        label or "custom",
+    }.get(prize_type, prize_type)
+
+    await interaction.response.send_message(
+        f"✅ Added counting prize `#{new_id}`: **{prize_str}**\n"
+        f"Weight formula: `{weight_formula}` "
+        f"*(evaluated at n=100: **{test_w:.2f}**)*")
+
+
+@bot.tree.command(name="removecountingprize",
+                  description="Remove a counting prize by ID (see /listcountingprizes)")
+@app_commands.describe(prize_id="Prize ID to remove")
+@command_enabled()
+async def removecountingprize(interaction: discord.Interaction, prize_id: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT prize_type, prize_value FROM counting_prizes WHERE id=? AND guild_id=?",
+                (prize_id, interaction.guild.id)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await interaction.response.send_message(f"❌ Prize `#{prize_id}` not found.",
+                                                        ephemeral=True); return
+            await db.execute("DELETE FROM counting_prizes WHERE id=?", (prize_id,))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 Removed counting prize `#{prize_id}` ({row[0]}: {row[1]}).")
+
+
+@bot.tree.command(name="listcountingprizes",
+                  description="List all prizes in the counting reward pool")
+@command_enabled()
+async def listcountingprizes(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT id, prize_type, prize_value, prize_amount, weight_formula "
+            "FROM counting_prizes WHERE guild_id=? ORDER BY id",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message(
+            "❌ No counting prizes configured. Use `/addcountingprize`.", ephemeral=True); return
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled, channel_id, announce_channel_id "
+            "FROM counting_config WHERE guild_id=?",
+            (interaction.guild.id,)) as cur:
+            cfg = await cur.fetchone()
+
+    embed = discord.Embed(title="🔢 Counting Prize Pool", color=discord.Color.teal())
+    if cfg:
+        status  = "✅ Enabled" if cfg[0] else "🔒 Disabled"
+        ch      = interaction.guild.get_channel(cfg[1])
+        ann     = interaction.guild.get_channel(cfg[2])
+        ch_str  = ch.mention  if ch  else "🌐 All channels"
+        ann_str = ann.mention if ann else "↩️ Counting channel"
+        embed.description = (f"{status} | Watch: {ch_str} | Announce: {ann_str}\n"
+                             f"*Weight is evaluated per count — test values at n=1, 100, 1000*")
+
+    EXAMPLE_NS = [1, 100, 1000]
+    for (pid, ptype, pvalue, pamount, formula) in rows:
+        label = {
+            "balance":       f"💰 {pamount:,} coins",
+            "exp":           f"⭐ {pamount:,} EXP",
+            "tickets":       f"🎟 {pamount} ticket(s)",
+            "gamble_tokens": f"🎲 {pamount} token(s)",
+            "vip_keys":      f"🔑 {pamount} key(s)",
+            "item":          f"🎒 {pamount}x {pvalue}",
+            "nothing":       "😔 Nothing",
+            "custom":        f"✨ {pvalue}",
+        }.get(ptype, ptype)
+        weights_str = " | ".join(
+            f"n={n}: **{_eval_weight(formula, n):.2f}**" for n in EXAMPLE_NS)
+        embed.add_field(
+            name=f"`#{pid}` {label}",
+            value=f"Formula: `{formula}`\n{weights_str}",
+            inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="addcountingspecial",
+                  description="Add a bonus prize given on top for a specific count number")
+@app_commands.describe(
+    number="The exact count that triggers this bonus",
+    prize_type="Type of prize",
+    amount="Amount for balance/EXP/tickets/tokens/keys",
+    item_name="Item or box name (for item prizes)",
+    label="How it's announced, e.g. '1k EXP milestone bonus'"
+)
+@app_commands.choices(prize_type=_CP_CHOICES)
+@command_enabled()
+async def addcountingspecial(interaction: discord.Interaction,
+                              number: int, prize_type: str,
+                              amount: int = 0, item_name: str = None,
+                              label: str = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if number <= 0:
+        await interaction.response.send_message("❌ Number must be > 0.", ephemeral=True); return
+    if prize_type in ("balance","exp","tickets","gamble_tokens","vip_keys") and amount <= 0:
+        await interaction.response.send_message("❌ Amount must be > 0.", ephemeral=True); return
+    if prize_type == "item" and not item_name:
+        await interaction.response.send_message("❌ Provide item_name.", ephemeral=True); return
+
+    p_value  = item_name.strip() if prize_type == "item" else (label or prize_type)
+    p_amount = amount if prize_type != "item" else (amount or 1)
+    p_label  = label or p_value
+
+    async with db_lock:
+        async with get_db() as db:
+            cur = await db.execute(
+                "INSERT INTO counting_special_prizes"
+                "(guild_id,number,prize_type,prize_value,prize_amount,label) "
+                "VALUES(?,?,?,?,?,?)",
+                (interaction.guild.id, number, prize_type, p_value, p_amount, p_label))
+            new_id = cur.lastrowid
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Special prize `#{new_id}` added: counting **{number:,}** gives bonus **{p_label}**.")
+
+
+@bot.tree.command(name="removecountingspecial",
+                  description="Remove a special count prize by ID (see /listcountingspecials)")
+@app_commands.describe(special_id="Special prize ID to remove")
+@command_enabled()
+async def removecountingspecial(interaction: discord.Interaction, special_id: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT number, label FROM counting_special_prizes WHERE id=? AND guild_id=?",
+                (special_id, interaction.guild.id)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await interaction.response.send_message(f"❌ Special `#{special_id}` not found.",
+                                                        ephemeral=True); return
+            await db.execute("DELETE FROM counting_special_prizes WHERE id=?", (special_id,))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 Removed special `#{special_id}` (count {row[0]:,}: {row[1]}).")
+
+
+@bot.tree.command(name="listcountingspecials",
+                  description="List all special prizes for specific count numbers")
+@command_enabled()
+async def listcountingspecials(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT id, number, prize_type, prize_value, prize_amount, label "
+            "FROM counting_special_prizes WHERE guild_id=? ORDER BY number",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message(
+            "❌ No special prizes configured. Use `/addcountingspecial`.", ephemeral=True); return
+    embed = discord.Embed(title="✨ Special Count Prizes", color=discord.Color.teal())
+    for (sid, num, ptype, pvalue, pamount, lbl) in rows:
+        prize_str = {
+            "balance":       f"💰 {pamount:,} coins",
+            "exp":           f"⭐ {pamount:,} EXP",
+            "tickets":       f"🎟 {pamount} ticket(s)",
+            "gamble_tokens": f"🎲 {pamount} token(s)",
+            "vip_keys":      f"🔑 {pamount} key(s)",
+            "item":          f"🎒 {pamount}x {pvalue}",
+            "nothing":       "😔 Nothing",
+            "custom":        f"✨ {pvalue}",
+        }.get(ptype, ptype)
+        embed.add_field(
+            name=f"`#{sid}` Count **{num:,}**",
+            value=f"{prize_str}\n*Announces as: {lbl}*",
+            inline=False)
+    await interaction.response.send_message(embed=embed)
 
 # ═══════════════════════════════════════════════════════
 # RUN BOT
