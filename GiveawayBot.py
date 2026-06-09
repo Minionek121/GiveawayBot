@@ -5630,25 +5630,6 @@ giveaway._callback = _giveaway_logged
 
 # ── Codes ─────────────────────────────────────────────────────────────────────
 
-_orig_createcode = createcode._callback
-async def _createcode_logged(
-    interaction: discord.Interaction, code: str, prize_json: str,
-    uses: int = -1, min_activity_rank: int = 0, min_balance: int = 0,
-    required_role: discord.Role = None
-):
-    await _orig_createcode(interaction, code, prize_json, uses,
-                            min_activity_rank, min_balance, required_role)
-    if not await is_allowed_to_giveaway(interaction): return
-    await log_event(interaction.guild.id, "code", _log_embed(
-        "🎫 Code Created", discord.Color.green(),
-        By=interaction.user.mention, Code=code.upper().strip(),
-        Uses="∞" if uses == -1 else str(uses), MinRank=str(min_activity_rank)))
-    await log_event(interaction.guild.id, "admin", _log_embed(
-        "⚙️ createcode", discord.Color.orange(),
-        By=interaction.user.mention, Code=code.upper().strip(),
-        Uses="∞" if uses == -1 else str(uses)))
-createcode._callback = _createcode_logged
-
 _orig_redeem = redeem._callback
 async def _redeem_logged(interaction: discord.Interaction, code: str):
     code_upper = code.upper().strip()
