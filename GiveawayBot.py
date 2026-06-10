@@ -2888,7 +2888,7 @@ async def setwelcome(interaction: discord.Interaction):
 
 class WelcomeChannelModal(discord.ui.Modal, title="Set Channel Welcome Message"):
     message_input = discord.ui.TextInput(
-        label="Welcome message (blank = use DM message or default)",
+        label="Welcome message (blank = DM message/default)",
         style=discord.TextStyle.long,
         placeholder="Welcome to {server}, {member}! 🎉  — {member} and {server} are placeholders",
         max_length=1800,
