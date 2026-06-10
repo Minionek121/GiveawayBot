@@ -6127,6 +6127,668 @@ async def addcountingspecial(interaction: discord.Interaction,
         f"✅ Special prize `#{new_id}` added: counting **{number:,}** gives bonus **{p_label}**.")
 
 # ═══════════════════════════════════════════════════════
+# FAKE INTERACTION  — wraps ctx so slash callbacks work as prefix
+# ═══════════════════════════════════════════════════════
+
+class FakeInteraction:
+    """
+    Wraps a commands.Context so that slash command ._callback() can be
+    called directly from a prefix command without any modification.
+    ephemeral=True is silently ignored (message is sent publicly).
+    """
+
+    class _Resp:
+        def __init__(self, ctx):
+            self._ctx = ctx
+
+        async def send_message(self, content=None, *, embed=None, embeds=None,
+                                ephemeral=False, view=None):
+            kw = {}
+            if content  is not None: kw['content'] = content
+            if embed    is not None: kw['embed']   = embed
+            if embeds   is not None: kw['embeds']  = embeds
+            if view     is not None: kw['view']    = view
+            await self._ctx.send(**kw)
+
+        async def defer(self, ephemeral=False):
+            await self._ctx.trigger_typing()
+
+        async def send_modal(self, modal):
+            await self._ctx.send(
+                "❌ This command requires the slash version "
+                "(it opens a pop-up form that prefix commands can't show).")
+
+    class _Follow:
+        def __init__(self, ctx):
+            self._ctx = ctx
+
+        async def send(self, content=None, *, embed=None, embeds=None,
+                       ephemeral=False, view=None):
+            kw = {}
+            if content  is not None: kw['content'] = content
+            if embed    is not None: kw['embed']   = embed
+            if embeds   is not None: kw['embeds']  = embeds
+            if view     is not None: kw['view']    = view
+            await self._ctx.send(**kw)
+
+    def __init__(self, ctx: commands.Context):
+        self._ctx     = ctx
+        self.guild    = ctx.guild
+        self.user     = ctx.author
+        self.channel  = ctx.channel
+        self.command  = ctx.command
+        self.data     = {}
+        self.type     = discord.InteractionType.application_command
+        self.response = self._Resp(ctx)
+        self.followup = self._Follow(ctx)
+
+    async def original_response(self):
+        """Used by trade — returns the last sent message."""
+        async for msg in self._ctx.channel.history(limit=1):
+            return msg
+
+
+class _MC:
+    """Mock app_commands.Choice — used for leaderboard and addgamepreset."""
+    def __init__(self, value: str):
+        self.value = value
+        self.name  = value
+
+
+# ═══════════════════════════════════════════════════════
+# PREFIX WRAPPERS FOR ALL REMAINING SLASH COMMANDS
+# ═══════════════════════════════════════════════════════
+
+# ── Public user commands ──────────────────────────────────────────────────────
+
+@bot.command(name="balance")
+async def pfx_balance(ctx, user: discord.Member = None):
+    await balance._callback(FakeInteraction(ctx), user)
+
+@bot.command(name="activityrank")
+async def pfx_activityrank(ctx, user: discord.Member = None):
+    await level._callback(FakeInteraction(ctx), user)
+
+@bot.command(name="leaderboard")
+async def pfx_leaderboard(ctx, category: str = "balance", page: int = 1):
+    _valid = {"total_exp","current_exp","balance","raffle_tickets_bought",
+              "current_tickets","chests_opened","gifted_balance"}
+    if category not in _valid:
+        await ctx.send(f"❌ Valid categories: {', '.join(sorted(_valid))}"); return
+    await leaderboard._callback(FakeInteraction(ctx), _MC(category), page)
+
+@bot.command(name="buytickets")
+async def pfx_buytickets(ctx, amount: int):
+    await buytickets._callback(FakeInteraction(ctx), amount)
+
+@bot.command(name="rafflechance")
+async def pfx_rafflechance(ctx, user: discord.Member = None):
+    await rafflechance._callback(FakeInteraction(ctx), user)
+
+@bot.command(name="chest")
+async def pfx_chest(ctx, amount: int = 1):
+    await chest._callback(FakeInteraction(ctx), amount)
+
+@bot.command(name="vipchest")
+async def pfx_vipchest(ctx, amount: int = 1):
+    await vipchest._callback(FakeInteraction(ctx), amount)
+
+@bot.command(name="openbox")
+async def pfx_openbox(ctx, box: str, amount: int = 1):
+    await openbox._callback(FakeInteraction(ctx), box, amount)
+
+@bot.command(name="blackjack")
+async def pfx_blackjack(ctx, bet: int):
+    await blackjack._callback(FakeInteraction(ctx), bet)
+
+@bot.command(name="roulette")
+async def pfx_roulette(ctx, bet: int, choice: str):
+    await roulette._callback(FakeInteraction(ctx), bet, choice)
+
+@bot.command(name="redeem")
+async def pfx_redeem(ctx, code: str):
+    await redeem._callback(FakeInteraction(ctx), code)
+
+@bot.command(name="trade")
+async def pfx_trade(ctx, user: discord.Member):
+    if user.id == ctx.author.id: await ctx.send("❌ Can't trade with yourself."); return
+    if user.bot:                  await ctx.send("❌ Can't trade with a bot."); return
+    key = (ctx.guild.id, frozenset({ctx.author.id, user.id}))
+    if key in trade_sessions:     await ctx.send("❌ A trade is already in progress."); return
+    session = TradeSession(ctx.guild.id, ctx.author.id, user.id)
+    trade_sessions[key] = session
+    msg = await ctx.send(
+        f"🤝 {ctx.author.mention} wants to trade with {user.mention}!\n"
+        "Click **Set Offer**, then **Confirm**.",
+        embed=session.build_embed(ctx.guild), view=TradeView(session))
+    session.message = msg
+
+@bot.command(name="help")
+async def pfx_help(ctx, *, command: str = None):
+    await help_cmd._callback(FakeInteraction(ctx), command)
+
+# ── Item group as prefix group ─────────────────────────────────────────────────
+
+@bot.group(name="item", invoke_without_command=True)
+async def pfx_item(ctx):
+    p = _BOT_PREFIX
+    await ctx.send(
+        f"**Item commands:** `{p}item store` · `{p}item buy <name>` · `{p}item use <name>` · "
+        f"`{p}item inv [@user]` · `{p}item info <name>` · `{p}item give @user <name> [qty]` · "
+        f"`{p}item take @user <name> [qty]` · `{p}item add <name> <price> @role <desc>` · "
+        f"`{p}item remove <name>`")
+
+@pfx_item.command(name="store")
+async def pfx_item_store(ctx):
+    await item_store_cmd._callback(FakeInteraction(ctx))
+
+@pfx_item.command(name="buy")
+async def pfx_item_buy_cmd(ctx, *, name: str):
+    await item_buy._callback(FakeInteraction(ctx), name)
+
+@pfx_item.command(name="use")
+async def pfx_item_use_cmd(ctx, *, name: str):
+    await item_use._callback(FakeInteraction(ctx), name)
+
+@pfx_item.command(name="inv")
+async def pfx_item_inv_cmd(ctx, user: discord.Member = None):
+    await item_inv._callback(FakeInteraction(ctx), user)
+
+@pfx_item.command(name="info")
+async def pfx_item_info_cmd(ctx, *, name: str):
+    await item_info._callback(FakeInteraction(ctx), name)
+
+@pfx_item.command(name="give")
+async def pfx_item_give_cmd(ctx, user: discord.Member, name: str, quantity: int = 1):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await item_give._callback(FakeInteraction(ctx), user, name, quantity)
+
+@pfx_item.command(name="take")
+async def pfx_item_take_cmd(ctx, user: discord.Member, name: str, quantity: int = 1):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await item_take._callback(FakeInteraction(ctx), user, name, quantity)
+
+@pfx_item.command(name="add")
+async def pfx_item_add_cmd(ctx, name: str, price: int, role: discord.Role, *, description: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await item_add._callback(FakeInteraction(ctx), name, price, role, description)
+
+@pfx_item.command(name="remove")
+async def pfx_item_remove_cmd(ctx, *, name: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await item_remove._callback(FakeInteraction(ctx), name)
+
+# ── Giveaway admin ────────────────────────────────────────────────────────────
+
+@bot.command(name="addgiveawayrole")
+async def pfx_addgiveawayrole(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await addgiveawayrole._callback(FakeInteraction(ctx), role)
+
+@bot.command(name="removegiveawayrole")
+async def pfx_removegiveawayrole(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removegiveawayrole._callback(FakeInteraction(ctx), role)
+
+@bot.command(name="giveaway")
+async def pfx_giveaway(ctx, prize: str, seconds: int, winners: int = 1,
+                        reward_balance: int = 0, reward_exp: int = 0):
+    """Usage: !giveaway <prize> <seconds> [winners] [reward_balance] [reward_exp]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await giveaway._callback(FakeInteraction(ctx), prize, seconds, winners,
+                              reward_balance, reward_exp, 0, 0, 0,
+                              None, None, 1, None, None, "gold")
+
+@bot.command(name="addautogiveaway")
+async def pfx_addautogiveaway(ctx, prize: str, winners: int = 1, chance: float = 1.0,
+                               reward_balance: int = 0, reward_exp: int = 0):
+    """Usage: !addautogiveaway <prize> [winners] [chance] [reward_balance] [reward_exp]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await addautogiveaway._callback(FakeInteraction(ctx), prize, winners, chance,
+                                    reward_balance, reward_exp, 0, 0, 0, None, None, 1)
+
+@bot.command(name="startgiveaways")
+async def pfx_startgiveaways(ctx, interval_seconds: int, giveaway_duration_seconds: int,
+                               channel: discord.TextChannel = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await startgiveaways._callback(FakeInteraction(ctx), interval_seconds,
+                                   giveaway_duration_seconds, channel)
+
+# ── Channel / config setup ───────────────────────────────────────────────────
+
+@bot.command(name="setrafflechannel")
+async def pfx_setrafflechannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setrafflechannel._callback(FakeInteraction(ctx), channel)
+
+@bot.command(name="setraffleinfochannel")
+async def pfx_setraffleinfochannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setraffleinfochannel._callback(FakeInteraction(ctx), channel)
+
+@bot.command(name="setraredropchannel")
+async def pfx_setraredropchannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setraredropchannel._callback(FakeInteraction(ctx), channel)
+
+@bot.command(name="setlogchannel")
+async def pfx_setlogchannel(ctx, log_type: str, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if log_type not in {c.value for c in _LOG_CHOICES}:
+        await ctx.send(f"❌ Valid types: {', '.join(c.value for c in _LOG_CHOICES)}"); return
+    await setlogchannel._callback(FakeInteraction(ctx), log_type, channel)
+
+@bot.command(name="removelogchannel")
+async def pfx_removelogchannel(ctx, log_type: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if log_type not in {c.value for c in _LOG_CHOICES}:
+        await ctx.send(f"❌ Valid types: {', '.join(c.value for c in _LOG_CHOICES)}"); return
+    await removelogchannel._callback(FakeInteraction(ctx), log_type)
+
+@bot.command(name="setcountingchannel")
+async def pfx_setcountingchannel(ctx, counting_channel: discord.TextChannel = None,
+                                   announce_channel: discord.TextChannel = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setcountingchannel._callback(FakeInteraction(ctx), counting_channel, announce_channel)
+
+@bot.command(name="expboost")
+async def pfx_expboost(ctx, role: discord.Role, boost: float,
+                        channel: discord.TextChannel = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await expboost._callback(FakeInteraction(ctx), role, boost, channel, None)
+
+@bot.command(name="removeexpboost")
+async def pfx_removeexpboost(ctx, role: discord.Role,
+                               channel: discord.TextChannel = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removeexpboost._callback(FakeInteraction(ctx), role, channel, None)
+
+@bot.command(name="enablesystem")
+async def pfx_enablesystem(ctx, system: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if system not in _SYSTEM_LABELS:
+        await ctx.send(f"❌ Valid: {', '.join(_SYSTEM_LABELS)}"); return
+    await enablesystem._callback(FakeInteraction(ctx), system)
+
+@bot.command(name="disablesystem")
+async def pfx_disablesystem(ctx, system: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if system not in _SYSTEM_LABELS:
+        await ctx.send(f"❌ Valid: {', '.join(_SYSTEM_LABELS)}"); return
+    await disablesystem._callback(FakeInteraction(ctx), system)
+
+@bot.command(name="disablecmd")
+async def pfx_disablecmd(ctx, command_name: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await disablecmd._callback(FakeInteraction(ctx), command_name)
+
+@bot.command(name="enablecmd")
+async def pfx_enablecmd(ctx, command_name: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await enablecmd._callback(FakeInteraction(ctx), command_name)
+
+@bot.command(name="listcmds")
+async def pfx_listcmds(ctx):
+    await listcmds._callback(FakeInteraction(ctx))
+
+# ── Chest management ─────────────────────────────────────────────────────────
+
+@bot.command(name="addchestprize")
+async def pfx_addchestprize(ctx, chest_type: str, name: str,
+                              exp: int = 0, balance: int = 0, chance: float = 10.0):
+    """Usage: !addchestprize <chest|vipchest> <name> [exp] [balance] [chance]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if chest_type not in ("chest","vipchest"):
+        await ctx.send("❌ Use `chest` or `vipchest`."); return
+    await addchestprize._callback(FakeInteraction(ctx), chest_type, name, exp, balance, chance)
+
+@bot.command(name="removechestprize")
+async def pfx_removechestprize(ctx, chest_type: str, prize_id: int):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if chest_type not in ("chest","vipchest"):
+        await ctx.send("❌ Use `chest` or `vipchest`."); return
+    await removechestprize._callback(FakeInteraction(ctx), chest_type, prize_id)
+
+@bot.command(name="addrarechestdrop")
+async def pfx_addrarechestdrop(ctx, chest_type: str, *, prize: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if chest_type not in ("chest","vipchest"):
+        await ctx.send("❌ Use `chest` or `vipchest`."); return
+    await addrarechestdrop._callback(FakeInteraction(ctx), chest_type, prize)
+
+@bot.command(name="removerarechestdrop")
+async def pfx_removerarechestdrop(ctx, chest_type: str, *, prize: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if chest_type not in ("chest","vipchest"):
+        await ctx.send("❌ Use `chest` or `vipchest`."); return
+    await removerarechestdrop._callback(FakeInteraction(ctx), chest_type, prize)
+
+# ── Box management ────────────────────────────────────────────────────────────
+
+@bot.command(name="addboxprize")
+async def pfx_addboxprize(ctx, box: str, prize_type: str, chance: int,
+                           amount: int = 0, item_name: str = None, *, custom_label: str = None):
+    """Usage: !addboxprize <box> <balance|exp|item|nothing|custom> <chance> [amount] [item_name] [custom_label]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if prize_type not in ("balance","exp","item","nothing","custom"):
+        await ctx.send("❌ Valid types: balance, exp, item, nothing, custom"); return
+    await addboxprize._callback(FakeInteraction(ctx), box, prize_type, chance,
+                                amount, item_name, custom_label)
+
+# ── Game management ───────────────────────────────────────────────────────────
+
+@bot.command(name="addgame")
+async def pfx_addgame(ctx, name: str, reward_balance: int = 0, reward_exp: int = 0,
+                       chance: float = 1.0, answer_time: int = 30):
+    """Usage: !addgame <name> [reward_balance] [reward_exp] [chance] [answer_time]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await addgame._callback(FakeInteraction(ctx), name, reward_balance, reward_exp,
+                            0, 0, 0, None, 1, None, chance, answer_time)
+
+@bot.command(name="editgame")
+async def pfx_editgame(ctx, name: str, reward_balance: int = None, reward_exp: int = None,
+                        chance: float = None, answer_time: int = None):
+    """Usage: !editgame <name> [reward_balance] [reward_exp] [chance] [answer_time]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await editgame._callback(FakeInteraction(ctx), name, reward_balance, reward_exp,
+                              None, None, None, None, None, None, None, chance, answer_time)
+
+@bot.command(name="setgamechannel")
+async def pfx_setgamechannel(ctx, channel: discord.TextChannel, interval_seconds: int = 60):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setgamechannel._callback(FakeInteraction(ctx), channel, interval_seconds)
+
+@bot.command(name="startgames")
+async def pfx_startgames(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await startgames._callback(FakeInteraction(ctx))
+
+@bot.command(name="addgamepreset")
+async def pfx_addgamepreset(ctx, game_name: str, preset: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if preset not in _PRESET_DATA:
+        await ctx.send(f"❌ Valid presets: {', '.join(_PRESET_DATA.keys())}"); return
+    await addgamepreset._callback(FakeInteraction(ctx), game_name, preset)
+
+# ── Welcome (modal command — prefix not supported) ────────────────────────────
+
+@bot.command(name="setwelcome")
+async def pfx_setwelcome(ctx):
+    await ctx.send("❌ `/setwelcome` opens a pop-up text editor that only works as a slash command. "
+                   "Please use `/setwelcome` instead.")
+
+
+# ═══════════════════════════════════════════════════════
+# /transfer  — owner command to copy all data between guilds
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="transfer",
+                  description="[Owner] Copy ALL data from one guild to another (replaces destination data)")
+@app_commands.describe(
+    guild_id_from="Source guild ID",
+    guild_id_to="Destination guild ID — ALL existing data there will be replaced!"
+)
+async def transfer(interaction: discord.Interaction,
+                   guild_id_from: str, guild_id_to: str):
+    if not _owner_only(interaction):
+        await interaction.response.send_message("❌ Owner only.", ephemeral=True); return
+    try:
+        gid_from = int(guild_id_from.strip())
+        gid_to   = int(guild_id_to.strip())
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid guild IDs.", ephemeral=True); return
+    if gid_from == gid_to:
+        await interaction.response.send_message("❌ Source and destination are the same.", ephemeral=True); return
+
+    await interaction.response.defer(ephemeral=True)
+    copied: dict[str, int] = {}
+
+    # ── helper: delete target rows, copy source rows with guild_id swapped ──
+
+    async def _copy(db, table: str, cols: list[str]):
+        """cols[0] must be 'guild_id'."""
+        await db.execute(f"DELETE FROM {table} WHERE guild_id=?", (gid_to,))
+        async with db.execute(
+            f"SELECT {','.join(cols)} FROM {table} WHERE guild_id=?", (gid_from,)) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            copied[table] = 0; return
+        ph  = ','.join('?' * len(cols))
+        sql = f"INSERT OR IGNORE INTO {table} ({','.join(cols)}) VALUES ({ph})"
+        n   = 0
+        for row in rows:
+            vals    = list(row)
+            vals[0] = gid_to       # replace guild_id (always index 0)
+            try:   await db.execute(sql, vals); n += 1
+            except Exception: pass
+        copied[table] = n
+
+    async with db_lock:
+        async with get_db() as db:
+
+            # ── 1. Pure guild-scoped tables — no FK complications ─────────────
+            await _copy(db, "balances",
+                        ["guild_id","user_id","balance"])
+            await _copy(db, "exp_history",
+                        ["guild_id","user_id","amount","timestamp","is_bonus"])
+            await _copy(db, "user_stats",
+                        ["guild_id","user_id","total_exp","gifted_balance",
+                         "chests_opened","raffle_tickets_bought"])
+            await _copy(db, "inventory",
+                        ["guild_id","user_id","item_name","quantity"])
+            await _copy(db, "item_store",
+                        ["guild_id","item_name","price","role_id","description"])
+            await _copy(db, "raffle",
+                        ["guild_id","user_id","tickets"])
+            await _copy(db, "giveaway_roles",
+                        ["guild_id","role_id"])
+            await _copy(db, "system_flags",
+                        ["guild_id","flag_name","enabled"])
+            await _copy(db, "rare_drop_config",
+                        ["guild_id","channel_id"])
+            await _copy(db, "raffle_config",
+                        ["guild_id","channel_id"])
+            await _copy(db, "raffle_info_config",
+                        ["guild_id","channel_id","message_id"])
+            await _copy(db, "game_config",
+                        ["guild_id","channel_id","answer_time","interval_seconds","hint_delays"])
+            await _copy(db, "rare_chest_config",
+                        ["guild_id","chest_type","prize_name"])
+            await _copy(db, "log_channels",
+                        ["guild_id","log_type","channel_id"])
+            await _copy(db, "disabled_commands_persist",
+                        ["guild_id","command_name"])
+            await _copy(db, "welcome_config",
+                        ["guild_id","enabled","message"])
+            await _copy(db, "auto_giveaway_config",
+                        ["guild_id","channel_id","interval_seconds","duration_seconds","running"])
+            await _copy(db, "counting_config",
+                        ["guild_id","enabled","channel_id","announce_channel_id"])
+            await _copy(db, "daily_key_log",
+                        ["guild_id","user_id","date"])
+            await _copy(db, "daily_gamble_log",
+                        ["guild_id","user_id","date"])
+            await _copy(db, "redeem_codes",
+                        ["guild_id","code","prize_json","uses_left",
+                         "min_level","min_balance","required_role_id"])
+            await _copy(db, "code_uses",
+                        ["guild_id","code","user_id"])
+            await _copy(db, "abuse_boxes",
+                        ["guild_id","box_name"])
+
+            # exp_boosts has a composite PK — handle separately
+            await db.execute("DELETE FROM exp_boosts WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,role_id,boost_percent,channel_id,category_id "
+                "FROM exp_boosts WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            n = 0
+            for _, rid, bp, cid, catid in rows:
+                try:
+                    await db.execute("INSERT OR IGNORE INTO exp_boosts VALUES(?,?,?,?,?)",
+                                     (gid_to, rid, bp, cid, catid))
+                    n += 1
+                except Exception: pass
+            copied['exp_boosts'] = n
+
+            # ── 2. Auto-increment tables with NO external FK references ────────
+            # auto_giveaway_pool (id not referenced elsewhere)
+            await db.execute("DELETE FROM auto_giveaway_pool WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,prize,winners,chance,reward_balance,reward_exp,"
+                "reward_tickets,reward_gamble_tokens,reward_vip_keys,"
+                "reward_role_id,reward_item,reward_item_qty "
+                "FROM auto_giveaway_pool WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO auto_giveaway_pool(guild_id,prize,winners,chance,"
+                    "reward_balance,reward_exp,reward_tickets,reward_gamble_tokens,"
+                    "reward_vip_keys,reward_role_id,reward_item,reward_item_qty) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (gid_to, *r[1:]))
+            copied['auto_giveaway_pool'] = len(rows)
+
+            # counting_prizes
+            await db.execute("DELETE FROM counting_prizes WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,prize_type,prize_value,prize_amount,weight_formula "
+                "FROM counting_prizes WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO counting_prizes(guild_id,prize_type,prize_value,prize_amount,weight_formula) "
+                    "VALUES(?,?,?,?,?)", (gid_to, *r[1:]))
+            copied['counting_prizes'] = len(rows)
+
+            # counting_special_prizes
+            await db.execute("DELETE FROM counting_special_prizes WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,number,prize_type,prize_value,prize_amount,label "
+                "FROM counting_special_prizes WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO counting_special_prizes"
+                    "(guild_id,number,prize_type,prize_value,prize_amount,label) "
+                    "VALUES(?,?,?,?,?,?)", (gid_to, *r[1:]))
+            copied['counting_special_prizes'] = len(rows)
+
+            # raffle_history
+            await db.execute("DELETE FROM raffle_history WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
+                "FROM raffle_history WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO raffle_history(guild_id,draw_timestamp,winner_id,"
+                    "winner_tickets,total_tickets,top_json) VALUES(?,?,?,?,?,?)",
+                    (gid_to, *r[1:]))
+            copied['raffle_history'] = len(rows)
+
+            # chest_prizes (referenced by rare_chest_config by NAME, not ID — no mapping needed)
+            await db.execute("DELETE FROM chest_prizes WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,chest_type,name,exp,balance,chance "
+                "FROM chest_prizes WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                await db.execute(
+                    "INSERT INTO chest_prizes(guild_id,chest_type,name,exp,balance,chance) "
+                    "VALUES(?,?,?,?,?,?)", (gid_to, *r[1:]))
+            copied['chest_prizes'] = len(rows)
+
+            # games
+            await db.execute("DELETE FROM games WHERE guild_id=?", (gid_to,))
+            async with db.execute(
+                "SELECT guild_id,game_name,enabled,reward_balance,reward_exp,"
+                "reward_tickets,reward_gamble_tokens,reward_vip_keys,reward_item,"
+                "reward_item_qty,reward_role_id,chance,answer_time "
+                "FROM games WHERE guild_id=?", (gid_from,)) as cur:
+                rows = await cur.fetchall()
+            for r in rows:
+                try:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO games(guild_id,game_name,enabled,reward_balance,"
+                        "reward_exp,reward_tickets,reward_gamble_tokens,reward_vip_keys,"
+                        "reward_item,reward_item_qty,reward_role_id,chance,answer_time) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (gid_to, *r[1:]))
+                except Exception: pass
+            copied['games'] = len(rows)
+
+            # ── 3. Tables with ID-based FK chains (need old→new ID mapping) ───
+
+            # game_answers → game_hints
+            await db.execute("DELETE FROM game_hints   WHERE guild_id=?", (gid_to,))
+            await db.execute("DELETE FROM game_answers WHERE guild_id=?", (gid_to,))
+
+            async with db.execute(
+                "SELECT id,guild_id,game_name,answer "
+                "FROM game_answers WHERE guild_id=?", (gid_from,)) as cur:
+                ans_rows = await cur.fetchall()
+            ans_map: dict[int, int] = {}
+            for old_id, _, gname, ans in ans_rows:
+                c = await db.execute(
+                    "INSERT INTO game_answers(guild_id,game_name,answer) VALUES(?,?,?)",
+                    (gid_to, gname, ans))
+                ans_map[old_id] = c.lastrowid
+            copied['game_answers'] = len(ans_rows)
+
+            async with db.execute(
+                "SELECT guild_id,game_name,answer_id,hint_text,hint_order "
+                "FROM game_hints WHERE guild_id=?", (gid_from,)) as cur:
+                hint_rows = await cur.fetchall()
+            for _, gname, old_aid, ht, ho in hint_rows:
+                await db.execute(
+                    "INSERT INTO game_hints(guild_id,game_name,answer_id,hint_text,hint_order) "
+                    "VALUES(?,?,?,?,?)",
+                    (gid_to, gname, ans_map.get(old_aid, old_aid), ht, ho))
+            copied['game_hints'] = len(hint_rows)
+
+            # abuse_box_prizes → rare_box_config
+            await db.execute("DELETE FROM rare_box_config  WHERE guild_id=?", (gid_to,))
+            await db.execute("DELETE FROM abuse_box_prizes WHERE guild_id=?", (gid_to,))
+
+            async with db.execute(
+                "SELECT id,guild_id,box_name,prize_type,prize_value,prize_amount,chance "
+                "FROM abuse_box_prizes WHERE guild_id=?", (gid_from,)) as cur:
+                bp_rows = await cur.fetchall()
+            bp_map: dict[int, int] = {}
+            for old_id, _, bname, pt, pv, pa, pc in bp_rows:
+                c = await db.execute(
+                    "INSERT INTO abuse_box_prizes"
+                    "(guild_id,box_name,prize_type,prize_value,prize_amount,chance) "
+                    "VALUES(?,?,?,?,?,?)", (gid_to, bname, pt, pv, pa, pc))
+                bp_map[old_id] = c.lastrowid
+            copied['abuse_box_prizes'] = len(bp_rows)
+
+            async with db.execute(
+                "SELECT guild_id,box_name,prize_id "
+                "FROM rare_box_config WHERE guild_id=?", (gid_from,)) as cur:
+                rbc_rows = await cur.fetchall()
+            for _, bname, old_pid in rbc_rows:
+                try:
+                    await db.execute(
+                        "INSERT INTO rare_box_config(guild_id,box_name,prize_id) VALUES(?,?,?)",
+                        (gid_to, bname, bp_map.get(old_pid, old_pid)))
+                except Exception: pass
+            copied['rare_box_config'] = len(rbc_rows)
+
+            await db.commit()
+
+    # ── Build summary ────────────────────────────────────────────────────────
+    total = sum(copied.values())
+    lines = [f"✅ **Transfer complete:** `{gid_from}` → `{gid_to}`",
+             f"📊 **Total rows copied: {total:,}**", ""]
+    for tbl, cnt in sorted(copied.items()):
+        if cnt > 0:
+            lines.append(f"• `{tbl}`: {cnt:,}")
+    if total == 0:
+        lines.append("*(no data found in source guild)*")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# ═══════════════════════════════════════════════════════
 # RUN BOT
 # ═══════════════════════════════════════════════════════
 
