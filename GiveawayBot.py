@@ -232,6 +232,15 @@ async def setup_database():
                 guild_id INTEGER PRIMARY KEY,
                 enabled  INTEGER DEFAULT 0,
                 message  TEXT)""")
+            # ── welcome_config channel-welcome columns ─────────────────────────────
+            for _wc_col in [("channel_id",      "INTEGER DEFAULT 0"),
+                        ("channel_enabled",  "INTEGER DEFAULT 0"),
+                        ("channel_message",  "TEXT")]:
+                try:
+                    await db.execute(
+                        f"ALTER TABLE welcome_config ADD COLUMN {_wc_col[0]} {_wc_col[1]}")
+                except aiosqlite.OperationalError:
+                    pass
             await db.execute("""CREATE TABLE IF NOT EXISTS auto_giveaway_pool(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER,
@@ -770,26 +779,75 @@ async def on_message(message):
 async def on_member_join(member: discord.Member):
     if member.bot:
         return
+
+    # ── join log ──────────────────────────────────────────────────────────
+    await log_event(member.guild.id, "join", _log_embed(
+        "📥 Member Joined", discord.Color.green(),
+        Member=f"{member} ({member.mention})",
+        Account_Age=f"<t:{int(member.created_at.timestamp())}:R>",
+        ID=str(member.id),
+        Member_Count=str(member.guild.member_count)))
+
+    # ── welcome config ────────────────────────────────────────────────────
     async with get_db() as db:
         async with db.execute(
-            "SELECT enabled, message FROM welcome_config WHERE guild_id=?",
+            "SELECT enabled, message, channel_id, channel_enabled, channel_message "
+            "FROM welcome_config WHERE guild_id=?",
             (member.guild.id,)) as cur:
             row = await cur.fetchone()
-    if not row or not row[0] or not row[1]:
-        return  # disabled or not configured
-    text = (row[1]
-            .replace("{member}", member.mention)
-            .replace("{server}", member.guild.name))
-    embed = discord.Embed(description=text, color=discord.Color.blurple())
-    embed.set_author(
-        name=member.guild.name,
-        icon_url=member.guild.icon.url if member.guild.icon else None)
-    try:
-        await member.send(embed=embed, view=_WelcomeView(member.guild.name))
-    except discord.Forbidden:
-        pass  # user has DMs closed — silently skip
-    except Exception as e:
-        print(f"[Welcome] {member} / {member.guild.name}: {e}")
+
+    if not row:
+        return
+
+    dm_enabled, dm_message, ch_id, ch_enabled, ch_message = row
+
+    # ── DM welcome ────────────────────────────────────────────────────────
+    if dm_enabled and dm_message:
+        text = (dm_message
+                .replace("{member}", member.mention)
+                .replace("{server}", member.guild.name))
+        embed = discord.Embed(description=text, color=discord.Color.blurple())
+        embed.set_author(
+            name=member.guild.name,
+            icon_url=member.guild.icon.url if member.guild.icon else None)
+        try:
+            await member.send(embed=embed, view=_WelcomeView(member.guild.name))
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"[Welcome DM] {member} / {member.guild.name}: {e}")
+
+    # ── channel welcome ───────────────────────────────────────────────────
+    if ch_enabled and ch_id:
+        ch = member.guild.get_channel(ch_id)
+        if ch:
+            fallback = "Welcome {member} to **{server}**! 🎉"
+            msg_text = (ch_message or dm_message or fallback)
+            msg_text  = msg_text.replace("{member}", member.mention).replace("{server}", member.guild.name)
+            embed_ch  = discord.Embed(description=msg_text, color=discord.Color.green())
+            embed_ch.set_author(
+                name=member.guild.name,
+                icon_url=member.guild.icon.url if member.guild.icon else None)
+            embed_ch.set_thumbnail(url=member.display_avatar.url)
+            embed_ch.set_footer(text=f"Member #{member.guild.member_count}")
+            try:
+                await ch.send(member.mention, embed=embed_ch)
+            except Exception as e:
+                print(f"[Welcome Channel] {member} / {member.guild.name}: {e}")
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.bot:
+        return
+    joined = (f"<t:{int(member.joined_at.timestamp())}:R>"
+              if member.joined_at else "Unknown")
+    roles = [r.mention for r in member.roles[1:]]   # skip @everyone
+    roles_str = ", ".join(roles[:12]) + (f" +{len(roles)-12} more" if len(roles) > 12 else "")
+    await log_event(member.guild.id, "leave", _log_embed(
+        "📤 Member Left", discord.Color.orange(),
+        Member=f"{member} ({member.id})",
+        Joined=joined,
+        Roles=roles_str or "None"))
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -2823,6 +2881,139 @@ async def setwelcome(interaction: discord.Interaction):
             row = await cur.fetchone()
     await interaction.response.send_modal(
         WelcomeMessageModal(existing=row[0] if row and row[0] else ""))
+
+# ═══════════════════════════════════════════════════════
+# CHANNEL WELCOME SYSTEM
+# ═══════════════════════════════════════════════════════
+
+class WelcomeChannelModal(discord.ui.Modal, title="Set Channel Welcome Message"):
+    message_input = discord.ui.TextInput(
+        label="Welcome message (blank = use DM message or default)",
+        style=discord.TextStyle.long,
+        placeholder="Welcome to {server}, {member}! 🎉  — {member} and {server} are placeholders",
+        max_length=1800,
+        required=False)
+
+    def __init__(self, guild_id: int, channel_id: int, existing: str = ""):
+        super().__init__()
+        self.guild_id   = guild_id
+        self.channel_id = channel_id
+        if existing:
+            self.message_input.default = existing
+
+    async def on_submit(self, interaction: discord.Interaction):
+        msg = self.message_input.value.strip() or None
+        async with db_lock:
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT INTO welcome_config"
+                    "(guild_id, enabled, message, channel_id, channel_enabled, channel_message) "
+                    "VALUES(?,0,NULL,?,1,?) "
+                    "ON CONFLICT(guild_id) DO UPDATE SET "
+                    "channel_id=excluded.channel_id, "
+                    "channel_enabled=1, "
+                    "channel_message=excluded.channel_message",
+                    (self.guild_id, self.channel_id, msg))
+                await db.commit()
+        ch = interaction.guild.get_channel(self.channel_id)
+        await interaction.response.send_message(
+            f"✅ Channel welcome **enabled** in {ch.mention if ch else f'<#{self.channel_id}>'}!\n"
+            + ("Custom message saved." if msg else
+               "No custom message set — will fall back to the DM message, or a default greeting.") +
+            "\nUse `/disablewelcomechannel` to turn it off, or `/previewwelcomechannel` to preview.",
+            ephemeral=True)
+
+
+@bot.tree.command(name="setwelcomechannel",
+                  description="Set the channel for join announcements — opens a message editor")
+@app_commands.describe(channel="Channel to post welcome pings in")
+@command_enabled()
+async def setwelcomechannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute("SELECT channel_message FROM welcome_config WHERE guild_id=?",
+                              (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    existing = row[0] if row and row[0] else ""
+    await interaction.response.send_modal(
+        WelcomeChannelModal(interaction.guild.id, channel.id, existing))
+
+
+@bot.tree.command(name="disablewelcomechannel",
+                  description="Disable channel welcome pings (the channel setting is kept)")
+@command_enabled()
+async def disablewelcomechannel(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE welcome_config SET channel_enabled=0 WHERE guild_id=?",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message(
+        "🔕 Channel welcome pings disabled. Use `/setwelcomechannel` or `/enablewelcomechannel` to re-enable.")
+
+
+@bot.tree.command(name="enablewelcomechannel",
+                  description="Re-enable channel welcome pings (channel must already be set)")
+@command_enabled()
+async def enablewelcomechannel(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with get_db() as db:
+        async with db.execute("SELECT channel_id FROM welcome_config WHERE guild_id=?",
+                              (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        await interaction.response.send_message(
+            "❌ No channel configured yet. Use `/setwelcomechannel` first.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE welcome_config SET channel_enabled=1 WHERE guild_id=?",
+                (interaction.guild.id,))
+            await db.commit()
+    ch = interaction.guild.get_channel(row[0])
+    await interaction.response.send_message(
+        f"✅ Channel welcome pings re-enabled in {ch.mention if ch else '?'}.")
+
+
+@bot.tree.command(name="previewwelcomechannel",
+                  description="Preview how the channel welcome ping will look")
+@command_enabled()
+async def previewwelcomechannel(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, channel_enabled, channel_message, message "
+            "FROM welcome_config WHERE guild_id=?",
+            (interaction.guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        await interaction.response.send_message(
+            "❌ No channel welcome configured. Use `/setwelcomechannel` first.",
+            ephemeral=True); return
+    ch_id, ch_enabled, ch_message, dm_message = row
+    fallback = "Welcome {member} to **{server}**! 🎉"
+    msg_text = (ch_message or dm_message or fallback)
+    msg_text  = msg_text.replace("{member}", interaction.user.mention).replace("{server}", interaction.guild.name)
+    embed = discord.Embed(description=msg_text, color=discord.Color.green())
+    embed.set_author(
+        name=interaction.guild.name,
+        icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(text=f"Member #{interaction.guild.member_count}")
+    ch      = interaction.guild.get_channel(ch_id)
+    status  = "✅ Enabled" if ch_enabled else "🔒 Disabled"
+    source  = ("Custom message" if ch_message
+                else "Falling back to DM message" if dm_message
+                else "Default greeting")
+    await interaction.response.send_message(
+        f"📬 **Channel Welcome Preview** — Status: {status} | {source}\n"
+        f"Channel: {ch.mention if ch else '?'}\n"
+        "*(your mention is used as the example member)*",
+        embed=embed, ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
 # ADMIN ABUSE BOX SYSTEM
@@ -5345,6 +5536,39 @@ async def cmd_previewwelcome(ctx):
     await ctx.send(f"📬 **Welcome DM Preview** — Status: {status}\n*(your mention is used as example)*",
                    embed=embed, view=_WelcomeView(ctx.guild.name))
 
+@bot.command(name="setwelcomechannel")
+async def cmd_setwelcomechannel(ctx, channel: discord.TextChannel, *, message: str = None):
+    """Usage: !setwelcomechannel #channel [optional message — use {member} and {server}]"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO welcome_config"
+                "(guild_id, enabled, message, channel_id, channel_enabled, channel_message) "
+                "VALUES(?,0,NULL,?,1,?) "
+                "ON CONFLICT(guild_id) DO UPDATE SET "
+                "channel_id=excluded.channel_id, "
+                "channel_enabled=1, "
+                "channel_message=excluded.channel_message",
+                (ctx.guild.id, channel.id, message))
+            await db.commit()
+    await ctx.send(f"✅ Channel welcome enabled in {channel.mention}."
+                   + (f" Custom message saved." if message else " Using fallback message."))
+
+@bot.command(name="disablewelcomechannel")
+async def cmd_disablewelcomechannel(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await disablewelcomechannel._callback(FakeInteraction(ctx))
+
+@bot.command(name="enablewelcomechannel")
+async def cmd_enablewelcomechannel(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await enablewelcomechannel._callback(FakeInteraction(ctx))
+
+@bot.command(name="previewwelcomechannel")
+async def cmd_previewwelcomechannel(ctx):
+    await previewwelcomechannel._callback(FakeInteraction(ctx))
+
 # ── Counting ──────────────────────────────────────────────────────────────────
 
 @bot.command(name="enablecounting")
@@ -5503,6 +5727,8 @@ _LOG_CHOICES = [
     app_commands.Choice(name="🤝 Trades   — executed trades",             value="trade"),
     app_commands.Choice(name="💬 Commands — every slash command used",    value="command"),
     app_commands.Choice(name="⚙️ Admin    — all admin-only actions",      value="admin"),
+    app_commands.Choice(name="📥 Join    — member joined the server",    value="join"),
+    app_commands.Choice(name="📤 Leave   — member left / was kicked",    value="leave"),
 ]
 
 async def log_event(guild_id: int, log_type: str, embed: discord.Embed):
