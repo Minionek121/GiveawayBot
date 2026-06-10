@@ -43,6 +43,9 @@ LEVEL_DIVISOR       = 700
 BOT_OWNER_ID = 906291437895843901
 COUNTING_BOT_ID      = 510016054391734273
 _COUNTING_FAIL_EMOJI = frozenset({'❌', '⚠️', '⚠'})
+# {(guild_id, channel_id): {role_id: allowed_bool}}
+# role_id 0 means the "everyone" rule for that channel
+prefix_channel_rules: dict[tuple[int, int], dict[int, bool]] = {}
 
 def is_owner(uid: int) -> bool:
     return uid == BOT_OWNER_ID
@@ -365,6 +368,12 @@ async def setup_database():
                 await db.execute("ALTER TABLE game_config ADD COLUMN hint_delays TEXT")
             except aiosqlite.OperationalError:
                 pass
+            await db.execute("""CREATE TABLE IF NOT EXISTS prefix_restrictions(
+                guild_id INTEGER,
+                channel_id INTEGER,
+                role_id INTEGER,   -- 0 = "everyone" default for this channel
+                allowed INTEGER DEFAULT 0,
+                PRIMARY KEY(guild_id, channel_id, role_id))""")
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
             await db.execute("""CREATE TABLE IF NOT EXISTS bot_config(
                 key TEXT PRIMARY KEY, value TEXT)""")
@@ -751,6 +760,8 @@ async def on_message(message):
                     gained = max(0, int(gained * (1 + total_boost / 100)))
         await add_exp(message.guild.id, message.author.id, gained)
         last_message_exp[key] = now
+    if message.content.startswith(_BOT_PREFIX) and not _prefix_channel_allowed(message):
+        return   # prefix commands are blocked for this author in this channel
     await bot.process_commands(message)
 
 # WELCOME MESSAGE
@@ -880,6 +891,7 @@ async def on_ready():
     await setup_database()
     await _load_prefix()
     await load_disabled_commands()   # ← restore persisted disabled commands
+    await load_prefix_restrictions()
     # Resume any auto giveaway loops that were running before the restart
     async with get_db() as db:
         async with db.execute(
@@ -2010,6 +2022,75 @@ async def _is_allowed_ctx(ctx: commands.Context) -> bool:
                 rows = await cur.fetchall()
     allowed = {r[0] for r in rows}
     return any(role.id in allowed for role in ctx.author.roles)
+
+async def load_prefix_restrictions():
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT guild_id,channel_id,role_id,allowed FROM prefix_restrictions") as cur:
+            for gid, cid, rid, allowed in await cur.fetchall():
+                key = (gid, cid)
+                if key not in prefix_channel_rules:
+                    prefix_channel_rules[key] = {}
+                prefix_channel_rules[key][rid] = bool(allowed)
+    total = sum(len(v) for v in prefix_channel_rules.values())
+    if total:
+        print(f"[PrefixRules] Loaded {total} rule(s) across {len(prefix_channel_rules)} channel(s)")
+
+
+def _prefix_channel_allowed(message: discord.Message) -> bool:
+    """True if this author may use prefix commands in this channel."""
+    if not message.guild:
+        return True
+    if message.author.id == BOT_OWNER_ID:
+        return True
+    key   = (message.guild.id, message.channel.id)
+    rules = prefix_channel_rules.get(key, {})
+    if not rules:
+        return True
+    user_role_ids = (
+        {role.id for role in message.author.roles}
+        if isinstance(message.author, discord.Member) else set()
+    )
+    # Any explicitly-allowed role wins over everything else
+    for rid in user_role_ids:
+        if rules.get(rid) is True:
+            return True
+    # Check blocking rules
+    if rules.get(0) is False:           # everyone is blocked
+        return False
+    for rid in user_role_ids:           # a specific role of this user is blocked
+        if rules.get(rid) is False:
+            return False
+    return True
+
+
+async def _do_reset(guild_id: int, user_id: int, reset_type: str):
+    """Wipe one or all data categories for a single user in a guild."""
+    async with db_lock:
+        async with get_db() as db:
+            if reset_type in ("balance", "all"):
+                await db.execute(
+                    "UPDATE balances SET balance=0 WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id))
+            if reset_type in ("exp", "all"):
+                await db.execute(
+                    "DELETE FROM exp_history WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id))
+            if reset_type in ("inventory", "all"):
+                await db.execute(
+                    "DELETE FROM inventory WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id))
+            if reset_type in ("tickets", "all"):
+                await db.execute(
+                    "UPDATE raffle SET tickets=0 WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id))
+            if reset_type in ("stats", "all"):
+                await db.execute(
+                    "UPDATE user_stats SET total_exp=0, gifted_balance=0, "
+                    "chests_opened=0, raffle_tickets_bought=0 "
+                    "WHERE guild_id=? AND user_id=?",
+                    (guild_id, user_id))
+            await db.commit()
 
 _UNDISABLEABLE = {"disablecmd", "enablecmd", "listcmds"}
 
@@ -6787,6 +6868,204 @@ async def transfer(interaction: discord.Interaction,
         lines.append("*(no data found in source guild)*")
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# ═══════════════════════════════════════════════════════
+# RESET COMMANDS
+# ═══════════════════════════════════════════════════════
+
+_RESET_TYPE_CHOICES = [
+    app_commands.Choice(name="Balance",                                      value="balance"),
+    app_commands.Choice(name="EXP (all history — rank + usable)",            value="exp"),
+    app_commands.Choice(name="Inventory (items, boxes, keys, tokens)",        value="inventory"),
+    app_commands.Choice(name="Raffle Tickets",                               value="tickets"),
+    app_commands.Choice(name="Leaderboard Stats (total EXP stat, chests…)",  value="stats"),
+    app_commands.Choice(name="Everything (all of the above)",                value="all"),
+]
+
+@bot.tree.command(name="resetuser", description="Wipe a user's data in this server")
+@app_commands.describe(user="User to reset", reset_type="What to wipe")
+@app_commands.choices(reset_type=_RESET_TYPE_CHOICES)
+@command_enabled()
+async def resetuser(interaction: discord.Interaction,
+                    user: discord.Member, reset_type: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await _do_reset(interaction.guild.id, user.id, reset_type)
+    label = next(c.name for c in _RESET_TYPE_CHOICES if c.value == reset_type)
+    await interaction.response.send_message(f"🗑 Reset **{label}** for {user.mention}.")
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "🗑 User Reset", discord.Color.red(),
+        By=interaction.user.mention, User=user.mention, Type=reset_type))
+
+
+@bot.tree.command(name="resetrole", description="Wipe data for every member with a role")
+@app_commands.describe(role="Role whose members get reset", reset_type="What to wipe")
+@app_commands.choices(reset_type=_RESET_TYPE_CHOICES)
+@command_enabled()
+async def resetrole(interaction: discord.Interaction,
+                    role: discord.Role, reset_type: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+    members = [m for m in interaction.guild.members if role in m.roles and not m.bot]
+    if not members:
+        await interaction.followup.send(f"❌ No non-bot members with {role.mention}."); return
+    for m in members:
+        await _do_reset(interaction.guild.id, m.id, reset_type)
+    label = next(c.name for c in _RESET_TYPE_CHOICES if c.value == reset_type)
+    await interaction.followup.send(
+        f"🗑 Reset **{label}** for **{len(members)}** member(s) with {role.mention}.")
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "🗑 Role Reset", discord.Color.red(),
+        By=interaction.user.mention, Role=role.name,
+        Members=str(len(members)), Type=reset_type))
+
+
+# ═══════════════════════════════════════════════════════
+# PREFIX CHANNEL RESTRICTIONS
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="disableprefixchannel",
+                  description="Block prefix commands in a channel for everyone or a specific role")
+@app_commands.describe(
+    channel="Channel to restrict",
+    role="Role to block (leave empty to block everyone in this channel)"
+)
+@command_enabled()
+async def disableprefixchannel(interaction: discord.Interaction,
+                                channel: discord.TextChannel,
+                                role: discord.Role = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    gid, cid, rid = interaction.guild.id, channel.id, (role.id if role else 0)
+    key = (gid, cid)
+    prefix_channel_rules.setdefault(key, {})[rid] = False
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO prefix_restrictions VALUES(?,?,?,?)",
+                (gid, cid, rid, 0))
+            await db.commit()
+    target = role.mention if role else "everyone"
+    await interaction.response.send_message(
+        f"🔒 Prefix commands disabled in {channel.mention} for **{target}**.\n"
+        f"Use `/enableprefixchannel` to grant specific roles a bypass.")
+
+
+@bot.tree.command(name="enableprefixchannel",
+                  description="Let a role use prefix commands in a channel, even if it's blocked for others")
+@app_commands.describe(
+    channel="Channel to allow prefix in",
+    role="Role to allow (their allowed status overrides any block)"
+)
+@command_enabled()
+async def enableprefixchannel(interaction: discord.Interaction,
+                               channel: discord.TextChannel,
+                               role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    gid, cid, rid = interaction.guild.id, channel.id, role.id
+    key = (gid, cid)
+    prefix_channel_rules.setdefault(key, {})[rid] = True
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO prefix_restrictions VALUES(?,?,?,?)",
+                (gid, cid, rid, 1))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ {role.mention} can use prefix commands in {channel.mention}, "
+        f"even if the channel is blocked for everyone else.")
+
+
+@bot.tree.command(name="resetprefixchannel",
+                  description="Remove all prefix-command restrictions from a channel")
+@app_commands.describe(channel="Channel whose restrictions to clear")
+@command_enabled()
+async def resetprefixchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    key = (interaction.guild.id, channel.id)
+    prefix_channel_rules.pop(key, None)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM prefix_restrictions WHERE guild_id=? AND channel_id=?",
+                (interaction.guild.id, channel.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🔓 All prefix restrictions removed from {channel.mention}.")
+
+
+@bot.tree.command(name="listprefixchannels",
+                  description="Show all prefix-command channel restrictions in this server")
+@command_enabled()
+async def listprefixchannels(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id,role_id,allowed FROM prefix_restrictions "
+            "WHERE guild_id=? ORDER BY channel_id,role_id",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("✅ No prefix restrictions configured."); return
+    embed = discord.Embed(title="🔒 Prefix Command Restrictions", color=discord.Color.orange())
+    channels: dict[int, list] = {}
+    for cid, rid, allowed in rows:
+        channels.setdefault(cid, []).append((rid, bool(allowed)))
+    for cid, rules in channels.items():
+        ch    = interaction.guild.get_channel(cid)
+        lines = []
+        for rid, allowed in sorted(rules):
+            icon   = "✅" if allowed else "🔒"
+            if rid == 0:
+                target = "@everyone"
+            else:
+                r      = interaction.guild.get_role(rid)
+                target = r.mention if r else f"<@&{rid}>"
+            lines.append(f"{icon} {target}")
+        embed.add_field(
+            name=ch.mention if ch else f"<#{cid}>",
+            value="\n".join(lines),
+            inline=False)
+    await interaction.response.send_message(embed=embed)
+
+# ── Reset ─────────────────────────────────────────────────────────────────────
+
+@bot.command(name="resetuser")
+async def pfx_resetuser(ctx, user: discord.Member, reset_type: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if reset_type not in {c.value for c in _RESET_TYPE_CHOICES}:
+        await ctx.send(f"❌ Valid types: {', '.join(c.value for c in _RESET_TYPE_CHOICES)}"); return
+    await resetuser._callback(FakeInteraction(ctx), user, reset_type)
+
+@bot.command(name="resetrole")
+async def pfx_resetrole(ctx, role: discord.Role, reset_type: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    if reset_type not in {c.value for c in _RESET_TYPE_CHOICES}:
+        await ctx.send(f"❌ Valid types: {', '.join(c.value for c in _RESET_TYPE_CHOICES)}"); return
+    await resetrole._callback(FakeInteraction(ctx), role, reset_type)
+
+# ── Prefix channel restrictions ───────────────────────────────────────────────
+
+@bot.command(name="disableprefixchannel")
+async def pfx_disableprefixchannel(ctx, channel: discord.TextChannel, role: discord.Role = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await disableprefixchannel._callback(FakeInteraction(ctx), channel, role)
+
+@bot.command(name="enableprefixchannel")
+async def pfx_enableprefixchannel(ctx, channel: discord.TextChannel, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await enableprefixchannel._callback(FakeInteraction(ctx), channel, role)
+
+@bot.command(name="resetprefixchannel")
+async def pfx_resetprefixchannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await resetprefixchannel._callback(FakeInteraction(ctx), channel)
+
+@bot.command(name="listprefixchannels")
+async def pfx_listprefixchannels(ctx):
+    await listprefixchannels._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
 # RUN BOT
