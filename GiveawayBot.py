@@ -383,6 +383,43 @@ async def setup_database():
                 role_id INTEGER,   -- 0 = "everyone" default for this channel
                 allowed INTEGER DEFAULT 0,
                 PRIMARY KEY(guild_id, channel_id, role_id))""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS counting_state(
+                guild_id INTEGER PRIMARY KEY,
+                current_count INTEGER DEFAULT 0,
+                last_user_id INTEGER DEFAULT 0,
+                last_message_id INTEGER DEFAULT 0,
+                record INTEGER DEFAULT 0,
+                notify_message_id INTEGER DEFAULT 0)""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS counting_bans(
+                guild_id INTEGER,
+                user_id INTEGER,
+                unban_time INTEGER,
+                PRIMARY KEY(guild_id, user_id))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS verification_config(
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0,
+                verified_role_id INTEGER DEFAULT 0,
+                unverified_role_id INTEGER DEFAULT 0,
+                message TEXT)""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_entry_roles(
+                guild_id INTEGER,
+                role_id INTEGER,
+                PRIMARY KEY(guild_id, role_id))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_entry_users(
+                guild_id INTEGER,
+                user_id INTEGER,
+                enabled INTEGER DEFAULT 1,
+                PRIMARY KEY(guild_id, user_id))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS chest_channel_config(
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0)""")
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
             await db.execute("""CREATE TABLE IF NOT EXISTS bot_config(
                 key TEXT PRIMARY KEY, value TEXT)""")
@@ -470,7 +507,198 @@ async def add_stat(guild_id: int, user_id: int, column: str, amount: int):
 
 # --- COUNTING STUFF -----------------------------
 
+import ast
 import math as _math
+
+def _eval_counting_expr(expr: str) -> float | None:
+    """Safely evaluate a counting math expression. Returns float or None if invalid."""
+    if len(expr) > 60:
+        return None
+    expr = expr.replace('^', '**')
+    try:
+        tree = ast.parse(expr.strip(), mode='eval')
+    except SyntaxError:
+        return None
+    _ALLOWED = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Num,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.FloorDiv, ast.Mod,
+        ast.USub, ast.UAdd, ast.Call, ast.Name, ast.Load,
+    )
+    _ALLOWED_NAMES = {'sqrt', 'abs', 'floor', 'ceil', 'pi', 'e'}
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED):
+            return None
+        if isinstance(node, ast.Name) and node.id not in _ALLOWED_NAMES:
+            return None
+        if isinstance(node, ast.Call):
+            if not (isinstance(node.func, ast.Name) and node.func.id in _ALLOWED_NAMES):
+                return None
+    ns = {
+        '__builtins__': {},
+        'sqrt': _math.sqrt, 'abs': abs,
+        'floor': _math.floor, 'ceil': _math.ceil,
+        'pi': _math.pi, 'e': _math.e,
+    }
+    try:
+        result = eval(compile(tree, '<string>', 'eval'), ns)
+        return float(result)
+    except Exception:
+        return None
+
+def _is_int_like(val: float) -> bool:
+    try:
+        return abs(val - round(val)) < 1e-9 and 0 < val < 1e15
+    except (OverflowError, ValueError):
+        return False
+
+async def _counting_break(message: discord.Message, broken_at: int, double: bool = False):
+    """React, ban the counter for 1 h, reset the count, send the break message."""
+    gid  = message.guild.id
+    user = message.author
+    try: await message.add_reaction("❌")
+    except Exception: pass
+
+    unban_ts = int((datetime.now(UTC) + timedelta(hours=1)).timestamp())
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO counting_state(guild_id) VALUES(?)", (gid,))
+            await db.execute(
+                "UPDATE counting_state SET current_count=0, last_user_id=0, "
+                "last_message_id=0, notify_message_id=0 WHERE guild_id=?", (gid,))
+            await db.execute(
+                "INSERT OR REPLACE INTO counting_bans(guild_id, user_id, unban_time) "
+                "VALUES(?,?,?)", (gid, user.id, unban_ts))
+            await db.commit()
+
+    if double:
+        text = (f"❌ {user.mention} counted twice in a row and broke the count at **{broken_at}**! "
+                f"They are banned from counting for 1 hour. Counting restarts from **1**.")
+    else:
+        text = (f"❌ {user.mention} broke the count at **{broken_at}**! "
+                f"They are banned from counting for 1 hour. Counting restarts from **1**.")
+    try: await message.channel.send(text)
+    except Exception: pass
+
+async def _process_counting(message: discord.Message):
+    """Handle built-in counting logic for a message."""
+    if not message.guild:
+        return
+
+    # Check if counting is enabled and this is the counting channel
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled, channel_id, announce_channel_id "
+            "FROM counting_config WHERE guild_id=?", (message.guild.id,)) as cur:
+            cfg = await cur.fetchone()
+    if not cfg or not cfg[0] or not cfg[1]:
+        return
+    _, ch_id, ann_ch_id = cfg
+    if message.channel.id != ch_id:
+        return
+
+    # Get text before the first space
+    raw = message.content.strip()
+    if not raw:
+        return
+    text = raw.split()[0]
+
+    val = _eval_counting_expr(text)
+    if val is None or not _is_int_like(val):
+        return  # Not a valid integer expression — skip silently
+
+    num = round(val)
+
+    # Fetch current counting state
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT current_count, last_user_id, last_message_id, record, notify_message_id "
+            "FROM counting_state WHERE guild_id=?", (message.guild.id,)) as cur:
+            state = await cur.fetchone()
+
+    if not state:
+        async with db_lock:
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO counting_state(guild_id) VALUES(?)",
+                    (message.guild.id,))
+                await db.commit()
+        cur_count, last_uid, last_msg_id, record, notify_msg_id = 0, 0, 0, 0, 0
+    else:
+        cur_count, last_uid, last_msg_id, record, notify_msg_id = state
+
+    # Check ban
+    now_ts = int(datetime.now(UTC).timestamp())
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT unban_time FROM counting_bans WHERE guild_id=? AND user_id=?",
+            (message.guild.id, message.author.id)) as cur:
+            ban_row = await cur.fetchone()
+    if ban_row and ban_row[0] > now_ts:
+        return  # Silently ignore banned user
+
+    if num == cur_count + 1:
+        if message.author.id == last_uid:
+            await _counting_break(message, cur_count, double=True)
+        else:
+            # Valid count!
+            new_record = max(record, num)
+            async with db_lock:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE counting_state SET current_count=?, last_user_id=?, "
+                        "last_message_id=?, record=?, notify_message_id=0 WHERE guild_id=?",
+                        (num, message.author.id, message.id, new_record, message.guild.id))
+                    await db.commit()
+
+            # React
+            try:
+                if num == 100:
+                    await message.add_reaction("💯")
+                elif num > record:          # new record
+                    await message.add_reaction("☑️")
+                else:
+                    await message.add_reaction("✅")
+            except Exception:
+                pass
+
+            # Give prizes if a pool is configured
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT id, prize_type, prize_value, prize_amount, weight_formula "
+                    "FROM counting_prizes WHERE guild_id=?", (message.guild.id,)) as cur:
+                    pool = await cur.fetchall()
+            if pool:
+                weights = [max(1e-9, _eval_weight(r[4], num)) for r in pool]
+                chosen  = random.choices(pool, weights=weights, k=1)[0]
+                _, p_type, p_value, p_amount, _ = chosen
+                prize_desc = await _give_counting_prize(
+                    message.guild.id, message.author.id, p_type, p_value, p_amount)
+
+                async with get_db() as db:
+                    async with db.execute(
+                        "SELECT prize_type, prize_value, prize_amount, label "
+                        "FROM counting_special_prizes WHERE guild_id=? AND number=?",
+                        (message.guild.id, num)) as cur:
+                        specials = await cur.fetchall()
+                special_parts = []
+                for sp_type, sp_value, sp_amount, sp_label in specials:
+                    sp_desc = await _give_counting_prize(
+                        message.guild.id, message.author.id, sp_type, sp_value, sp_amount)
+                    special_parts.append(sp_label or sp_desc)
+
+                if prize_desc or special_parts:
+                    ann_ch = bot.get_channel(ann_ch_id or ch_id)
+                    if ann_ch:
+                        lines = ([f"🎉 {message.author.mention} counted **{num:,}** and won **{prize_desc}**!"]
+                                 if prize_desc else
+                                 [f"🎉 {message.author.mention} counted **{num:,}**!"])
+                        for sp in special_parts:
+                            lines.append(f"✨ **Special prize:** {sp}!")
+                        try: await ann_ch.send("\n".join(lines))
+                        except Exception: pass
+    else:
+        await _counting_break(message, cur_count, double=False)
 
 def _eval_weight(formula: str, n: int) -> float:
     """Evaluate a weight formula where {n} is the count number. Returns ≥ 0."""
@@ -743,6 +971,7 @@ async def on_message(message):
                 session["winner"] = message.author
                 if "event" in session:
                     session["event"].set()
+        await _process_counting(message)
     now = datetime.now().timestamp()
     key = (message.guild.id, message.author.id)
     last_time = last_message_exp.get(key, 0)
@@ -834,6 +1063,19 @@ async def on_member_join(member: discord.Member):
                 await ch.send(member.mention, embed=embed_ch)
             except Exception as e:
                 print(f"[Welcome Channel] {member} / {member.guild.name}: {e}")
+    # ── Verification: assign unverified role ──────────────────────────────────
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT unverified_role_id FROM verification_config WHERE guild_id=?",
+            (member.guild.id,)) as cur:
+            ver_cfg = await cur.fetchone()
+    if ver_cfg and ver_cfg[0]:
+        unver_role = member.guild.get_role(ver_cfg[0])
+        if unver_role:
+            try:
+                await member.add_roles(unver_role, reason="Verification: new member")
+            except Exception as e:
+                print(f"[Verification] {member} / {member.guild.name}: {e}")
 
 @bot.event
 async def on_member_remove(member: discord.Member):
@@ -940,6 +1182,50 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         except Exception:
             pass
 
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if not payload.guild_id:
+        return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id FROM counting_config WHERE guild_id=? AND enabled=1",
+            (payload.guild_id,)) as cur:
+            cfg = await cur.fetchone()
+    if not cfg or cfg[0] != payload.channel_id:
+        return
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT current_count, last_message_id, notify_message_id "
+            "FROM counting_state WHERE guild_id=?", (payload.guild_id,)) as cur:
+            state = await cur.fetchone()
+    if not state:
+        return
+    cur_count, last_msg_id, notify_msg_id = state
+
+    channel = bot.get_channel(payload.channel_id)
+    if not channel or cur_count == 0:
+        return
+
+    async def _resend_notify():
+        try:
+            notify = await channel.send(
+                f"🗑️ **{cur_count}** was the last number but was deleted. "
+                f"The next number is **{cur_count + 1}**.")
+            async with db_lock:
+                async with get_db() as db:
+                    await db.execute(
+                        "UPDATE counting_state SET notify_message_id=? WHERE guild_id=?",
+                        (notify.id, payload.guild_id))
+                    await db.commit()
+        except Exception:
+            pass
+
+    if payload.message_id == last_msg_id:
+        await _resend_notify()
+    elif notify_msg_id and payload.message_id == notify_msg_id:
+        await _resend_notify()  # Bot's own notify was deleted — resend it
+
 # ═══════════════════════════════════════════════════════
 # READY EVENT
 # ═══════════════════════════════════════════════════════
@@ -950,6 +1236,27 @@ async def on_ready():
     await _load_prefix()
     await load_disabled_commands()   # ← restore persisted disabled commands
     await load_prefix_restrictions()
+    # Register persistent views (must happen before any interaction can fire)
+    bot.add_view(VerificationView())
+    bot.add_view(ChestChannelView())
+
+    # Restore verification embeds and chest panels for all guilds
+    for _guild in bot.guilds:
+        # Verification
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT channel_id FROM verification_config WHERE guild_id=?",
+                (_guild.id,)) as cur:
+                _ver = await cur.fetchone()
+        if _ver and _ver[0]:
+            _vch = bot.get_channel(_ver[0])
+            if _vch:
+                try: await _post_verification_embed(_guild, _vch)
+                except Exception as e: print(f"[Verification restore] {_guild.name}: {e}")
+
+        # Chest panel
+        try: await _refresh_chest_channel(_guild)
+        except Exception as e: print(f"[ChestPanel restore] {_guild.name}: {e}")
     # Resume any auto giveaway loops that were running before the restart
     async with get_db() as db:
         async with db.execute(
@@ -1253,6 +1560,22 @@ async def end_giveaway(message_id, reroll=False):
         if not member: continue
         if required_role and required_role not in {r.id for r in member.roles}: continue
         users.append(user)
+    # ── Auto-entry: include opted-in users ─────────────────────────────────────
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT user_id FROM auto_entry_users WHERE guild_id=? AND enabled=1",
+            (channel.guild.id,)) as cur:
+            auto_uids = {r[0] for r in await cur.fetchall()}
+    existing_uids = {u.id for u in users}
+    for auid in auto_uids:
+        if auid in existing_uids:
+            continue
+        ae_member = channel.guild.get_member(auid)
+        if not ae_member or ae_member.bot:
+            continue
+        if required_role and required_role not in {r.id for r in ae_member.roles}:
+            continue
+        users.append(ae_member)
     if not users:
         await channel.send("No valid participants."); return
 
@@ -2233,6 +2556,461 @@ async def disablesystem(interaction: discord.Interaction, system: str):
     await set_system_flag(interaction.guild.id, system, False)
     await interaction.response.send_message(f"🔒 **{_SYSTEM_LABELS[system]}** is now **disabled**.")
 
+# --- CHEST EMBED -------------------------------------
+
+async def _build_chest_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="📦 Chest Shop",
+        description="Open chests to win prizes! Results are only visible to you.",
+        color=discord.Color.purple())
+
+    for chest_type, label, cost_str in [
+        ("chest",    "📦 EXP Chest",  "Cost: 1,000 EXP"),
+        ("vipchest", "💎 VIP Chest",  "Cost: 1 VIP Key"),
+    ]:
+        prizes  = await get_chest_prizes(guild.id, chest_type)
+        total_w = sum(p["chance"] for p in prizes) or 1
+        lines   = []
+        for p in prizes:
+            pct  = p["chance"] / total_w * 100
+            desc = []
+            if p["exp"] > 0:     desc.append(f"⭐ {p['exp']:,} EXP")
+            if p["balance"] > 0: desc.append(f"💰 {p['balance']:,} coins")
+            if not desc:         desc.append("✨ Special")
+            lines.append(f"• **{p['name']}** — {', '.join(desc)} — {pct:.1f}%")
+        embed.add_field(
+            name=f"{label} ({cost_str})",
+            value="\n".join(lines) or "*No prizes configured*",
+            inline=False)
+
+    embed.set_footer(text="Use the buttons below • responses are only visible to you")
+    return embed
+
+
+async def _refresh_chest_channel(guild: discord.Guild):
+    """Update the chest embed in the configured channel."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM chest_channel_config WHERE guild_id=?",
+            (guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return
+    ch_id, msg_id = row
+    channel = bot.get_channel(ch_id)
+    if not channel:
+        return
+    embed = await _build_chest_embed(guild)
+    view  = ChestChannelView()
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=view)
+            return
+        except discord.NotFound:
+            pass
+    new_msg = await channel.send(embed=embed, view=view)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE chest_channel_config SET message_id=? WHERE guild_id=?",
+                (new_msg.id, guild.id))
+            await db.commit()
+
+
+class ChestChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="⭐ My EXP", style=discord.ButtonStyle.secondary,
+                       custom_id="chest_panel:check_exp")
+    async def check_exp(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        gid  = interaction.guild.id
+        uid  = interaction.user.id
+        exp  = await get_exp(gid, uid)
+        lvl  = await get_level(gid, uid)
+        embed = discord.Embed(
+            title=f"⭐ {interaction.user.display_name}'s EXP",
+            color=discord.Color.gold())
+        embed.add_field(name="Activity Rank",     value=str(lvl),              inline=True)
+        embed.add_field(name="Usable EXP",        value=f"{exp:,}",            inline=True)
+        embed.add_field(name="Chests Available",  value=f"{exp // CHEST_COST}", inline=True)
+        inv  = await inventory_get(gid, uid)
+        keys = next((q for n, q in inv if n == VIP_CHEST_KEY), 0)
+        embed.add_field(name="VIP Keys",          value=str(keys),             inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📦 Open EXP Chest", style=discord.ButtonStyle.primary,
+                       custom_id="chest_panel:open_exp")
+    async def open_exp(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        gid = interaction.guild.id
+        uid = interaction.user.id
+        exp = await get_exp(gid, uid)
+        if exp < CHEST_COST:
+            await interaction.followup.send(
+                f"❌ You need {CHEST_COST:,} EXP (you have {exp:,}).",
+                ephemeral=True); return
+
+        prizes     = await get_chest_prizes(gid, "chest")
+        rare_names = await get_rare_chest_names(gid, "chest")
+        prize      = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
+        await _add_chest_spending(gid, uid, CHEST_COST)
+        if prize["balance"] > 0: await add_balance(gid, uid, prize["balance"])
+        if prize["exp"] > 0:     await add_exp(gid, uid, prize["exp"])
+        await add_stat(gid, uid, "chests_opened", 1)
+
+        embed = discord.Embed(
+            title="📦 Chest Result",
+            description=f"• **{prize['name']}**",
+            color=discord.Color.purple())
+        embed.set_footer(text=f"Cost: {CHEST_COST:,} EXP | Remaining: {exp - CHEST_COST:,} EXP")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await log_event(gid, "chest", _log_embed("📦 Chest Opened (Panel)", discord.Color.purple(),
+            User=interaction.user.mention, Cost=f"{CHEST_COST:,} EXP"))
+
+        if prize["name"] in rare_names:
+            rcid = await get_rare_drop_channel(gid)
+            if rcid:
+                rc = bot.get_channel(rcid)
+                if rc:
+                    re = discord.Embed(title="🌟 Rare Drop!",
+                        description=f"{interaction.user.mention} got **{prize['name']}** from a chest! 🎉",
+                        color=discord.Color.gold())
+                    re.set_thumbnail(url=interaction.user.display_avatar.url)
+                    await rc.send(embed=re)
+
+    @discord.ui.button(label="💎 Open VIP Chest", style=discord.ButtonStyle.success,
+                       custom_id="chest_panel:open_vip")
+    async def open_vip(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        gid = interaction.guild.id
+        uid = interaction.user.id
+
+        if not await is_system_enabled(gid, "vipkey"):
+            await interaction.followup.send("❌ VIP chest system is disabled.", ephemeral=True); return
+
+        inv  = await inventory_get(gid, uid)
+        keys = next((q for n, q in inv if n.lower() == VIP_CHEST_KEY.lower()), 0)
+        if keys < 1:
+            await interaction.followup.send(
+                f"❌ You need 1 **{VIP_CHEST_KEY}** (Nitro Boosters get one daily!).",
+                ephemeral=True); return
+        if not await inventory_remove(gid, uid, VIP_CHEST_KEY, 1):
+            await interaction.followup.send("❌ Failed to consume key.", ephemeral=True); return
+
+        prizes     = await get_chest_prizes(gid, "vipchest")
+        rare_names = await get_rare_chest_names(gid, "vipchest")
+        prize      = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
+        if prize["balance"] > 0: await add_balance(gid, uid, prize["balance"])
+        if prize["exp"] > 0:     await add_exp(gid, uid, prize["exp"])
+
+        embed = discord.Embed(
+            title="💎 VIP Chest Result",
+            description=f"• **{prize['name']}**",
+            color=discord.Color.from_rgb(148, 0, 211))
+        embed.set_footer(text=f"1 VIP Key consumed | {keys - 1} key(s) remaining")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await log_event(gid, "chest", _log_embed("💎 VIP Chest Opened (Panel)",
+            discord.Color.from_rgb(148, 0, 211),
+            User=interaction.user.mention, Keys_Used="1"))
+
+        if prize["name"] in rare_names:
+            rcid = await get_rare_drop_channel(gid)
+            if rcid:
+                rc = bot.get_channel(rcid)
+                if rc:
+                    re = discord.Embed(title="💎 VIP Rare Drop!",
+                        description=f"{interaction.user.mention} got **{prize['name']}** from a VIP Chest! 👑",
+                        color=discord.Color.from_rgb(148, 0, 211))
+                    re.set_thumbnail(url=interaction.user.display_avatar.url)
+                    await rc.send(embed=re)
+
+@bot.tree.command(name="setchestchannel",
+                  description="Post the chest panel embed in a channel (updates on restart)")
+@app_commands.describe(channel="Channel to post the panel in")
+@command_enabled()
+async def setchestchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+    gid = interaction.guild.id
+
+    # Delete old panel if it was in a different channel
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM chest_channel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            old = await cur.fetchone()
+    if old and old[0] and old[0] != channel.id and old[1]:
+        old_ch = bot.get_channel(old[0])
+        if old_ch:
+            try: await (await old_ch.fetch_message(old[1])).delete()
+            except Exception: pass
+
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO chest_channel_config(guild_id, channel_id, message_id) VALUES(?,?,0) "
+                "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=0",
+                (gid, channel.id))
+            await db.commit()
+
+    await _refresh_chest_channel(interaction.guild)
+    await interaction.followup.send(f"✅ Chest panel posted in {channel.mention}.")
+
+@bot.command(name="setchestchannel")
+async def pfx_setchestchannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setchestchannel._callback(FakeInteraction(ctx), channel)
+
+# --- VERIFICATION --------------------------------------
+
+class VerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ Verify", style=discord.ButtonStyle.green,
+                       custom_id="verification:verify")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT verified_role_id, unverified_role_id "
+                "FROM verification_config WHERE guild_id=?",
+                (interaction.guild.id,)) as cur:
+                cfg = await cur.fetchone()
+        if not cfg:
+            await interaction.response.send_message(
+                "❌ Verification is not configured.", ephemeral=True); return
+
+        verified_rid, unverified_rid = cfg
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member:
+            await interaction.response.send_message("❌ Member not found.", ephemeral=True); return
+
+        try:
+            if unverified_rid:
+                role = interaction.guild.get_role(unverified_rid)
+                if role and role in member.roles:
+                    await member.remove_roles(role, reason="Verification")
+            if verified_rid:
+                role = interaction.guild.get_role(verified_rid)
+                if role and role not in member.roles:
+                    await member.add_roles(role, reason="Verification")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Bot lacks permission to manage roles.", ephemeral=True); return
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True); return
+
+        await interaction.response.send_message(
+            "✅ Verified! Welcome to the server.", ephemeral=True)
+
+async def _post_verification_embed(guild: discord.Guild, channel: discord.TextChannel):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT message_id, message FROM verification_config WHERE guild_id=?",
+            (guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return
+    msg_id, msg_text = row
+    embed = discord.Embed(
+        title="✅ Verification",
+        description=msg_text or "Click the button below to verify and access the server!",
+        color=discord.Color.green())
+    embed.set_footer(text=f"{guild.name} • Click the button to verify")
+    view = VerificationView()
+
+    if msg_id:
+        try:
+            existing = await channel.fetch_message(msg_id)
+            await existing.edit(embed=embed, view=view)
+            return
+        except discord.NotFound:
+            pass
+
+    new_msg = await channel.send(embed=embed, view=view)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE verification_config SET message_id=? WHERE guild_id=?",
+                (new_msg.id, guild.id))
+            await db.commit()
+
+# ═══════════════════════════════════════════════════════
+# VERIFICATION SYSTEM
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="setverification",
+                  description="Set up the verification system and post the verification embed")
+@app_commands.describe(
+    channel="Channel where the verify button will be posted",
+    verified_role="Role to give when verified (optional)",
+    unverified_role="Role new members get that restricts access until they verify (optional)",
+    message="Custom message text shown in the embed"
+)
+@command_enabled()
+async def setverification(interaction: discord.Interaction,
+                           channel: discord.TextChannel,
+                           verified_role: discord.Role = None,
+                           unverified_role: discord.Role = None,
+                           message: str = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+    gid = interaction.guild.id
+    msg_text = message or "Click the button below to verify and access the server!"
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO verification_config"
+                "(guild_id, channel_id, verified_role_id, unverified_role_id, message) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
+                "channel_id=excluded.channel_id, verified_role_id=excluded.verified_role_id, "
+                "unverified_role_id=excluded.unverified_role_id, message=excluded.message",
+                (gid, channel.id,
+                 verified_role.id if verified_role else 0,
+                 unverified_role.id if unverified_role else 0,
+                 msg_text))
+            await db.commit()
+    await _post_verification_embed(interaction.guild, channel)
+    lines = [f"✅ Verification embed posted in {channel.mention}."]
+    if verified_role:
+        lines.append(f"Gives **{verified_role.name}** on verify.")
+    if unverified_role:
+        lines.append(f"Removes **{unverified_role.name}** on verify — assign it to new members "
+                     f"and restrict channel access via Discord permissions.")
+    await interaction.followup.send("\n".join(lines))
+
+@bot.tree.command(name="disableverification", description="Disable the verification system")
+@command_enabled()
+async def disableverification(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM verification_config WHERE guild_id=?", (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("🗑 Verification system disabled.")
+
+# ═══════════════════════════════════════════════════════
+# AUTO-ENTRY GIVEAWAYS
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="addautoentryrole",
+                  description="Add a role that allows members to use auto-entry for giveaways")
+@app_commands.describe(role="Role to allow")
+@command_enabled()
+async def addautoentryrole(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO auto_entry_roles(guild_id, role_id) VALUES(?,?)",
+                (interaction.guild.id, role.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ {role.mention} members can now enable auto-entry.")
+
+@bot.tree.command(name="removeautoentryrole",
+                  description="Remove a role from auto-entry eligibility")
+@app_commands.describe(role="Role to remove")
+@command_enabled()
+async def removeautoentryrole(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM auto_entry_roles WHERE guild_id=? AND role_id=?",
+                (interaction.guild.id, role.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 {role.mention} removed from auto-entry eligibility.")
+
+@bot.tree.command(name="listautoentryroles",
+                  description="List roles that allow auto-entry")
+@command_enabled()
+async def listautoentryroles(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message(
+            "❌ No auto-entry roles configured.", ephemeral=True); return
+    mentions = []
+    for (rid,) in rows:
+        r = interaction.guild.get_role(rid)
+        mentions.append(r.mention if r else f"<@&{rid}>")
+    embed = discord.Embed(title="🎉 Auto-Entry Eligible Roles",
+                          description="\n".join(mentions),
+                          color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="autoentry",
+                  description="Toggle automatic entry into all server giveaways")
+@command_enabled()
+async def autoentry(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    uid = interaction.user.id
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?", (gid,)) as cur:
+            role_rows = await cur.fetchall()
+
+    required = {r[0] for r in role_rows}
+    if not required:
+        await interaction.response.send_message(
+            "❌ Auto-entry is not configured for this server.", ephemeral=True); return
+
+    member = interaction.guild.get_member(uid)
+    user_rids = {r.id for r in member.roles} if member else set()
+
+    if not (required & user_rids):
+        mentions = []
+        for rid in required:
+            r = interaction.guild.get_role(rid)
+            mentions.append(r.mention if r else f"<@&{rid}>")
+        await interaction.response.send_message(
+            f"❌ You need one of these roles to be able to automatically enter giveaways: "
+            f"{', '.join(mentions)}",
+            ephemeral=True); return
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled FROM auto_entry_users WHERE guild_id=? AND user_id=?",
+            (gid, uid)) as cur:
+            existing = await cur.fetchone()
+
+    if existing:
+        new_val = 0 if existing[0] else 1
+        async with db_lock:
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE auto_entry_users SET enabled=? WHERE guild_id=? AND user_id=?",
+                    (new_val, gid, uid))
+                await db.commit()
+    else:
+        new_val = 1
+        async with db_lock:
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT INTO auto_entry_users(guild_id, user_id, enabled) VALUES(?,?,1)",
+                    (gid, uid))
+                await db.commit()
+
+    status = "enabled ✅" if new_val else "disabled 🔒"
+    await interaction.response.send_message(
+        f"Auto-entry **{status}**! "
+        f"{'You will be auto-entered into all giveaways.' if new_val else 'You will no longer be auto-entered.'}",
+        ephemeral=True)
+
 # ═══════════════════════════════════════════════════════
 # LEADERBOARD
 # ═══════════════════════════════════════════════════════
@@ -2861,7 +3639,8 @@ class WelcomeMessageModal(discord.ui.Modal, title="Set Welcome DM Message"):
         async with db_lock:
             async with get_db() as db:
                 await db.execute(
-                    "INSERT OR REPLACE INTO welcome_config(guild_id, enabled, message) VALUES(?,?,?)",
+                    "INSERT INTO welcome_config(guild_id, enabled, message) VALUES(?,?,?) "
+                    "ON CONFLICT(guild_id) DO UPDATE SET enabled=1, message=excluded.message",
                     (interaction.guild.id, 1, msg))
                 await db.commit()
         await interaction.response.send_message(
@@ -5647,6 +6426,69 @@ async def cmd_listcountingspecials(ctx):
         embed.add_field(name=f"`#{sid}` Count **{num:,}**", value=lbl, inline=False)
     await ctx.send(embed=embed)
 
+# ═══════════════════════════════════════════════════════
+# BUILT-IN COUNTING COMMANDS
+# ═══════════════════════════════════════════════════════
+
+@bot.tree.command(name="countingstats", description="Show current count, record, and your ban status")
+@command_enabled()
+async def countingstats(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT current_count, record FROM counting_state WHERE guild_id=?",
+            (gid,)) as cur:
+            state = await cur.fetchone()
+        async with db.execute(
+            "SELECT unban_time FROM counting_bans WHERE guild_id=? AND user_id=?",
+            (gid, interaction.user.id)) as cur:
+            ban = await cur.fetchone()
+
+    now_ts = int(datetime.now(UTC).timestamp())
+    embed = discord.Embed(title="🔢 Counting Stats", color=discord.Color.teal())
+    if state:
+        embed.add_field(name="Current Count", value=f"{state[0]:,}", inline=True)
+        embed.add_field(name="Record", value=f"{state[1]:,}", inline=True)
+    else:
+        embed.description = "Counting not active in this server."
+    if ban and ban[0] > now_ts:
+        embed.add_field(
+            name="Your Status",
+            value=f"🔒 Banned — unbans <t:{ban[0]}:R>",
+            inline=False)
+    else:
+        embed.add_field(name="Your Status", value="✅ Can count", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="resetcount", description="Admin: reset the count to 0")
+@command_enabled()
+async def resetcount(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE counting_state SET current_count=0, last_user_id=0, "
+                "last_message_id=0, notify_message_id=0 WHERE guild_id=?",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("✅ Count reset to 0. Next number is **1**.")
+
+@bot.tree.command(name="unbancounter",
+                  description="Admin: remove a user's counting ban immediately")
+@app_commands.describe(user="User to unban")
+@command_enabled()
+async def unbancounter(interaction: discord.Interaction, user: discord.Member):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM counting_bans WHERE guild_id=? AND user_id=?",
+                (interaction.guild.id, user.id))
+            await db.commit()
+    await interaction.response.send_message(f"✅ {user.mention} can count again.")
+
 # ── List commands (read-only) ─────────────────────────────────────────────────
 
 @bot.command(name="listchestprizes")
@@ -6324,6 +7166,9 @@ async def setcountingchannel(interaction: discord.Interaction,
                 "VALUES(?,1,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
                 "channel_id=excluded.channel_id, announce_channel_id=excluded.announce_channel_id",
                 (interaction.guild.id, ch_id, ann_id))
+            await db.execute(
+                "INSERT OR IGNORE INTO counting_state(guild_id) VALUES(?)",
+                (interaction.guild.id,))
             await db.commit()
     parts = []
     parts.append(f"Counting channel: {counting_channel.mention if counting_channel else '🌐 All channels'}")
@@ -6697,6 +7542,38 @@ async def pfx_setcountingchannel(ctx, counting_channel: discord.TextChannel = No
                                    announce_channel: discord.TextChannel = None):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
     await setcountingchannel._callback(FakeInteraction(ctx), counting_channel, announce_channel)
+
+@bot.command(name="countingstats")
+async def pfx_countingstats(ctx):
+    await countingstats._callback(FakeInteraction(ctx))
+
+@bot.command(name="resetcount")
+async def pfx_resetcount(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await resetcount._callback(FakeInteraction(ctx))
+
+@bot.command(name="unbancounter")
+async def pfx_unbancounter(ctx, user: discord.Member):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await unbancounter._callback(FakeInteraction(ctx), user)
+
+@bot.command(name="autoentry")
+async def pfx_autoentry(ctx):
+    await autoentry._callback(FakeInteraction(ctx))
+
+@bot.command(name="addautoentryrole")
+async def pfx_addautoentryrole(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await addautoentryrole._callback(FakeInteraction(ctx), role)
+
+@bot.command(name="removeautoentryrole")
+async def pfx_removeautoentryrole(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removeautoentryrole._callback(FakeInteraction(ctx), role)
+
+@bot.command(name="listautoentryroles")
+async def pfx_listautoentryroles(ctx):
+    await listautoentryroles._callback(FakeInteraction(ctx))
 
 @bot.command(name="expboost")
 async def pfx_expboost(ctx, role: discord.Role, boost: float,
