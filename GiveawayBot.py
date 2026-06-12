@@ -1301,25 +1301,26 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
 async def on_ready():
     await setup_database()
     await _load_prefix()
-    await load_disabled_commands()   # ← restore persisted disabled commands
+    await load_disabled_commands()
     await load_prefix_restrictions()
+
     # Register persistent views (must happen before any interaction can fire)
     bot.add_view(VerificationView())
     bot.add_view(ChestChannelView())
-    # Add StatsChannelView to the persistent view registrations:
-    bot.add_view(StatsChannelView())   # alongside VerificationView() and ChestChannelView()
+    bot.add_view(StatsChannelView())
 
-    # Restore stats channel panels (add alongside the chest panel restore loop):
-    try: await _refresh_stats_channel(_guild)
-    except Exception as e: print(f"[StatsPanel restore] {_guild.name}: {e}")
+    # Resume any auto giveaway loops that were running before the restart
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT guild_id FROM auto_giveaway_config WHERE running=1") as cur:
+            _ag_guilds = [r[0] for r in await cur.fetchall()]
+    for _gid in _ag_guilds:
+        auto_giveaway_tasks[_gid] = asyncio.create_task(auto_giveaway_loop(_gid))
+        print(f"[AutoGiveaway] Resumed for guild {_gid}")
 
-    # Add to the task list:
-    for task_fn in [..., _msg_count_flush_loop]:
-        bot.loop.create_task(task_fn())
-
-    # Restore verification embeds and chest panels for all guilds
+    # Restore persistent embeds/panels for every guild
     for _guild in bot.guilds:
-        # Verification
+        # Verification embed
         async with get_db() as db:
             async with db.execute(
                 "SELECT channel_id FROM verification_config WHERE guild_id=?",
@@ -1334,17 +1335,12 @@ async def on_ready():
         # Chest panel
         try: await _refresh_chest_channel(_guild)
         except Exception as e: print(f"[ChestPanel restore] {_guild.name}: {e}")
-    # Resume any auto giveaway loops that were running before the restart
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT guild_id FROM auto_giveaway_config WHERE running=1") as cur:
-            _ag_guilds = [r[0] for r in await cur.fetchall()]
-    for _gid in _ag_guilds:
-        auto_giveaway_tasks[_gid] = asyncio.create_task(auto_giveaway_loop(_gid))
-        print(f"[AutoGiveaway] Resumed for guild {_gid}")
-    # Sync to every guild the bot is currently in.
-    # Guild-scoped syncs appear instantly (no 1-hour delay).
-    # For 2–10 servers this completes in a few seconds total.
+
+        # Stats panel
+        try: await _refresh_stats_channel(_guild)
+        except Exception as e: print(f"[StatsPanel restore] {_guild.name}: {e}")
+
+    # Sync slash commands to every guild (guild-scoped = instant, no 1 h delay)
     ok, fail = 0, 0
     for guild in bot.guilds:
         try:
@@ -1355,6 +1351,19 @@ async def on_ready():
         except discord.HTTPException as e:
             print(f"[Sync] ❌  {guild.name} ({guild.id}): {e}")
             fail += 1
+
+    # Clear global commands so nothing appears twice in any server
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync(guild=None)
+
+    print(f"[Sync] Done — {ok} succeeded, {fail} failed")
+    print(f"Logged in as {bot.user}")
+
+    for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
+                    game_loop, daily_key_loop, daily_gamble_loop,
+                    _msg_count_flush_loop]:
+        bot.loop.create_task(task_fn())
+
 
     # Clear global commands so nothing appears twice in any server.
     bot.tree.clear_commands(guild=None)
@@ -3685,6 +3694,138 @@ async def raffle_info_loop():
             except Exception as e:
                 print(f"[RaffleInfoLoop] {guild_id}: {e}")
         await asyncio.sleep(60)
+
+# --- MY WININGS ----------------------------------------
+
+_WINS_PER_PAGE = 8
+
+class WinningsView(discord.ui.View):
+    """Paginated view for /mywinnings."""
+    def __init__(self, pages: list[discord.Embed], user_id: int):
+        super().__init__(timeout=120)
+        self.pages   = pages
+        self.current = 0
+        self.user_id = user_id
+        self._sync()
+
+    def _sync(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                if item.label == "◀": item.disabled = self.current == 0
+                elif item.label == "▶": item.disabled = self.current >= len(self.pages) - 1
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, disabled=True)
+    async def prev_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your list.", ephemeral=True); return
+        self.current -= 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Not your list.", ephemeral=True); return
+        self.current += 1
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.current], view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+@bot.tree.command(name="mywinnings",
+                  description="Check your giveaway win history in this server")
+@app_commands.describe(user="User to check (defaults to yourself)")
+@command_enabled()
+async def mywinnings(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    await interaction.response.defer()
+
+    # We filter by channel IDs that belong to this guild so wins from other
+    # guilds (whose channels happen to share IDs) can't bleed through.
+    guild_channel_ids = [c.id for c in interaction.guild.channels]
+    if not guild_channel_ids:
+        await interaction.followup.send("❌ No channels found."); return
+
+    placeholders = ",".join("?" * len(guild_channel_ids))
+    async with get_db() as db:
+        async with db.execute(
+            f"SELECT gw.message_id, g.prize, g.end_time, g.channel_id "
+            f"FROM giveaway_winners gw "
+            f"JOIN giveaways g ON gw.message_id = g.message_id "
+            f"WHERE gw.winner_id = ? AND g.channel_id IN ({placeholders}) "
+            f"ORDER BY g.end_time DESC",
+            (user.id, *guild_channel_ids)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        embed = discord.Embed(
+            title=f"🏆 {user.display_name}'s Wins",
+            description="No giveaway wins found in this server yet.",
+            color=discord.Color.gold())
+        embed.set_thumbnail(url=user.display_avatar.url)
+        await interaction.followup.send(embed=embed); return
+
+    # Also fetch auto-entry status for this user
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled FROM auto_entry_users WHERE guild_id=? AND user_id=?",
+            (interaction.guild.id, user.id)) as cur:
+            ae_row = await cur.fetchone()
+    ae_status = "✅ On" if (ae_row and ae_row[0]) else "🔒 Off"
+
+    # Build paginated embeds
+    pages: list[discord.Embed] = []
+    for page_start in range(0, len(rows), _WINS_PER_PAGE):
+        chunk = rows[page_start:page_start + _WINS_PER_PAGE]
+        page_num = page_start // _WINS_PER_PAGE + 1
+        total_pages = (len(rows) + _WINS_PER_PAGE - 1) // _WINS_PER_PAGE
+
+        embed = discord.Embed(
+            title=f"🏆 {user.display_name}'s Wins",
+            color=discord.Color.gold())
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.description = (
+            f"**Total wins:** {len(rows):,} | **Auto-entry:** {ae_status}\n\u200b"
+        )
+
+        for msg_id, prize_raw, end_time, ch_id in chunk:
+            # Parse prize label and reward summary
+            try:
+                meta        = json.loads(prize_raw)
+                prize_label = meta.get("label", str(prize_raw))
+                reward_str  = build_reward_summary(meta, interaction.guild)
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                prize_label = str(prize_raw)
+                reward_str  = "—"
+
+            ch      = interaction.guild.get_channel(ch_id)
+            ch_str  = ch.mention if ch else "*(deleted channel)*"
+            date_str = f"<t:{end_time}:D>" if end_time else "Unknown date"
+
+            embed.add_field(
+                name=f"🎉 {prize_label[:64]}",
+                value=f"📅 {date_str} · {ch_str}\n💰 {reward_str}",
+                inline=False)
+
+        embed.set_footer(text=f"Page {page_num}/{total_pages} · {len(rows)} total win(s)")
+        pages.append(embed)
+
+    view = WinningsView(pages, interaction.user.id)
+    await interaction.followup.send(
+        embed=pages[0],
+        view=view if len(pages) > 1 else None)
+
+
+# ── autoentry command — extend existing to show status inline ─────────────────
+# The existing /autoentry command toggles auto-entry.  The new /mywinnings
+# command shows wins.  Optionally add a prefix wrapper:
+
+@bot.command(name="mywinnings")
+async def pfx_mywinnings(ctx, user: discord.Member = None):
+    await mywinnings._callback(FakeInteraction(ctx), user)
 
 # ═══════════════════════════════════════════════════════
 # EXP BOOSTS
