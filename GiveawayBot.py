@@ -46,6 +46,9 @@ _COUNTING_FAIL_EMOJI = frozenset({'❌', '⚠️', '⚠'})
 # {(guild_id, channel_id): {role_id: allowed_bool}}
 # role_id 0 means the "everyone" rule for that channel
 prefix_channel_rules: dict[tuple[int, int], dict[int, bool]] = {}
+# Daily message count buffer (flushed to DB every 2 minutes)
+_msg_buf: dict[tuple[int, int], int] = {}   # (guild_id, user_id) -> count since midnight
+_msg_buf_date: str = ""                      # YYYY-MM-DD the buffer belongs to
 
 def is_owner(uid: int) -> bool:
     return uid == BOT_OWNER_ID
@@ -420,6 +423,24 @@ async def setup_database():
                 guild_id INTEGER PRIMARY KEY,
                 channel_id INTEGER DEFAULT 0,
                 message_id INTEGER DEFAULT 0)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS daily_message_counts(
+                guild_id INTEGER,
+                user_id INTEGER,
+                date TEXT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY(guild_id, user_id, date))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS stats_channel_config(
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0)""")
+
+            # Migration: add message requirement to auto-entry roles
+            try:
+                await db.execute(
+                    "ALTER TABLE auto_entry_roles ADD COLUMN message_requirement INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError:
+                pass
             # EXP bug fix: zero spent_exp so new negative-entry system takes over
             await db.execute("""CREATE TABLE IF NOT EXISTS bot_config(
                 key TEXT PRIMARY KEY, value TEXT)""")
@@ -925,6 +946,51 @@ async def add_tickets(guild_id, user_id, amount):
                              (new_tickets, guild_id, user_id))
             await db.commit()
 
+# --- MESSAGE HELPERS --------------------------
+
+def _bump_msg_count(guild_id: int, user_id: int):
+    global _msg_buf_date
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    if today != _msg_buf_date:
+        _msg_buf.clear()
+        _msg_buf_date = today
+    key = (guild_id, user_id)
+    _msg_buf[key] = _msg_buf.get(key, 0) + 1
+
+async def _get_today_msg_count(guild_id: int, user_id: int) -> int:
+    """Return total messages sent today: flushed DB rows + unflushed in-memory buffer."""
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    mem = _msg_buf.get((guild_id, user_id), 0) if _msg_buf_date == today else 0
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT count FROM daily_message_counts WHERE guild_id=? AND user_id=? AND date=?",
+            (guild_id, user_id, today)) as cur:
+            row = await cur.fetchone()
+    return mem + (row[0] if row else 0)
+
+async def _msg_count_flush_loop():
+    """Persist the in-memory message count buffer to DB every 2 minutes."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(120)
+        if not _msg_buf:
+            continue
+        today = _msg_buf_date or datetime.now(UTC).strftime("%Y-%m-%d")
+        snapshot = {k: v for k, v in _msg_buf.items() if v > 0}
+        for k in snapshot:
+            _msg_buf.pop(k, None)
+        if not snapshot:
+            continue
+        async with db_lock:
+            async with get_db() as db:
+                for (gid, uid), cnt in snapshot.items():
+                    await db.execute(
+                        "INSERT INTO daily_message_counts(guild_id,user_id,date,count) "
+                        "VALUES(?,?,?,?) "
+                        "ON CONFLICT(guild_id,user_id,date) DO UPDATE SET count=count+?",
+                        (gid, uid, today, cnt, cnt))
+                await db.commit()
+
 # ═══════════════════════════════════════════════════════
 # ACTIVE GAME SESSIONS
 # ═══════════════════════════════════════════════════════
@@ -964,6 +1030,7 @@ async def on_message(message):
     if message.author.bot:
         return
     if message.guild:
+        _bump_msg_count(message.guild.id, message.author.id)
         session = active_game_sessions.get(message.guild.id)
         if session and not session.get("answered") and message.channel.id == session.get("channel_id"):
             if message.content.strip().lower() == session["answer"].lower():
@@ -1239,6 +1306,16 @@ async def on_ready():
     # Register persistent views (must happen before any interaction can fire)
     bot.add_view(VerificationView())
     bot.add_view(ChestChannelView())
+    # Add StatsChannelView to the persistent view registrations:
+    bot.add_view(StatsChannelView())   # alongside VerificationView() and ChestChannelView()
+
+    # Restore stats channel panels (add alongside the chest panel restore loop):
+    try: await _refresh_stats_channel(_guild)
+    except Exception as e: print(f"[StatsPanel restore] {_guild.name}: {e}")
+
+    # Add to the task list:
+    for task_fn in [..., _msg_count_flush_loop]:
+        bot.loop.create_task(task_fn())
 
     # Restore verification embeds and chest panels for all guilds
     for _guild in bot.guilds:
@@ -1560,12 +1637,16 @@ async def end_giveaway(message_id, reroll=False):
         if not member: continue
         if required_role and required_role not in {r.id for r in member.roles}: continue
         users.append(user)
-    # ── Auto-entry: include opted-in users ─────────────────────────────────────
+    # ── Auto-entry: include opted-in users (re-validates role at draw time) ──────
     async with get_db() as db:
         async with db.execute(
             "SELECT user_id FROM auto_entry_users WHERE guild_id=? AND enabled=1",
             (channel.guild.id,)) as cur:
             auto_uids = {r[0] for r in await cur.fetchall()}
+        async with db.execute(
+            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?",
+            (channel.guild.id,)) as cur:
+            auto_role_ids = {r[0] for r in await cur.fetchall()}
     existing_uids = {u.id for u in users}
     for auid in auto_uids:
         if auid in existing_uids:
@@ -1573,10 +1654,14 @@ async def end_giveaway(message_id, reroll=False):
         ae_member = channel.guild.get_member(auid)
         if not ae_member or ae_member.bot:
             continue
-        if required_role and required_role not in {r.id for r in ae_member.roles}:
+        member_rids = {r.id for r in ae_member.roles}
+        if auto_role_ids and not (auto_role_ids & member_rids):
+            continue  # Lost the eligible role since they enabled auto-entry
+        if required_role and required_role not in member_rids:
             continue
         users.append(ae_member)
-    if not users:
+        
+     if not users:
         await channel.send("No valid participants."); return
 
     weighted = []
@@ -1992,10 +2077,12 @@ async def chest(interaction: discord.Interaction, amount: int = 1):
     embed = discord.Embed(title="📦 Chest Results", description=result_text, color=discord.Color.purple())
     embed.set_footer(text=f"Opened {amount} chest(s) | Cost: {total_cost:,} EXP")
     await interaction.followup.send(embed=embed)
+    results_log = ", ".join(f"{c}x {n}" for n, c in results.items())
     await log_event(gid, "chest", _log_embed(
         "📦 Chest Opened", discord.Color.purple(),
         User=interaction.user.mention, Opened=str(amount),
-        Cost=f"{total_cost:,} EXP"))
+        Cost=f"{total_cost:,} EXP", Won=results_log[:1024]))
+
 
     rare_won = {n: c for n, c in results.items() if n in rare_names}
     if rare_won:
@@ -2052,11 +2139,12 @@ async def vipchest(interaction: discord.Interaction, amount: int = 1):
                           color=discord.Color.from_rgb(148, 0, 211))
     embed.set_footer(text=f"Opened {amount} VIP chest(s) | {available_keys - amount} key(s) remaining")
     await interaction.followup.send(embed=embed)
+    results_log = ", ".join(f"{c}x {n}" for n, c in results.items())
     await log_event(interaction.guild.id, "chest", _log_embed(
         "💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
         User=interaction.user.mention, Opened=str(amount),
-        Keys_Used=str(amount)))
-
+        Keys_Used=str(amount), Won=results_log[:1024]))
+    
     rare_won = {n: c for n, c in results.items() if n in rare_names}
     if rare_won:
         rcid = await get_rare_drop_channel(interaction.guild.id)
@@ -2618,113 +2706,177 @@ async def _refresh_chest_channel(guild: discord.Guild):
             await db.commit()
 
 
+async def _do_open_exp_chests(interaction: discord.Interaction, amount: int):
+    """Shared EXP chest opening for the panel. amount=-1 means open max."""
+    await interaction.response.defer(ephemeral=True)
+    gid = interaction.guild.id
+    uid = interaction.user.id
+    exp = await get_exp(gid, uid)
+
+    if exp < CHEST_COST:
+        await interaction.followup.send(
+            f"❌ You need {CHEST_COST:,} EXP (you have {exp:,}).", ephemeral=True); return
+
+    max_open = exp // CHEST_COST
+    if amount == -1:
+        amount = min(max_open, 100)   # cap at 100 per click
+    else:
+        amount = min(amount, max_open)
+    if amount == 0:
+        await interaction.followup.send("❌ Not enough EXP.", ephemeral=True); return
+
+    total_cost    = CHEST_COST * amount
+    prizes        = await get_chest_prizes(gid, "chest")
+    rare_names    = await get_rare_chest_names(gid, "chest")
+    results: dict[str, int] = {}
+    total_balance = total_exp_won = 0
+
+    for _ in range(amount):
+        prize = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
+        results[prize["name"]] = results.get(prize["name"], 0) + 1
+        total_balance += prize["balance"]
+        total_exp_won += prize["exp"]
+
+    await _add_chest_spending(gid, uid, total_cost)
+    if total_balance > 0: await add_balance(gid, uid, total_balance)
+    if total_exp_won > 0: await add_exp(gid, uid, total_exp_won)
+    await add_stat(gid, uid, "chests_opened", amount)
+
+    embed = discord.Embed(
+        title=f"📦 Chest Results ×{amount}",
+        description="\n".join(f"• {c}x **{n}**" for n, c in results.items()),
+        color=discord.Color.purple())
+    embed.set_footer(text=f"Cost: {total_cost:,} EXP | Remaining: {exp - total_cost:,} EXP")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    results_log = ", ".join(f"{c}x {n}" for n, c in results.items())
+    await log_event(gid, "chest", _log_embed("📦 Chest Opened", discord.Color.purple(),
+        User=interaction.user.mention, Opened=str(amount),
+        Cost=f"{total_cost:,} EXP", Won=results_log[:1024]))
+
+    rare_won = {n: c for n, c in results.items() if n in rare_names}
+    if rare_won:
+        rcid = await get_rare_drop_channel(gid)
+        if rcid:
+            rc = bot.get_channel(rcid)
+            if rc:
+                text = " and ".join(f"**{c}x {n}**" for n, c in rare_won.items())
+                re   = discord.Embed(title="🌟 Rare Drop!",
+                    description=f"{interaction.user.mention} got {text} from "
+                                f"{'a chest' if amount == 1 else f'{amount} chests'}! 🎉",
+                    color=discord.Color.gold())
+                re.set_thumbnail(url=interaction.user.display_avatar.url)
+                await rc.send(embed=re)
+
+
+async def _do_open_vip_chests(interaction: discord.Interaction, amount: int):
+    """Shared VIP chest opening for the panel."""
+    await interaction.response.defer(ephemeral=True)
+    gid = interaction.guild.id
+    uid = interaction.user.id
+
+    if not await is_system_enabled(gid, "vipkey"):
+        await interaction.followup.send("❌ VIP chest system is disabled.", ephemeral=True); return
+
+    inv  = await inventory_get(gid, uid)
+    keys = next((q for n, q in inv if n.lower() == VIP_CHEST_KEY.lower()), 0)
+
+    if keys < 1:
+        await interaction.followup.send(
+            f"❌ You have no **{VIP_CHEST_KEY}** (Nitro Boosters get one daily!).",
+            ephemeral=True); return
+
+    amount = min(amount, keys, 10)   # cap at 10 and available keys
+    if not await inventory_remove(gid, uid, VIP_CHEST_KEY, amount):
+        await interaction.followup.send("❌ Failed to consume keys.", ephemeral=True); return
+
+    prizes        = await get_chest_prizes(gid, "vipchest")
+    rare_names    = await get_rare_chest_names(gid, "vipchest")
+    results: dict[str, int] = {}
+    total_balance = total_exp_won = 0
+
+    for _ in range(amount):
+        prize = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
+        results[prize["name"]] = results.get(prize["name"], 0) + 1
+        total_balance += prize["balance"]
+        total_exp_won += prize["exp"]
+
+    if total_balance > 0: await add_balance(gid, uid, total_balance)
+    if total_exp_won > 0: await add_exp(gid, uid, total_exp_won)
+
+    embed = discord.Embed(
+        title=f"💎 VIP Chest Results ×{amount}",
+        description="\n".join(f"• {c}x **{n}**" for n, c in results.items()),
+        color=discord.Color.from_rgb(148, 0, 211))
+    embed.set_footer(text=f"{amount} key(s) used | {keys - amount} remaining")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    results_log = ", ".join(f"{c}x {n}" for n, c in results.items())
+    await log_event(gid, "chest", _log_embed("💎 VIP Chest Opened", discord.Color.from_rgb(148, 0, 211),
+        User=interaction.user.mention, Opened=str(amount),
+        Keys_Used=str(amount), Won=results_log[:1024]))
+
+    rare_won = {n: c for n, c in results.items() if n in rare_names}
+    if rare_won:
+        rcid = await get_rare_drop_channel(gid)
+        if rcid:
+            rc = bot.get_channel(rcid)
+            if rc:
+                text = " and ".join(f"**{c}x {n}**" for n, c in rare_won.items())
+                re   = discord.Embed(title="💎 VIP Rare Drop!",
+                    description=f"{interaction.user.mention} got {text} from "
+                                f"**{amount} VIP Chest{'s' if amount > 1 else ''}**! 👑",
+                    color=discord.Color.from_rgb(148, 0, 211))
+                re.set_thumbnail(url=interaction.user.display_avatar.url)
+                await rc.send(embed=re)
+
+
 class ChestChannelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    # ── Row 0: EXP chests ─────────────────────────────────────────────────
     @discord.ui.button(label="⭐ My EXP", style=discord.ButtonStyle.secondary,
-                       custom_id="chest_panel:check_exp")
+                       custom_id="chest_panel:check_exp", row=0)
     async def check_exp(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        gid  = interaction.guild.id
-        uid  = interaction.user.id
-        exp  = await get_exp(gid, uid)
-        lvl  = await get_level(gid, uid)
-        embed = discord.Embed(
-            title=f"⭐ {interaction.user.display_name}'s EXP",
-            color=discord.Color.gold())
-        embed.add_field(name="Activity Rank",     value=str(lvl),              inline=True)
-        embed.add_field(name="Usable EXP",        value=f"{exp:,}",            inline=True)
-        embed.add_field(name="Chests Available",  value=f"{exp // CHEST_COST}", inline=True)
-        inv  = await inventory_get(gid, uid)
-        keys = next((q for n, q in inv if n == VIP_CHEST_KEY), 0)
-        embed.add_field(name="VIP Keys",          value=str(keys),             inline=True)
+        gid    = interaction.guild.id
+        uid    = interaction.user.id
+        exp    = await get_exp(gid, uid)
+        lvl    = await get_level(gid, uid)
+        inv    = await inventory_get(gid, uid)
+        keys   = next((q for n, q in inv if n.lower() == VIP_CHEST_KEY.lower()), 0)
+        embed  = discord.Embed(title=f"⭐ {interaction.user.display_name}", color=discord.Color.gold())
+        embed.add_field(name="Activity Rank",    value=str(lvl),              inline=True)
+        embed.add_field(name="Usable EXP",       value=f"{exp:,}",            inline=True)
+        embed.add_field(name="Chests Available", value=f"{exp // CHEST_COST}", inline=True)
+        embed.add_field(name="VIP Keys",         value=str(keys),             inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="📦 Open EXP Chest", style=discord.ButtonStyle.primary,
-                       custom_id="chest_panel:open_exp")
-    async def open_exp(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        gid = interaction.guild.id
-        uid = interaction.user.id
-        exp = await get_exp(gid, uid)
-        if exp < CHEST_COST:
-            await interaction.followup.send(
-                f"❌ You need {CHEST_COST:,} EXP (you have {exp:,}).",
-                ephemeral=True); return
+    @discord.ui.button(label="📦 ×1", style=discord.ButtonStyle.primary,
+                       custom_id="chest_panel:open_exp_1", row=0)
+    async def open_exp_1(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await _do_open_exp_chests(interaction, 1)
 
-        prizes     = await get_chest_prizes(gid, "chest")
-        rare_names = await get_rare_chest_names(gid, "chest")
-        prize      = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
-        await _add_chest_spending(gid, uid, CHEST_COST)
-        if prize["balance"] > 0: await add_balance(gid, uid, prize["balance"])
-        if prize["exp"] > 0:     await add_exp(gid, uid, prize["exp"])
-        await add_stat(gid, uid, "chests_opened", 1)
+    @discord.ui.button(label="📦 ×10", style=discord.ButtonStyle.primary,
+                       custom_id="chest_panel:open_exp_10", row=0)
+    async def open_exp_10(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await _do_open_exp_chests(interaction, 10)
 
-        embed = discord.Embed(
-            title="📦 Chest Result",
-            description=f"• **{prize['name']}**",
-            color=discord.Color.purple())
-        embed.set_footer(text=f"Cost: {CHEST_COST:,} EXP | Remaining: {exp - CHEST_COST:,} EXP")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        await log_event(gid, "chest", _log_embed("📦 Chest Opened (Panel)", discord.Color.purple(),
-            User=interaction.user.mention, Cost=f"{CHEST_COST:,} EXP"))
+    @discord.ui.button(label="📦 ×Max", style=discord.ButtonStyle.primary,
+                       custom_id="chest_panel:open_exp_max", row=0)
+    async def open_exp_max(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await _do_open_exp_chests(interaction, -1)
 
-        if prize["name"] in rare_names:
-            rcid = await get_rare_drop_channel(gid)
-            if rcid:
-                rc = bot.get_channel(rcid)
-                if rc:
-                    re = discord.Embed(title="🌟 Rare Drop!",
-                        description=f"{interaction.user.mention} got **{prize['name']}** from a chest! 🎉",
-                        color=discord.Color.gold())
-                    re.set_thumbnail(url=interaction.user.display_avatar.url)
-                    await rc.send(embed=re)
+    # ── Row 1: VIP chests ─────────────────────────────────────────────────
+    @discord.ui.button(label="💎 VIP ×1", style=discord.ButtonStyle.success,
+                       custom_id="chest_panel:open_vip_1", row=1)
+    async def open_vip_1(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await _do_open_vip_chests(interaction, 1)
 
-    @discord.ui.button(label="💎 Open VIP Chest", style=discord.ButtonStyle.success,
-                       custom_id="chest_panel:open_vip")
-    async def open_vip(self, interaction: discord.Interaction, btn: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        gid = interaction.guild.id
-        uid = interaction.user.id
-
-        if not await is_system_enabled(gid, "vipkey"):
-            await interaction.followup.send("❌ VIP chest system is disabled.", ephemeral=True); return
-
-        inv  = await inventory_get(gid, uid)
-        keys = next((q for n, q in inv if n.lower() == VIP_CHEST_KEY.lower()), 0)
-        if keys < 1:
-            await interaction.followup.send(
-                f"❌ You need 1 **{VIP_CHEST_KEY}** (Nitro Boosters get one daily!).",
-                ephemeral=True); return
-        if not await inventory_remove(gid, uid, VIP_CHEST_KEY, 1):
-            await interaction.followup.send("❌ Failed to consume key.", ephemeral=True); return
-
-        prizes     = await get_chest_prizes(gid, "vipchest")
-        rare_names = await get_rare_chest_names(gid, "vipchest")
-        prize      = random.choices(prizes, weights=[p["chance"] for p in prizes], k=1)[0]
-        if prize["balance"] > 0: await add_balance(gid, uid, prize["balance"])
-        if prize["exp"] > 0:     await add_exp(gid, uid, prize["exp"])
-
-        embed = discord.Embed(
-            title="💎 VIP Chest Result",
-            description=f"• **{prize['name']}**",
-            color=discord.Color.from_rgb(148, 0, 211))
-        embed.set_footer(text=f"1 VIP Key consumed | {keys - 1} key(s) remaining")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        await log_event(gid, "chest", _log_embed("💎 VIP Chest Opened (Panel)",
-            discord.Color.from_rgb(148, 0, 211),
-            User=interaction.user.mention, Keys_Used="1"))
-
-        if prize["name"] in rare_names:
-            rcid = await get_rare_drop_channel(gid)
-            if rcid:
-                rc = bot.get_channel(rcid)
-                if rc:
-                    re = discord.Embed(title="💎 VIP Rare Drop!",
-                        description=f"{interaction.user.mention} got **{prize['name']}** from a VIP Chest! 👑",
-                        color=discord.Color.from_rgb(148, 0, 211))
-                    re.set_thumbnail(url=interaction.user.display_avatar.url)
-                    await rc.send(embed=re)
+    @discord.ui.button(label="💎 VIP ×5", style=discord.ButtonStyle.success,
+                       custom_id="chest_panel:open_vip_5", row=1)
+    async def open_vip_5(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        await _do_open_vip_chests(interaction, 5)
 
 @bot.tree.command(name="setchestchannel",
                   description="Post the chest panel embed in a channel (updates on restart)")
@@ -2900,57 +3052,52 @@ async def disableverification(interaction: discord.Interaction):
 # ═══════════════════════════════════════════════════════
 
 @bot.tree.command(name="addautoentryrole",
-                  description="Add a role that allows members to use auto-entry for giveaways")
-@app_commands.describe(role="Role to allow")
+                  description="Add/update a role that allows auto-entry for giveaways")
+@app_commands.describe(
+    role="Role to allow",
+    message_requirement="Messages the user must send today to qualify (0 = no requirement)"
+)
 @command_enabled()
-async def addautoentryrole(interaction: discord.Interaction, role: discord.Role):
+async def addautoentryrole(interaction: discord.Interaction,
+                            role: discord.Role,
+                            message_requirement: int = 0):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     async with db_lock:
         async with get_db() as db:
             await db.execute(
-                "INSERT OR IGNORE INTO auto_entry_roles(guild_id, role_id) VALUES(?,?)",
-                (interaction.guild.id, role.id))
+                "INSERT INTO auto_entry_roles(guild_id, role_id, message_requirement) "
+                "VALUES(?,?,?) ON CONFLICT(guild_id, role_id) DO UPDATE SET "
+                "message_requirement=excluded.message_requirement",
+                (interaction.guild.id, role.id, message_requirement))
             await db.commit()
+    req_str = f" — requires **{message_requirement}** messages today" if message_requirement else ""
     await interaction.response.send_message(
-        f"✅ {role.mention} members can now enable auto-entry.")
+        f"✅ {role.mention} can use auto-entry{req_str}.")
 
-@bot.tree.command(name="removeautoentryrole",
-                  description="Remove a role from auto-entry eligibility")
-@app_commands.describe(role="Role to remove")
-@command_enabled()
-async def removeautoentryrole(interaction: discord.Interaction, role: discord.Role):
-    if not await is_allowed_to_giveaway(interaction):
-        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
-    async with db_lock:
-        async with get_db() as db:
-            await db.execute(
-                "DELETE FROM auto_entry_roles WHERE guild_id=? AND role_id=?",
-                (interaction.guild.id, role.id))
-            await db.commit()
-    await interaction.response.send_message(
-        f"🗑 {role.mention} removed from auto-entry eligibility.")
 
 @bot.tree.command(name="listautoentryroles",
-                  description="List roles that allow auto-entry")
+                  description="List roles that allow auto-entry and their requirements")
 @command_enabled()
 async def listautoentryroles(interaction: discord.Interaction):
     async with get_db() as db:
         async with db.execute(
-            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?",
+            "SELECT role_id, message_requirement FROM auto_entry_roles WHERE guild_id=?",
             (interaction.guild.id,)) as cur:
             rows = await cur.fetchall()
     if not rows:
         await interaction.response.send_message(
             "❌ No auto-entry roles configured.", ephemeral=True); return
-    mentions = []
-    for (rid,) in rows:
+    lines = []
+    for rid, req in rows:
         r = interaction.guild.get_role(rid)
-        mentions.append(r.mention if r else f"<@&{rid}>")
-    embed = discord.Embed(title="🎉 Auto-Entry Eligible Roles",
-                          description="\n".join(mentions),
+        name = r.mention if r else f"<@&{rid}>"
+        lines.append(f"• {name}" + (f" — **{req}** messages/day required" if req else " — no requirement"))
+    embed = discord.Embed(title="🎉 Auto-Entry Roles",
+                          description="\n".join(lines),
                           color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="autoentry",
                   description="Toggle automatic entry into all server giveaways")
@@ -2961,27 +3108,52 @@ async def autoentry(interaction: discord.Interaction):
 
     async with get_db() as db:
         async with db.execute(
-            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?", (gid,)) as cur:
-            role_rows = await cur.fetchall()
+            "SELECT role_id, message_requirement FROM auto_entry_roles WHERE guild_id=?",
+            (gid,)) as cur:
+            all_roles = await cur.fetchall()
 
-    required = {r[0] for r in role_rows}
-    if not required:
+    if not all_roles:
         await interaction.response.send_message(
             "❌ Auto-entry is not configured for this server.", ephemeral=True); return
 
-    member = interaction.guild.get_member(uid)
+    member    = interaction.guild.get_member(uid)
     user_rids = {r.id for r in member.roles} if member else set()
 
-    if not (required & user_rids):
+    eligible     = False
+    no_role      = True
+    unmet_reqs   = []  # (Role | None, required, actual)
+
+    for rid, req in all_roles:
+        if rid not in user_rids:
+            continue
+        no_role = False
+        if req > 0:
+            today_count = await _get_today_msg_count(gid, uid)
+            if today_count < req:
+                unmet_reqs.append((interaction.guild.get_role(rid), req, today_count))
+                continue
+        eligible = True
+        break
+
+    if no_role:
         mentions = []
-        for rid in required:
+        for rid, req in all_roles:
             r = interaction.guild.get_role(rid)
-            mentions.append(r.mention if r else f"<@&{rid}>")
+            if r:
+                suffix = f" *(needs {req} msgs/day)*" if req else ""
+                mentions.append(f"{r.mention}{suffix}")
         await interaction.response.send_message(
             f"❌ You need one of these roles to be able to automatically enter giveaways: "
-            f"{', '.join(mentions)}",
-            ephemeral=True); return
+            f"{', '.join(mentions)}", ephemeral=True); return
 
+    if not eligible:
+        lines = ["❌ You don't meet the daily message requirements for any of your eligible roles:"]
+        for role, req, got in unmet_reqs:
+            name = role.mention if role else "?"
+            lines.append(f"• {name}: **{got}/{req}** messages sent today")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True); return
+
+    # Toggle
     async with get_db() as db:
         async with db.execute(
             "SELECT enabled FROM auto_entry_users WHERE guild_id=? AND user_id=?",
@@ -3001,15 +3173,203 @@ async def autoentry(interaction: discord.Interaction):
         async with db_lock:
             async with get_db() as db:
                 await db.execute(
-                    "INSERT INTO auto_entry_users(guild_id, user_id, enabled) VALUES(?,?,1)",
+                    "INSERT INTO auto_entry_users(guild_id,user_id,enabled) VALUES(?,?,1)",
                     (gid, uid))
                 await db.commit()
 
-    status = "enabled ✅" if new_val else "disabled 🔒"
+    if new_val:
+        await interaction.response.send_message(
+            "✅ Auto-entry **enabled** — you'll be automatically entered into all giveaways.",
+            ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "🔒 Auto-entry **disabled**.", ephemeral=True)
+
+@bot.tree.command(name="removeautoentryrole",
+                  description="Remove a role from auto-entry eligibility")
+@app_commands.describe(role="Role to remove")
+@command_enabled()
+async def removeautoentryrole(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM auto_entry_roles WHERE guild_id=? AND role_id=?",
+                (interaction.guild.id, role.id))
+            await db.commit()
     await interaction.response.send_message(
-        f"Auto-entry **{status}**! "
-        f"{'You will be auto-entered into all giveaways.' if new_val else 'You will no longer be auto-entered.'}",
-        ephemeral=True)
+        f"🗑 {role.mention} removed from auto-entry eligibility.")
+
+#  --- STAT CHANNEl
+
+async def _build_stats_embed(guild: discord.Guild) -> discord.Embed:
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(tickets),0) FROM raffle "
+            "WHERE guild_id=? AND tickets>0", (guild.id,)) as cur:
+            members, pool = await cur.fetchone()
+    embed = discord.Embed(
+        title="📊 Stats",
+        description=(
+            "Click a button below to check your personal stats.\n"
+            "All responses are **private** — only you can see them."
+        ),
+        color=discord.Color.blurple())
+    embed.add_field(
+        name="🎟 Current Raffle Pool",
+        value=f"{pool:,} tickets across {members:,} member(s)",
+        inline=False)
+    embed.set_footer(text="Results are only visible to you")
+    return embed
+
+
+async def _refresh_stats_channel(guild: discord.Guild):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM stats_channel_config WHERE guild_id=?",
+            (guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return
+    ch = bot.get_channel(row[0])
+    if not ch:
+        return
+    embed = await _build_stats_embed(guild)
+    view  = StatsChannelView()
+    if row[1]:
+        try:
+            msg = await ch.fetch_message(row[1])
+            await msg.edit(embed=embed, view=view)
+            return
+        except discord.NotFound:
+            pass
+    new_msg = await ch.send(embed=embed, view=view)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE stats_channel_config SET message_id=? WHERE guild_id=?",
+                (new_msg.id, guild.id))
+            await db.commit()
+
+
+class StatsChannelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="💰 Balance", style=discord.ButtonStyle.secondary,
+                       custom_id="stats_panel:balance", row=0)
+    async def check_balance(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        bal = await get_balance(interaction.guild.id, interaction.user.id)
+        embed = discord.Embed(
+            title=f"💰 {interaction.user.display_name}'s Balance",
+            description=f"**{bal:,}** coins",
+            color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="⭐ Activity Rank", style=discord.ButtonStyle.secondary,
+                       custom_id="stats_panel:rank", row=0)
+    async def check_rank(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        gid    = interaction.guild.id
+        uid    = interaction.user.id
+        exp    = await get_level_exp(gid, uid)
+        usable = await get_exp(gid, uid)
+        lvl    = await get_level(gid, uid)
+        embed  = discord.Embed(
+            title=f"⭐ {interaction.user.display_name}'s Activity Rank",
+            color=discord.Color.gold())
+        embed.add_field(name="Activity Rank",  value=str(lvl),      inline=True)
+        embed.add_field(name="Total EXP (7d)", value=f"{exp:,}",    inline=True)
+        embed.add_field(name="Usable EXP",     value=f"{usable:,}", inline=True)
+        embed.add_field(name="Chests Available",
+                        value=f"{usable // CHEST_COST}", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎟 Raffle Tickets", style=discord.ButtonStyle.secondary,
+                       custom_id="stats_panel:tickets", row=0)
+    async def check_tickets(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        gid     = interaction.guild.id
+        uid     = interaction.user.id
+        tickets = await get_tickets(gid, uid)
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(tickets),0) FROM raffle WHERE guild_id=?",
+                (gid,)) as cur:
+                total = (await cur.fetchone())[0]
+        chance = (tickets / total * 100) if total else 0
+        embed = discord.Embed(title="🎟 Your Raffle Stats", color=discord.Color.gold())
+        embed.add_field(name="Your Tickets",  value=f"{tickets:,}",    inline=True)
+        embed.add_field(name="Total Pool",    value=f"{total:,}",      inline=True)
+        embed.add_field(name="Win Chance",    value=f"{chance:.2f}%",  inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎒 Inventory", style=discord.ButtonStyle.secondary,
+                       custom_id="stats_panel:inventory", row=0)
+    async def check_inventory(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        gid = interaction.guild.id
+        uid = interaction.user.id
+        inv = await inventory_get(gid, uid)
+        embed = discord.Embed(
+            title=f"🎒 {interaction.user.display_name}'s Inventory",
+            color=discord.Color.blurple())
+        if not inv:
+            embed.description = "Inventory is empty."
+        else:
+            lines = []
+            for item_name, qty in inv:
+                if item_name == VIP_CHEST_KEY:
+                    lines.append(f"• 🔑 **{item_name}** ×{qty}")
+                elif item_name == GAMBLE_TOKEN:
+                    lines.append(f"• 🎲 **{item_name}** ×{qty}")
+                else:
+                    si = await get_item(gid, item_name)
+                    if si:
+                        r = interaction.guild.get_role(si[3])
+                        lines.append(f"• **{item_name}** ×{qty}" + (f" → {r.mention}" if r else ""))
+                    else:
+                        lines.append(f"• 📦 **{item_name}** ×{qty}")
+            embed.description = "\n".join(lines[:30])
+            if len(inv) > 30:
+                embed.set_footer(text=f"Showing 30 of {len(inv)} items")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="setstatchannel",
+                  description="Post the stats panel embed in a channel")
+@app_commands.describe(channel="Channel to post the panel in")
+@command_enabled()
+async def setstatchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+    gid = interaction.guild.id
+
+    # Remove old panel if in a different channel
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM stats_channel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            old = await cur.fetchone()
+    if old and old[0] and old[0] != channel.id and old[1]:
+        old_ch = bot.get_channel(old[0])
+        if old_ch:
+            try: await (await old_ch.fetch_message(old[1])).delete()
+            except Exception: pass
+
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO stats_channel_config(guild_id, channel_id, message_id) VALUES(?,?,0) "
+                "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=0",
+                (gid, channel.id))
+            await db.commit()
+
+    await _refresh_stats_channel(interaction.guild)
+    await interaction.followup.send(f"✅ Stats panel posted in {channel.mention}.")
+
+@bot.command(name="setstatchannel")
+async def pfx_setstatchannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setstatchannel._callback(FakeInteraction(ctx), channel)
 
 # ═══════════════════════════════════════════════════════
 # LEADERBOARD
@@ -7557,14 +7917,10 @@ async def pfx_unbancounter(ctx, user: discord.Member):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
     await unbancounter._callback(FakeInteraction(ctx), user)
 
-@bot.command(name="autoentry")
-async def pfx_autoentry(ctx):
-    await autoentry._callback(FakeInteraction(ctx))
-
 @bot.command(name="addautoentryrole")
-async def pfx_addautoentryrole(ctx, role: discord.Role):
+async def pfx_addautoentryrole(ctx, role: discord.Role, message_requirement: int = 0):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
-    await addautoentryrole._callback(FakeInteraction(ctx), role)
+    await addautoentryrole._callback(FakeInteraction(ctx), role, message_requirement)
 
 @bot.command(name="removeautoentryrole")
 async def pfx_removeautoentryrole(ctx, role: discord.Role):
@@ -7574,6 +7930,15 @@ async def pfx_removeautoentryrole(ctx, role: discord.Role):
 @bot.command(name="listautoentryroles")
 async def pfx_listautoentryroles(ctx):
     await listautoentryroles._callback(FakeInteraction(ctx))
+
+@bot.command(name="autoentry")
+async def pfx_autoentry(ctx):
+    await autoentry._callback(FakeInteraction(ctx))
+
+@bot.command(name="setstatchannel")
+async def pfx_setstatchannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setstatchannel._callback(FakeInteraction(ctx), channel)
 
 @bot.command(name="expboost")
 async def pfx_expboost(ctx, role: discord.Role, boost: float,
