@@ -7935,11 +7935,6 @@ async def pfx_listautoentryroles(ctx):
 async def pfx_autoentry(ctx):
     await autoentry._callback(FakeInteraction(ctx))
 
-@bot.command(name="setstatchannel")
-async def pfx_setstatchannel(ctx, channel: discord.TextChannel):
-    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
-    await setstatchannel._callback(FakeInteraction(ctx), channel)
-
 @bot.command(name="expboost")
 async def pfx_expboost(ctx, role: discord.Role, boost: float,
                         channel: discord.TextChannel = None):
