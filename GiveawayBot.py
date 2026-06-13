@@ -1776,8 +1776,10 @@ async def auto_giveaway_loop(guild_id: int):
         _banner_path = os.path.join(os.path.dirname(__file__), "AutoGiveaway.png")
         if os.path.exists(_banner_path):
             try:
-                banner_file = discord.File(_banner_path, filename="giveaway_banner.png")
-                msg = await channel.send(file=banner_file, embed=embed)
+                banner_file  = discord.File(_banner_path, filename="giveaway_banner.png")
+                banner_embed = discord.Embed(color=discord.Color.gold())   # same color bar as the main embed
+                banner_embed.set_image(url="attachment://giveaway_banner.png")
+                msg = await channel.send(file=banner_file, embeds=[banner_embed, embed])
             except Exception:
                 msg = await channel.send(embed=embed)
         else:
