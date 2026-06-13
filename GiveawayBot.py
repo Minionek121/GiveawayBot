@@ -1772,15 +1772,17 @@ async def auto_giveaway_loop(guild_id: int):
                 f"**Winners:** {winners}\n**Ends:** <t:{int(end_time.timestamp())}:R>"
             ),
             color=discord.Color.gold())
-        # Send the banner image above the giveaway embed
+        
         _banner_path = os.path.join(os.path.dirname(__file__), "AutoGiveaway.png")
         if os.path.exists(_banner_path):
             try:
-                await channel.send(file=discord.File(_banner_path, filename="giveaway_banner.png"))
+                banner_file = discord.File(_banner_path, filename="giveaway_banner.png")
+                embed.set_image(url="attachment://giveaway_banner.png")
+                msg = await channel.send(file=banner_file, embed=embed)
             except Exception:
-                pass  # if banner fails, continue without it
-
-        msg = await channel.send(embed=embed)
+                msg = await channel.send(embed=embed)
+        else:
+            msg = await channel.send(embed=embed)
         await msg.add_reaction("🎉")
 
         prize_meta = json.dumps({
