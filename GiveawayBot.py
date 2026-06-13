@@ -6189,7 +6189,7 @@ async def cmd_reroll(ctx, message_id: str):
     weighted = []
     for user in users:
         lvl = await get_level(ctx.guild.id, user.id)
-        weighted.extend([user] * random.randint(1, max(1, min(10, lvl))))
+        weighted.extend([user] * random.randint(1, max(1, lvl // 4)))
     new_winner = random.choice(weighted)
     try:
         _parsed = json.loads(prize_raw)
