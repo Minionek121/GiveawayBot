@@ -997,6 +997,52 @@ async def _msg_count_flush_loop():
                         (gid, uid, today, cnt, cnt))
                 await db.commit()
 
+# --- LIST EXP BOOSTS FIX -------------------------------
+
+_EXP_BOOSTS_PER_EMBED = 20   # lines per embed page
+ 
+def _build_exp_boost_embeds(guild, rows: list) -> list:
+    """
+    Turn exp_boost DB rows into a list of discord.Embed objects.
+    Uses description text instead of fields → no 25-entry limit.
+    Groups 20 entries per embed so descriptions stay short.
+    """
+    # Build every line first
+    lines = []
+    for role_id, boost, channel_id, category_id in rows:
+        role  = guild.get_role(role_id)
+        name  = role.mention if role else f"<deleted role {role_id}>"
+        sign  = "+" if boost > 0 else ""
+        if channel_id:
+            ch    = guild.get_channel(channel_id)
+            scope = ch.mention if ch else "🗑 deleted channel"
+        elif category_id:
+            cat   = guild.get_channel(category_id)
+            scope = f"📁 {cat.name}" if cat else "🗑 deleted category"
+        else:
+            scope = "🌐 Global"
+        lines.append(f"• {name} — **{sign}{boost}%** | {scope}")
+ 
+    # Chunk into pages
+    chunks = [
+        lines[i : i + _EXP_BOOSTS_PER_EMBED]
+        for i in range(0, len(lines), _EXP_BOOSTS_PER_EMBED)
+    ]
+    total_pages = len(chunks)
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        title = "⚡ Active EXP Boosts"
+        if total_pages > 1:
+            title += f"  ({i + 1}/{total_pages})"
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(chunk),
+            color=discord.Color.blurple())
+        if i == total_pages - 1:          # footer only on last embed
+            embed.set_footer(text=f"{len(rows)} boost(s) total")
+        embeds.append(embed)
+    return embeds
+
 # ═══════════════════════════════════════════════════════
 # ACTIVE GAME SESSIONS
 # ═══════════════════════════════════════════════════════
@@ -4289,9 +4335,6 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
     guild_channel_set = {c.id for c in interaction.guild.channels}
  
     try:
-        # Fetch all wins for this user then filter in Python.
-        # This avoids the "too many SQL bind parameters" crash on large servers
-        # that caused the bot to silently hang when a user had no wins.
         async with get_db() as db:
             async with db.execute(
                 "SELECT gw.message_id, g.prize, g.end_time, g.channel_id "
@@ -4315,7 +4358,7 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
         await interaction.followup.send(embed=embed)
         return
  
-    # Auto-entry status
+    # ── Auto-entry status ───────────────────────────────────────────────────
     async with get_db() as db:
         async with db.execute(
             "SELECT enabled FROM auto_entry_users WHERE guild_id=? AND user_id=?",
@@ -4323,17 +4366,38 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
             ae_row = await cur.fetchone()
     ae_status = "✅ On" if (ae_row and ae_row[0]) else "🔒 Off"
  
-    # Tally total coins won across all giveaways
-    total_coins_won = 0
+    # ── Tally every reward type across all wins ─────────────────────────────
+    totals: dict[str, int] = {
+        "balance":      0,
+        "exp":          0,
+        "tickets":      0,
+        "gamble_tokens":0,
+        "vip_keys":     0,
+    }
     for _, prize_raw, _, _ in rows:
         try:
             meta = json.loads(prize_raw)
             if isinstance(meta, dict):
-                total_coins_won += int(meta.get("balance", 0))
+                for key in totals:
+                    totals[key] += int(meta.get(key, 0))
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
  
-    # Build paginated embeds
+    # ── Build "Total rewards" line (only show non-zero categories) ──────────
+    reward_parts = []
+    if totals["balance"]       > 0: reward_parts.append(f"💰 {totals['balance']:,} coins")
+    if totals["exp"]           > 0: reward_parts.append(f"⭐ {totals['exp']:,} EXP")
+    if totals["tickets"]       > 0: reward_parts.append(f"🎟 {totals['tickets']:,} tickets")
+    if totals["gamble_tokens"] > 0: reward_parts.append(f"🎲 {totals['gamble_tokens']:,} tokens")
+    if totals["vip_keys"]      > 0: reward_parts.append(f"🔑 {totals['vip_keys']:,} VIP keys")
+ 
+    summary = (
+        f"**Total wins:** {len(rows):,} | **Auto-entry:** {ae_status}\n"
+        + (("**Total won:** " + " · ".join(reward_parts)) if reward_parts else "")
+        + "\n\u200b"
+    )
+ 
+    # ── Paginate wins ───────────────────────────────────────────────────────
     pages: list[discord.Embed] = []
     for page_start in range(0, len(rows), _WINS_PER_PAGE):
         chunk       = rows[page_start:page_start + _WINS_PER_PAGE]
@@ -4344,11 +4408,7 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
             title=f"🏆 {user.display_name}'s Wins",
             color=discord.Color.gold())
         embed.set_thumbnail(url=user.display_avatar.url)
-        embed.description = (
-            f"**Total wins:** {len(rows):,} | "
-            f"**Coins won:** {total_coins_won:,} | "
-            f"**Auto-entry:** {ae_status}\n\u200b"
-        )
+        embed.description = summary
  
         for msg_id, prize_raw, end_time, ch_id in chunk:
             try:
@@ -4368,14 +4428,14 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
                 value=f"📅 {date_str} · {ch_str}\n💰 {reward_str}",
                 inline=False)
  
-        embed.set_footer(text=f"Page {page_num}/{total_pages} · {len(rows)} total win(s)")
+        embed.set_footer(
+            text=f"Page {page_num}/{total_pages} · {len(rows)} total win(s)")
         pages.append(embed)
  
     view = WinningsView(pages, interaction.user.id)
     await interaction.followup.send(
         embed=pages[0],
         view=view if len(pages) > 1 else None)
- 
  
 @bot.command(name="mywinnings")
 async def pfx_mywinnings(ctx, user: discord.Member = None):
@@ -7803,27 +7863,17 @@ async def slash_listexpboosts(interaction: discord.Interaction):
             await interaction.response.send_message(
                 "❌ No EXP boosts configured.", ephemeral=True)
             return
-        embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
-        for role_id, boost, channel_id, category_id in rows:
-            role  = interaction.guild.get_role(role_id)
-            name  = role.mention if role else f"<deleted role {role_id}>"
-            sign  = "+" if boost > 0 else ""
-            if channel_id:
-                ch    = interaction.guild.get_channel(channel_id)
-                scope = ch.mention if ch else f"deleted channel ({channel_id})"
-            elif category_id:
-                cat   = interaction.guild.get_channel(category_id)
-                scope = f"📁 {cat.name}" if cat else f"deleted category ({category_id})"
-            else:
-                scope = "🌐 Global"
-            embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
-        await interaction.response.send_message(embed=embed)
+        embeds = _build_exp_boost_embeds(interaction.guild, rows)
+        # Discord allows up to 10 embeds per message
+        await interaction.response.send_message(embeds=embeds[:10])
+        # If somehow >10 pages (>200 boosts) send the remainder as follow-ups
+        for extra in embeds[10:]:
+            await interaction.followup.send(embed=extra)
     except Exception as e:
         try:
             await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
         except Exception:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
- 
  
 @bot.command(name="listexpboosts")
 async def cmd_listexpboosts(ctx):
@@ -7837,24 +7887,13 @@ async def cmd_listexpboosts(ctx):
         if not rows:
             await ctx.send("❌ No EXP boosts configured.")
             return
-        embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
-        for role_id, boost, channel_id, category_id in rows:
-            role  = ctx.guild.get_role(role_id)
-            name  = role.mention if role else f"<deleted role {role_id}>"
-            sign  = "+" if boost > 0 else ""
-            if channel_id:
-                ch    = ctx.guild.get_channel(channel_id)
-                scope = ch.mention if ch else f"deleted channel ({channel_id})"
-            elif category_id:
-                cat   = ctx.guild.get_channel(category_id)
-                scope = f"📁 {cat.name}" if cat else f"deleted category ({category_id})"
-            else:
-                scope = "🌐 Global"
-            embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
-        await ctx.send(embed=embed)
+        embeds = _build_exp_boost_embeds(ctx.guild, rows)
+        # Send all embed pages in one message (up to 10), then follow-ups
+        await ctx.send(embeds=embeds[:10])
+        for extra in embeds[10:]:
+            await ctx.send(embed=extra)
     except Exception as e:
         await ctx.send(f"❌ Error fetching EXP boosts: {e}")
-
 
 # ═══════════════════════════════════════════════════════
 # LOGGING SYSTEM
