@@ -2706,7 +2706,6 @@ async def vipchest(interaction: discord.Interaction, amount: int = 1):
         await interaction.response.send_message("❌ VIP chest system is disabled.", ephemeral=True); return
     await interaction.response.defer()
     if amount <= 0:   await interaction.followup.send("❌ Amount must be ≥ 1."); return
-    if amount > 10:   await interaction.followup.send("❌ Max 10 VIP chests at once."); return
 
     inv  = await inventory_get(interaction.guild.id, interaction.user.id)
     owned = {n.lower(): q for n, q in inv}
