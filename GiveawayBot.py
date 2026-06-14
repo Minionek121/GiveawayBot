@@ -434,6 +434,12 @@ async def setup_database():
                 guild_id INTEGER PRIMARY KEY,
                 channel_id INTEGER DEFAULT 0,
                 message_id INTEGER DEFAULT 0)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS admin_panel_config(
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0)""")
+
+
 
             # Migration: add message requirement to auto-entry roles
             try:
@@ -1293,6 +1299,508 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     elif notify_msg_id and payload.message_id == notify_msg_id:
         await _resend_notify()  # Bot's own notify was deleted — resend it
 
+# --- ADMIN PANEL ---------------------------------------
+
+async def _resolve_member_from_input(
+        guild: discord.Guild, raw: str) -> Optional[discord.Member]:
+    """Parse a user-ID string (plain or @mention) into a guild Member."""
+    uid_str = raw.strip().lstrip("<@!").rstrip(">")
+    try:
+        uid = int(uid_str)
+    except ValueError:
+        return None
+    member = guild.get_member(uid)
+    if not member:
+        try:
+            member = await guild.fetch_member(uid)
+        except Exception:
+            pass
+    return member
+ 
+ 
+class _APModal_Economy(discord.ui.Modal):
+    """Admin panel modal: add or remove balance / EXP / tickets / VIP keys / tokens."""
+ 
+    def __init__(self, guild: discord.Guild, resource: str):
+        _cfgs = {
+            "balance": ("💰 Modify Balance",  "Coins — positive adds, negative removes",    "💰", "coins"),
+            "exp":     ("⭐ Modify EXP",      "Usable EXP — positive adds, negative removes","⭐", "EXP"),
+            "tickets": ("🎟 Modify Tickets",  "Raffle tickets — positive adds, negative removes","🎟","tickets"),
+            "vipkey":  ("🔑 Modify VIP Keys", "Keys — positive adds, negative removes",     "🔑", "VIP Keys"),
+            "token":   ("🎲 Modify Tokens",   "Gamble Tokens — positive adds, negative removes","🎲","Gamble Tokens"),
+        }
+        title, placeholder, self._icon, self._label = _cfgs.get(
+            resource, ("Modify", "Amount", "?", "items"))
+        super().__init__(title=title)
+        self.guild    = guild
+        self.resource = resource
+ 
+        self.uid_field = discord.ui.TextInput(
+            label="User ID  (right-click user → Copy ID)",
+            placeholder="e.g. 123456789012345678",
+            min_length=15, max_length=21)
+        self.amt_field = discord.ui.TextInput(
+            label="Amount  (+add / −remove)",
+            placeholder=placeholder,
+            max_length=20)
+        self.add_item(self.uid_field)
+        self.add_item(self.amt_field)
+ 
+    async def on_submit(self, interaction: discord.Interaction):
+        member = await _resolve_member_from_input(self.guild, self.uid_field.value)
+        if not member:
+            await interaction.response.send_message(
+                "❌ User not found. Make sure you paste their numeric User ID.",
+                ephemeral=True)
+            return
+        try:
+            amt = int(self.amt_field.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Invalid amount — enter a whole number (e.g. `500` or `-200`).",
+                ephemeral=True)
+            return
+ 
+        gid, uid = self.guild.id, member.id
+        if self.resource == "balance":
+            await add_balance(gid, uid, amt)
+            new_val = await get_balance(gid, uid)
+        elif self.resource == "exp":
+            await add_exp(gid, uid, amt, is_bonus=True)
+            new_val = await get_exp(gid, uid)
+        elif self.resource == "tickets":
+            await add_tickets(gid, uid, amt)
+            new_val = await get_tickets(gid, uid)
+        elif self.resource == "vipkey":
+            if amt >= 0:
+                await inventory_add(gid, uid, VIP_CHEST_KEY, amt)
+            else:
+                await inventory_remove(gid, uid, VIP_CHEST_KEY, abs(amt))
+            new_val = next((q for n, q in await inventory_get(gid, uid)
+                            if n.lower() == VIP_CHEST_KEY.lower()), 0)
+        elif self.resource == "token":
+            if amt >= 0:
+                await inventory_add(gid, uid, GAMBLE_TOKEN, amt)
+            else:
+                await inventory_remove(gid, uid, GAMBLE_TOKEN, abs(amt))
+            new_val = next((q for n, q in await inventory_get(gid, uid)
+                            if n.lower() == GAMBLE_TOKEN.lower()), 0)
+        else:
+            return
+ 
+        sign  = "+" if amt >= 0 else ""
+        color = discord.Color.green() if amt >= 0 else discord.Color.red()
+        await interaction.response.send_message(
+            f"✅ {self._icon} **{sign}{amt:,}** {self._label} → {member.mention}. "
+            f"Now: **{new_val:,}**",
+            ephemeral=True)
+        await log_event(gid, "admin", _log_embed(
+            f"⚙️ Admin Panel · {self._label}", color,
+            By=interaction.user.mention, User=member.mention,
+            Change=f"{sign}{amt:,}", Now=str(new_val)))
+        if self.resource == "balance":
+            await log_event(gid, "balance", _log_embed(
+                "💰 Balance Modified", color,
+                Admin=interaction.user.mention, User=member.mention,
+                Amount=f"{sign}{amt:,}", New=f"{new_val:,}"))
+        elif self.resource == "exp":
+            await log_event(gid, "exp", _log_embed(
+                "⭐ EXP Modified", color,
+                Admin=interaction.user.mention, User=member.mention,
+                Amount=f"{sign}{amt:,}"))
+ 
+ 
+class _APModal_Item(discord.ui.Modal, title="🎒 Give / Take Item"):
+    """Admin panel modal: give or take any item / box by name."""
+ 
+    uid_field  = discord.ui.TextInput(
+        label="User ID  (right-click → Copy ID)",
+        placeholder="e.g. 123456789012345678",
+        min_length=15, max_length=21)
+    name_field = discord.ui.TextInput(
+        label="Item / box name  (exact, case-insensitive)",
+        placeholder="e.g. Mystery Box  or  VIP Chest Key",
+        max_length=100)
+    qty_field  = discord.ui.TextInput(
+        label="Quantity  (+give / −take)",
+        placeholder="e.g. 3  or  -1",
+        default="1", max_length=10)
+ 
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+ 
+    async def on_submit(self, interaction: discord.Interaction):
+        member = await _resolve_member_from_input(self.guild, self.uid_field.value)
+        if not member:
+            await interaction.response.send_message(
+                "❌ User not found.", ephemeral=True)
+            return
+        try:
+            qty = int(self.qty_field.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Invalid quantity.", ephemeral=True)
+            return
+        iname = self.name_field.value.strip()
+        if not iname:
+            await interaction.response.send_message(
+                "❌ Item name cannot be empty.", ephemeral=True)
+            return
+ 
+        gid, uid = self.guild.id, member.id
+        if qty >= 0:
+            await inventory_add(gid, uid, iname, qty)
+            msg = f"✅ Gave **{qty}x {iname}** to {member.mention}."
+        else:
+            ok = await inventory_remove(gid, uid, iname, abs(qty))
+            if not ok:
+                await interaction.response.send_message(
+                    f"❌ {member.mention} doesn't have {abs(qty)}x **{iname}**.",
+                    ephemeral=True)
+                return
+            msg = f"✅ Took **{abs(qty)}x {iname}** from {member.mention}."
+ 
+        await interaction.response.send_message(msg, ephemeral=True)
+        await log_event(gid, "item", _log_embed(
+            "🎒 Item Modified (Admin Panel)", discord.Color.orange(),
+            Admin=interaction.user.mention, User=member.mention,
+            Item=iname, Change=f"{qty:+}"))
+        await log_event(gid, "admin", _log_embed(
+            "⚙️ Admin Panel · Item", discord.Color.orange(),
+            By=interaction.user.mention, User=member.mention,
+            Change=f"{qty:+}x {iname}"))
+ 
+ 
+class _APModal_CheckUser(discord.ui.Modal, title="🔍 Check User Stats"):
+    """Admin panel modal: view full stats for any user (ephemeral)."""
+ 
+    uid_field = discord.ui.TextInput(
+        label="User ID  (right-click → Copy ID)",
+        placeholder="e.g. 123456789012345678",
+        min_length=15, max_length=21)
+ 
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+ 
+    async def on_submit(self, interaction: discord.Interaction):
+        member = await _resolve_member_from_input(self.guild, self.uid_field.value)
+        if not member:
+            await interaction.response.send_message(
+                "❌ User not found.", ephemeral=True)
+            return
+ 
+        gid, uid = self.guild.id, member.id
+        bal     = await get_balance(gid, uid)
+        exp     = await get_exp(gid, uid)
+        lexp    = await get_level_exp(gid, uid)
+        lvl     = await get_level(gid, uid)
+        tickets = await get_tickets(gid, uid)
+        tokens  = await get_gamble_tokens(gid, uid)
+        inv     = await inventory_get(gid, uid)
+        keys    = next((q for n, q in inv if n.lower() == VIP_CHEST_KEY.lower()), 0)
+ 
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(tickets),0) FROM raffle WHERE guild_id=?",
+                (gid,)) as cur:
+                total_tix = (await cur.fetchone())[0]
+        chance = (tickets / total_tix * 100) if total_tix else 0
+ 
+        embed = discord.Embed(
+            title=f"🔍 {member.display_name}",
+            color=discord.Color.blurple())
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="💰 Balance",
+                        value=f"{bal:,} coins", inline=True)
+        embed.add_field(name="⭐ Activity Rank",
+                        value=f"Rank {lvl}", inline=True)
+        embed.add_field(name="⭐ EXP (7d)",
+                        value=f"{lexp:,} total  /  {exp:,} usable", inline=True)
+        embed.add_field(name="🎟 Tickets",
+                        value=f"{tickets:,} ({chance:.1f}% win chance)", inline=True)
+        embed.add_field(name="🎲 Gamble Tokens",
+                        value=str(tokens), inline=True)
+        embed.add_field(name="🔑 VIP Keys",
+                        value=str(keys), inline=True)
+ 
+        other_inv = [(n, q) for n, q in inv
+                     if n not in (VIP_CHEST_KEY, GAMBLE_TOKEN)]
+        if other_inv:
+            inv_lines = [f"• **{n}** ×{q}" for n, q in other_inv[:15]]
+            if len(other_inv) > 15:
+                inv_lines.append(f"*… +{len(other_inv) - 15} more items*")
+            embed.add_field(name="🎒 Inventory",
+                            value="\n".join(inv_lines), inline=False)
+        else:
+            embed.add_field(name="🎒 Inventory", value="Empty", inline=False)
+ 
+        embed.set_footer(text=f"ID: {uid}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+ 
+ 
+class _APModal_Reset(discord.ui.Modal, title="🗑 Reset User Data"):
+    """Admin panel modal: wipe one or all data categories for a user."""
+ 
+    uid_field  = discord.ui.TextInput(
+        label="User ID  (right-click → Copy ID)",
+        placeholder="e.g. 123456789012345678",
+        min_length=15, max_length=21)
+    type_field = discord.ui.TextInput(
+        label="What to reset",
+        placeholder="balance  |  exp  |  inventory  |  tickets  |  stats  |  all",
+        max_length=20)
+ 
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+ 
+    async def on_submit(self, interaction: discord.Interaction):
+        member = await _resolve_member_from_input(self.guild, self.uid_field.value)
+        if not member:
+            await interaction.response.send_message(
+                "❌ User not found.", ephemeral=True)
+            return
+        rtype = self.type_field.value.strip().lower()
+        valid = {"balance", "exp", "inventory", "tickets", "stats", "all"}
+        if rtype not in valid:
+            await interaction.response.send_message(
+                f"❌ Invalid type. Choose one of: {', '.join(sorted(valid))}",
+                ephemeral=True)
+            return
+        await _do_reset(self.guild.id, member.id, rtype)
+        await interaction.response.send_message(
+            f"🗑 Reset **{rtype}** for {member.mention}.", ephemeral=True)
+        await log_event(self.guild.id, "admin", _log_embed(
+            "🗑 Admin Panel · Reset", discord.Color.red(),
+            By=interaction.user.mention, User=member.mention, Type=rtype))
+ 
+ 
+async def _build_admin_panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🛠 Admin Control Panel",
+        description=(
+            "Interactive admin tools — all actions require the **Giveaway/Admin role** "
+            "and are logged. Responses are only visible to you.\n\u200b"
+        ),
+        color=discord.Color.dark_gold())
+    embed.add_field(
+        name="Row 1 — Economy  (enter a User ID + positive or negative amount)",
+        value=(
+            "**💰 Balance** — coins\n"
+            "**⭐ EXP** — usable EXP (bonus, doesn't change Activity Rank total)\n"
+            "**🎟 Tickets** — raffle tickets\n"
+            "**🔑 VIP Keys** — VIP Chest Keys\n"
+            "**🎲 Tokens** — Gamble Tokens"
+        ), inline=False)
+    embed.add_field(
+        name="Row 2 — Management",
+        value=(
+            "**🎒 Item** — give or take any item/box by name (use +qty or −qty)\n"
+            "**🔍 Check User** — view balance, EXP, tickets, inventory for any user\n"
+            "**🗑 Reset User** — wipe a data category (balance/exp/inventory/…/all)\n"
+            "**⚙️ Systems** — see which major systems are on/off\n"
+            "**📊 Server Stats** — economy-wide totals"
+        ), inline=False)
+    embed.set_footer(text="All responses are ephemeral — only the clicker sees them")
+    return embed
+ 
+ 
+async def _refresh_admin_panel(guild: discord.Guild):
+    """Re-post or edit the admin panel embed in its configured channel."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM admin_panel_config WHERE guild_id=?",
+            (guild.id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return
+    ch_id, msg_id = row
+    channel = bot.get_channel(ch_id)
+    if not channel:
+        return
+    embed = await _build_admin_panel_embed()
+    view  = AdminPanelView()
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=view)
+            return
+        except discord.NotFound:
+            pass
+    new_msg = await channel.send(embed=embed, view=view)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE admin_panel_config SET message_id=? WHERE guild_id=?",
+                (new_msg.id, guild.id))
+            await db.commit()
+ 
+ 
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+ 
+    async def _perm_check(self, interaction: discord.Interaction) -> bool:
+        ok = await is_allowed_to_giveaway(interaction)
+        if not ok:
+            await interaction.response.send_message(
+                "❌ You don't have permission to use the admin panel.", ephemeral=True)
+        return ok
+ 
+    # ── Row 0 : Economy ───────────────────────────────────────────────────────
+    @discord.ui.button(label="💰 Balance",  style=discord.ButtonStyle.primary,
+                       custom_id="admin_panel:balance", row=0)
+    async def btn_balance(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(
+            _APModal_Economy(interaction.guild, "balance"))
+ 
+    @discord.ui.button(label="⭐ EXP",     style=discord.ButtonStyle.primary,
+                       custom_id="admin_panel:exp", row=0)
+    async def btn_exp(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(
+            _APModal_Economy(interaction.guild, "exp"))
+ 
+    @discord.ui.button(label="🎟 Tickets", style=discord.ButtonStyle.primary,
+                       custom_id="admin_panel:tickets", row=0)
+    async def btn_tickets(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(
+            _APModal_Economy(interaction.guild, "tickets"))
+ 
+    @discord.ui.button(label="🔑 VIP Keys", style=discord.ButtonStyle.primary,
+                       custom_id="admin_panel:vipkey", row=0)
+    async def btn_vipkey(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(
+            _APModal_Economy(interaction.guild, "vipkey"))
+ 
+    @discord.ui.button(label="🎲 Tokens",  style=discord.ButtonStyle.primary,
+                       custom_id="admin_panel:token", row=0)
+    async def btn_token(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(
+            _APModal_Economy(interaction.guild, "token"))
+ 
+    # ── Row 1 : Management ────────────────────────────────────────────────────
+    @discord.ui.button(label="🎒 Item",        style=discord.ButtonStyle.secondary,
+                       custom_id="admin_panel:item", row=1)
+    async def btn_item(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(_APModal_Item(interaction.guild))
+ 
+    @discord.ui.button(label="🔍 Check User",  style=discord.ButtonStyle.secondary,
+                       custom_id="admin_panel:check", row=1)
+    async def btn_check(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(_APModal_CheckUser(interaction.guild))
+ 
+    @discord.ui.button(label="🗑 Reset User",  style=discord.ButtonStyle.danger,
+                       custom_id="admin_panel:reset", row=1)
+    async def btn_reset(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        await interaction.response.send_modal(_APModal_Reset(interaction.guild))
+ 
+    @discord.ui.button(label="⚙️ Systems",     style=discord.ButtonStyle.secondary,
+                       custom_id="admin_panel:systems", row=1)
+    async def btn_systems(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        gid   = interaction.guild.id
+        lines = []
+        for flag, label in _SYSTEM_LABELS.items():
+            on = await is_system_enabled(gid, flag)
+            lines.append(f"{'✅' if on else '🔒'} **{label}**: {'Enabled' if on else 'Disabled'}")
+        if global_disabled_commands:
+            lines.append(
+                "\n🌐 **Globally disabled commands:** "
+                + ", ".join(f"`/{c}`" for c in sorted(global_disabled_commands)))
+        local_off = sorted(disabled_commands.get(gid, set()))
+        if local_off:
+            lines.append(
+                "🔒 **Disabled in this server:** "
+                + ", ".join(f"`/{c}`" for c in local_off))
+        embed = discord.Embed(
+            title="⚙️ System Status",
+            description="\n".join(lines),
+            color=discord.Color.blurple())
+        embed.set_footer(text="Use /enablesystem or /disablesystem to toggle")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+ 
+    @discord.ui.button(label="📊 Server Stats", style=discord.ButtonStyle.secondary,
+                       custom_id="admin_panel:serverstats", row=1)
+    async def btn_serverstats(self, interaction: discord.Interaction, _btn):
+        if not await self._perm_check(interaction): return
+        gid = interaction.guild.id
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(balance),0) "
+                "FROM balances WHERE guild_id=?", (gid,)) as cur:
+                bal_cnt, total_bal = await cur.fetchone()
+            async with db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(tickets),0) "
+                "FROM raffle WHERE guild_id=?", (gid,)) as cur:
+                raffle_cnt, total_tix = await cur.fetchone()
+            async with db.execute(
+                "SELECT COALESCE(SUM(chests_opened),0) "
+                "FROM user_stats WHERE guild_id=?", (gid,)) as cur:
+                total_chests = (await cur.fetchone())[0]
+            async with db.execute(
+                "SELECT COUNT(*) FROM giveaways WHERE ended=1") as cur:
+                total_ga = (await cur.fetchone())[0]
+        embed = discord.Embed(
+            title="📊 Server Economy Overview",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(UTC))
+        embed.add_field(name="💰 Coins in circulation", value=f"{total_bal:,}",    inline=True)
+        embed.add_field(name="👥 Users w/ balance",      value=f"{bal_cnt:,}",     inline=True)
+        embed.add_field(name="🎟 Raffle pool",           value=f"{total_tix:,}",   inline=True)
+        embed.add_field(name="🎟 Raffle participants",   value=f"{raffle_cnt:,}",  inline=True)
+        embed.add_field(name="📦 Chests opened (total)", value=f"{total_chests:,}",inline=True)
+        embed.add_field(name="🎉 Giveaways run",         value=f"{total_ga:,}",    inline=True)
+        embed.set_footer(text="Live snapshot")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+ 
+ 
+@bot.tree.command(name="setadminpanel",
+                  description="Post the admin control panel in a channel")
+@app_commands.describe(channel="Channel to post the panel in")
+@command_enabled()
+async def setadminpanel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    gid = interaction.guild.id
+ 
+    # Remove old panel if it was in a different channel
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id, message_id FROM admin_panel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            old = await cur.fetchone()
+    if old and old[0] and old[0] != channel.id and old[1]:
+        old_ch = bot.get_channel(old[0])
+        if old_ch:
+            try:
+                await (await old_ch.fetch_message(old[1])).delete()
+            except Exception:
+                pass
+ 
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO admin_panel_config(guild_id, channel_id, message_id) "
+                "VALUES(?,?,0) ON CONFLICT(guild_id) DO UPDATE SET "
+                "channel_id=excluded.channel_id, message_id=0",
+                (gid, channel.id))
+            await db.commit()
+ 
+    await _refresh_admin_panel(interaction.guild)
+    await interaction.followup.send(f"✅ Admin panel posted in {channel.mention}.")
+
 # ═══════════════════════════════════════════════════════
 # READY EVENT
 # ═══════════════════════════════════════════════════════
@@ -1308,6 +1816,7 @@ async def on_ready():
     bot.add_view(VerificationView())
     bot.add_view(ChestChannelView())
     bot.add_view(StatsChannelView())
+    bot.add_view(AdminPanelView())
 
     # Resume any auto giveaway loops that were running before the restart
     async with get_db() as db:
@@ -1339,6 +1848,11 @@ async def on_ready():
         # Stats panel
         try: await _refresh_stats_channel(_guild)
         except Exception as e: print(f"[StatsPanel restore] {_guild.name}: {e}")
+
+        try: await _refresh_admin_panel(_guild)
+        except Exception as e:
+            print(f"[AdminPanel restore] {_guild.name}: {e}")
+
 
     # Sync slash commands to every guild (guild-scoped = instant, no 1 h delay)
     ok, fail = 0, 0
@@ -1403,6 +1917,24 @@ async def on_command_error(ctx, error):
         pass  # silently ignore unknown prefix commands
     else:
         raise error
+
+@bot.before_invoke
+async def _log_prefix_command(ctx: commands.Context):
+    """Log every prefix command to the configured command-log channel."""
+    if not ctx.guild:
+        return
+    embed = discord.Embed(
+        description=(
+            f"{ctx.author.mention} used "
+            f"**`{_BOT_PREFIX}{ctx.command.qualified_name}`**"
+        ),
+        color=discord.Color.light_grey(),
+        timestamp=datetime.now(UTC))
+    embed.set_author(name=str(ctx.author), icon_url=ctx.author.display_avatar.url)
+    embed.set_footer(
+        text=f"#{getattr(ctx.channel, 'name', 'DM')} | UID: {ctx.author.id}")
+    await log_event(ctx.guild.id, "command", embed)
+
 
 # ═══════════════════════════════════════════════════════
 # GIVEAWAY ROLES
@@ -3753,57 +4285,72 @@ class WinningsView(discord.ui.View):
 async def mywinnings(interaction: discord.Interaction, user: discord.Member = None):
     user = user or interaction.user
     await interaction.response.defer()
-
-    # We filter by channel IDs that belong to this guild so wins from other
-    # guilds (whose channels happen to share IDs) can't bleed through.
-    guild_channel_ids = [c.id for c in interaction.guild.channels]
-    if not guild_channel_ids:
-        await interaction.followup.send("❌ No channels found."); return
-
-    placeholders = ",".join("?" * len(guild_channel_ids))
-    async with get_db() as db:
-        async with db.execute(
-            f"SELECT gw.message_id, g.prize, g.end_time, g.channel_id "
-            f"FROM giveaway_winners gw "
-            f"JOIN giveaways g ON gw.message_id = g.message_id "
-            f"WHERE gw.winner_id = ? AND g.channel_id IN ({placeholders}) "
-            f"ORDER BY g.end_time DESC",
-            (user.id, *guild_channel_ids)) as cur:
-            rows = await cur.fetchall()
-
+ 
+    guild_channel_set = {c.id for c in interaction.guild.channels}
+ 
+    try:
+        # Fetch all wins for this user then filter in Python.
+        # This avoids the "too many SQL bind parameters" crash on large servers
+        # that caused the bot to silently hang when a user had no wins.
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT gw.message_id, g.prize, g.end_time, g.channel_id "
+                "FROM giveaway_winners gw "
+                "JOIN giveaways g ON gw.message_id = g.message_id "
+                "WHERE gw.winner_id = ? "
+                "ORDER BY g.end_time DESC",
+                (user.id,)) as cur:
+                all_rows = await cur.fetchall()
+        rows = [r for r in all_rows if r[3] in guild_channel_set]
+    except Exception as e:
+        await interaction.followup.send(f"❌ Database error: {e}")
+        return
+ 
     if not rows:
         embed = discord.Embed(
             title=f"🏆 {user.display_name}'s Wins",
             description="No giveaway wins found in this server yet.",
             color=discord.Color.gold())
         embed.set_thumbnail(url=user.display_avatar.url)
-        await interaction.followup.send(embed=embed); return
-
-    # Also fetch auto-entry status for this user
+        await interaction.followup.send(embed=embed)
+        return
+ 
+    # Auto-entry status
     async with get_db() as db:
         async with db.execute(
             "SELECT enabled FROM auto_entry_users WHERE guild_id=? AND user_id=?",
             (interaction.guild.id, user.id)) as cur:
             ae_row = await cur.fetchone()
     ae_status = "✅ On" if (ae_row and ae_row[0]) else "🔒 Off"
-
+ 
+    # Tally total coins won across all giveaways
+    total_coins_won = 0
+    for _, prize_raw, _, _ in rows:
+        try:
+            meta = json.loads(prize_raw)
+            if isinstance(meta, dict):
+                total_coins_won += int(meta.get("balance", 0))
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+ 
     # Build paginated embeds
     pages: list[discord.Embed] = []
     for page_start in range(0, len(rows), _WINS_PER_PAGE):
-        chunk = rows[page_start:page_start + _WINS_PER_PAGE]
-        page_num = page_start // _WINS_PER_PAGE + 1
+        chunk       = rows[page_start:page_start + _WINS_PER_PAGE]
+        page_num    = page_start // _WINS_PER_PAGE + 1
         total_pages = (len(rows) + _WINS_PER_PAGE - 1) // _WINS_PER_PAGE
-
+ 
         embed = discord.Embed(
             title=f"🏆 {user.display_name}'s Wins",
             color=discord.Color.gold())
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.description = (
-            f"**Total wins:** {len(rows):,} | **Auto-entry:** {ae_status}\n\u200b"
+            f"**Total wins:** {len(rows):,} | "
+            f"**Coins won:** {total_coins_won:,} | "
+            f"**Auto-entry:** {ae_status}\n\u200b"
         )
-
+ 
         for msg_id, prize_raw, end_time, ch_id in chunk:
-            # Parse prize label and reward summary
             try:
                 meta        = json.loads(prize_raw)
                 prize_label = meta.get("label", str(prize_raw))
@@ -3811,29 +4358,25 @@ async def mywinnings(interaction: discord.Interaction, user: discord.Member = No
             except (json.JSONDecodeError, TypeError, AttributeError):
                 prize_label = str(prize_raw)
                 reward_str  = "—"
-
-            ch      = interaction.guild.get_channel(ch_id)
-            ch_str  = ch.mention if ch else "*(deleted channel)*"
+ 
+            ch       = interaction.guild.get_channel(ch_id)
+            ch_str   = ch.mention if ch else "*(deleted channel)*"
             date_str = f"<t:{end_time}:D>" if end_time else "Unknown date"
-
+ 
             embed.add_field(
                 name=f"🎉 {prize_label[:64]}",
                 value=f"📅 {date_str} · {ch_str}\n💰 {reward_str}",
                 inline=False)
-
+ 
         embed.set_footer(text=f"Page {page_num}/{total_pages} · {len(rows)} total win(s)")
         pages.append(embed)
-
+ 
     view = WinningsView(pages, interaction.user.id)
     await interaction.followup.send(
         embed=pages[0],
         view=view if len(pages) > 1 else None)
-
-
-# ── autoentry command — extend existing to show status inline ─────────────────
-# The existing /autoentry command toggles auto-entry.  The new /mywinnings
-# command shows wins.  Optionally add a prefix wrapper:
-
+ 
+ 
 @bot.command(name="mywinnings")
 async def pfx_mywinnings(ctx, user: discord.Member = None):
     await mywinnings._callback(FakeInteraction(ctx), user)
@@ -5870,146 +6413,339 @@ _STAT_CHOICES = [
 # ─── HELP SYSTEM ─────────────────────────────────────────────────────────────
 
 # (emoji, display title, [(command_name, description), ...])
-_HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
+_HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
     "giveaway": ("🎉", "Giveaway Commands", [
-        ("giveaway",          "Create a giveaway. Duration in **seconds**. Supports coin, EXP, ticket, gamble token, VIP key, role, and item/box rewards."),
-        ("reroll",            "Reroll a finished giveaway by its message ID. The old winner's coins are refunded."),
-        ("addautogiveaway",   "Add a prize/reward/winners preset to the auto-rotation pool."),
-        ("removeautogiveaway","Remove a preset from the auto pool by prize name."),
-        ("startgiveaways",    "Start posting giveaways automatically at a fixed interval using the presets in the pool."),
-        ("stopgiveaways",     "Stop the automatic giveaway loop."),
-        ("addgiveawayrole",   "Give a role permission to manage giveaways and use admin commands."),
-        ("removegiveawayrole","Remove a role's management permissions."),
-        ("giveawayroles",     "List all roles with giveaway/admin permissions."),
+        ("giveaway",           "Create a giveaway with optional coin/EXP/ticket/VIP key/role/item rewards.",
+         "/giveaway <prize> <seconds> [winners] [reward_balance] [reward_exp] [reward_tickets] …"),
+        ("reroll",             "Reroll a finished giveaway by message ID.",
+         "!reroll <message_id>"),
+        ("mywinnings",         "Giveaway win history — shows total wins and coins won.",
+         "/mywinnings  or  !mywinnings [@user]"),
+        ("addautogiveaway",    "Add a prize preset to the auto-giveaway pool.",
+         "/addautogiveaway <prize> [winners] [chance] [reward_balance] [reward_exp] …"),
+        ("removeautogiveaway", "Remove a preset from the auto pool by its numeric ID.",
+         "!removeautogiveaway <id>"),
+        ("listautogiveaways",  "List every preset in the auto pool with weights and rewards.",
+         "!listautogiveaways"),
+        ("startgiveaways",     "Start posting giveaways automatically.",
+         "/startgiveaways <interval_seconds> <giveaway_duration_seconds> [channel]"),
+        ("stopgiveaways",      "Stop the automatic giveaway loop.",
+         "!stopgiveaways"),
+        ("addgiveawayrole",    "Give a role permission to manage giveaways.",
+         "/addgiveawayrole <role>  or  !addgiveawayrole @role"),
+        ("removegiveawayrole", "Remove a role's giveaway-management permissions.",
+         "/removegiveawayrole <role>  or  !removegiveawayrole @role"),
+        ("giveawayroles",      "List all roles with giveaway/admin permissions.",
+         "!giveawayroles"),
+        ("autoentry",          "Toggle automatic entry into all server giveaways.",
+         "/autoentry"),
+        ("addautoentryrole",   "Add a role that grants auto-entry (optional daily-message requirement).",
+         "/addautoentryrole <role> [message_requirement]  or  !addautoentryrole @role [messages]"),
+        ("removeautoentryrole","Remove a role from auto-entry eligibility.",
+         "/removeautoentryrole <role>"),
+        ("listautoentryroles", "List auto-entry roles and their message requirements.",
+         "/listautoentryroles"),
     ]),
     "economy": ("💰", "Economy & EXP", [
-        ("balance",             "Check a user's coin balance."),
-        ("gift",                "Send coins to another user (deducted from your own balance)."),
-        ("addbalance",          "Admin: add coins to a user."),
-        ("removebalance",       "Admin: remove coins from a user."),
-        ("level",               "Show Level, **Total EXP (7d)** (used for level), and **Usable EXP** (spent on chests)."),
-        ("addexp",              "Admin: add **usable EXP only** — does **not** change level or Total EXP (7d)."),
-        ("removeexp",           "Admin: deduct EXP from a user."),
-        ("addtotalexp",         "Admin: add to **Total EXP (7d) and level only** — usable EXP stays the same."),
-        ("removetotalexp",      "Admin: remove from **Total EXP (7d) and level only** — usable EXP stays the same."),
-        ("expboost",            "Set a chat-EXP multiplier for a role, e.g. +50% or -25%. Multiple roles are summed."),
-        ("removeexpboost",      "Remove a role's EXP multiplier."),
-        ("listexpboosts",       "List all active EXP boosts."),
-        ("leaderboard",         "Top-10 across: Balance, Total EXP, Current EXP, Tickets, Chests Opened, Gifted Balance."),
-        ("addleaderboardstat",  "Admin: directly add to a user's leaderboard stat."),
-        ("removeleaderboardstat","Admin: directly subtract from a user's leaderboard stat."),
+        ("balance",              "Check a user's coin balance.",
+         "/balance [@user]  or  !balance [@user]"),
+        ("gift",                 "Send coins to another user (deducted from your balance).",
+         "!gift @user <amount>"),
+        ("addbalance",           "Admin: add coins to a user.",
+         "!addbalance @user <amount>"),
+        ("removebalance",        "Admin: remove coins from a user.",
+         "!removebalance @user <amount>"),
+        ("activityrank",         "Show Activity Rank, Total EXP (7d), and Usable EXP.",
+         "/activityrank [@user]  or  !activityrank [@user]"),
+        ("addexp",               "Admin: add usable EXP only (does not change Activity Rank).",
+         "!addexp @user <amount>"),
+        ("removeexp",            "Admin: deduct EXP.",
+         "!removeexp @user <amount>"),
+        ("addtotalexp",          "Admin: add to Activity Rank EXP only (usable EXP unchanged).",
+         "!addtotalexp @user <amount>"),
+        ("removetotalexp",       "Admin: subtract from Activity Rank EXP only.",
+         "!removetotalexp @user <amount>"),
+        ("expboost",             "Set a chat-EXP multiplier for a role (global, channel, or category).",
+         "/expboost <role> <boost> [channel] [category]  or  !expboost @role <boost> [#channel]"),
+        ("removeexpboost",       "Remove a role's EXP multiplier for a given scope.",
+         "/removeexpboost <role> [channel] [category]  or  !removeexpboost @role [#channel]"),
+        ("listexpboosts",        "List all active EXP boosts and their scopes.",
+         "/listexpboosts  or  !listexpboosts"),
+        ("leaderboard",          "Paginated top-10: Balance / EXP / Tickets / Chests / Gifted Balance.",
+         "/leaderboard <category> [page]  or  !leaderboard [category] [page]"),
+        ("addleaderboardstat",   "Admin: directly add to a leaderboard stat.",
+         "!addleaderboardstat @user <stat> <amount>"),
+        ("removeleaderboardstat","Admin: directly subtract from a leaderboard stat.",
+         "!removeleaderboardstat @user <stat> <amount>"),
     ]),
     "raffle": ("🎟", "Raffle", [
-        ("buytickets",          "Buy tickets for 100 coins each. More tickets → higher win chance (weighted draw)."),
-        ("rafflechance",        "Check a user's ticket count and current win probability."),
-        ("addtickets",          "Admin: add tickets to a user."),
-        ("removetickets",       "Admin: remove tickets from a user."),
-        ("setrafflechannel",    "Set the channel for daily winner announcements."),
-        ("setraffleinfochannel","Post a live status board showing the pool and top participants (auto-updates every 60 s)."),
+        ("buytickets",          "Buy raffle tickets (100 coins each). More tickets = higher chance.",
+         "/buytickets <amount>  or  !buytickets <amount>"),
+        ("rafflechance",        "Check a user's ticket count and win probability.",
+         "/rafflechance [@user]  or  !rafflechance [@user]"),
+        ("addtickets",          "Admin: add tickets to a user.",
+         "!addtickets @user <amount>"),
+        ("removetickets",       "Admin: remove tickets from a user.",
+         "!removetickets @user <amount>"),
+        ("checkrafflehistory",  "Admin: see the last 10 raffle draws.",
+         "!checkrafflehistory"),
+        ("setrafflechannel",    "Set the channel for daily raffle winner announcements.",
+         "/setrafflechannel <#channel>  or  !setrafflechannel #channel"),
+        ("setraffleinfochannel","Post a live raffle status board (auto-updates every 60 s).",
+         "/setraffleinfochannel <#channel>  or  !setraffleinfochannel #channel"),
     ]),
     "chests": ("📦", "Chests", [
-        ("chest",               "Open EXP chest(s). Costs **1 000 EXP** each. Bulk-open when you have ≥1 400 EXP."),
-        ("vipchest",            "Open VIP Chest(s) — costs 1 **VIP Chest Key** each (max 10). Better prizes than normal chests."),
-        ("givekey",             "Admin: give VIP Chest Keys to a user."),
-        ("takekey",             "Admin: take VIP Chest Keys from a user."),
-        ("addchestprize",       "Admin: add a custom prize to the EXP or VIP chest loot table (overrides defaults for this server)."),
-        ("removechestprize",    "Admin: remove a custom chest prize by ID (see /listchestprizes)."),
-        ("listchestprizes",     "List all prizes and drop percentages for a chest type."),
-        ("addrarechestdrop",    "Admin: mark a prize name **or ID** as a rare drop for announcements. Custom list replaces defaults once any entry is added."),
-        ("removerarechestdrop", "Admin: unmark a prize as a rare drop."),
-        ("setraredropchannel",  "Set the channel for all rare-drop announcements (chests, VIP chests, and boxes)."),
+        ("chest",               "Open EXP chest(s). Costs 1,000 EXP each.",
+         "/chest [amount]  or  !chest [amount]"),
+        ("vipchest",            "Open VIP Chest(s) — costs 1 VIP Key each (max 10 at once).",
+         "/vipchest [amount]  or  !vipchest [amount]"),
+        ("setchestchannel",     "Post the interactive Chest Panel (open EXP/VIP chests via buttons).",
+         "/setchestchannel <#channel>  or  !setchestchannel #channel"),
+        ("givekey",             "Admin: give VIP Chest Keys to a user.",
+         "!givekey @user [amount]"),
+        ("takekey",             "Admin: take VIP Chest Keys from a user.",
+         "!takekey @user [amount]"),
+        ("givekeyrole",         "Admin: give keys to every member with a role.",
+         "!givekeyrole @role [amount]"),
+        ("takekeyrole",         "Admin: take keys from every member with a role.",
+         "!takekeyrole @role [amount]"),
+        ("addchestprize",       "Admin: add a custom prize to a chest loot table (overrides defaults).",
+         "/addchestprize <chest|vipchest> <name> [exp] [balance] [chance]  or  !addchestprize …"),
+        ("removechestprize",    "Admin: remove a chest prize by ID (see !listchestprizes).",
+         "/removechestprize <chest|vipchest> <prize_id>  or  !removechestprize <type> <id>"),
+        ("listchestprizes",     "List all prizes and drop percentages for a chest type.",
+         "!listchestprizes [chest|vipchest]"),
+        ("addrarechestdrop",    "Admin: mark a prize as a rare drop (triggers announcement).",
+         "/addrarechestdrop <chest|vipchest> <prize_name_or_id>"),
+        ("removerarechestdrop", "Admin: unmark a prize as a rare drop.",
+         "/removerarechestdrop <chest|vipchest> <prize_name_or_id>"),
+        ("setraredropchannel",  "Set the announcement channel for rare drops from chests and boxes.",
+         "/setraredropchannel <#channel>  or  !setraredropchannel #channel"),
     ]),
     "items": ("🛒", "Item Store & Inventory", [
-        ("item store",  "Browse items available to purchase."),
-        ("item buy",    "Buy an item for coins (goes to your inventory)."),
-        ("item use",    "Redeem a store item to receive its Discord role."),
-        ("item inv",    "View a user's inventory — items, boxes, VIP keys, and gamble tokens."),
-        ("item info",   "Show details for an item **or** box (includes all prizes and drop chances)."),
-        ("item give",   "Admin: give any item, box, VIP Chest Key, or Gamble Token to a user."),
-        ("item take",   "Admin: take any item, box, VIP Chest Key, or Gamble Token from a user."),
-        ("item add",    "Admin: add a new purchasable item to the store (linked to a Discord role)."),
-        ("item remove", "Admin: remove an item from the store."),
+        ("item store",  "Browse items available to purchase.",
+         "/item store  or  !item store"),
+        ("item buy",    "Buy an item for coins (goes to your inventory).",
+         "/item buy <name>  or  !item buy <name>"),
+        ("item use",    "Redeem a store item to receive its Discord role.",
+         "/item use <name>  or  !item use <name>"),
+        ("item inv",    "View a user's full inventory.",
+         "/item inv [@user]  or  !item inv [@user]"),
+        ("item info",   "Show details for an item or box (including all prizes and drop rates).",
+         "/item info <name>  or  !item info <name>"),
+        ("item give",   "Admin: give any item, box, VIP Key, or Gamble Token to a user.",
+         "/item give <@user> <name> [quantity]  or  !item give @user <name> [qty]"),
+        ("item take",   "Admin: take an item from a user.",
+         "/item take <@user> <name> [quantity]  or  !item take @user <name> [qty]"),
+        ("item add",    "Admin: add a new purchasable item to the store (linked to a role).",
+         "/item add <name> <price> <role> <description>  or  !item add <name> <price> @role <desc>"),
+        ("item remove", "Admin: remove an item from the store.",
+         "/item remove <name>  or  !item remove <name>"),
     ]),
     "boxes": ("🎁", "Admin Abuse Boxes", [
-        ("addbox",          "Create a new box."),
-        ("removebox",       "Delete a box and all its prizes permanently."),
-        ("addboxprize",     "Add a prize to a box — balance, EXP, item, nothing, or a custom label."),
-        ("removeboxprize",  "Remove a specific prize from a box by ID (see /listboxes)."),
-        ("listboxes",       "List every box with its prizes, weights, and percentage chances."),
-        ("givebox",         "Give boxes to every member that has a specific role."),
-        ("openbox",         "Open one or more boxes from your inventory (max 20 at once)."),
-        ("addrarebox",      "Admin: mark a box prize by ID as a rare drop → triggers an announcement."),
-        ("removerarebox",   "Admin: unmark a box prize as a rare drop."),
+        ("addbox",          "Create a new box.",
+         "!addbox <name>"),
+        ("removebox",       "Delete a box and all its prizes permanently.",
+         "!removebox <name>"),
+        ("addboxprize",     "Add a prize to a box (balance / EXP / item / nothing / custom).",
+         "/addboxprize <box> <prize_type> <chance> [amount] [item_name] [custom_label]"),
+        ("removeboxprize",  "Remove a prize from a box by ID (see !listboxes).",
+         "!removeboxprize <box_name> <prize_id>"),
+        ("listboxes",       "List every box with prizes, weights, and percentages.",
+         "!listboxes [box_name]"),
+        ("givebox",         "Give boxes to every member with a specific role.",
+         "!givebox @role <amount> <box_name>"),
+        ("openbox",         "Open one or more boxes from your inventory (max 20).",
+         "/openbox <box> [amount]  or  !openbox <box> [amount]"),
+        ("addrarebox",      "Admin: mark a box prize ID as a rare drop (triggers announcement).",
+         "!addrarebox <box_name> <prize_id>"),
+        ("removerarebox",   "Admin: unmark a box prize as a rare drop.",
+         "!removerarebox <box_name> <prize_id>"),
     ]),
     "gambling": ("🎲", "Gambling", [
-        ("blackjack",       (
-            "Play blackjack vs the dealer — costs 1 **Gamble Token**.\n"
-            "**Hit** ➕ draw a card\n"
-            "**Stand** ✋ end your turn\n"
-            "**Double** ⬆️ first action only: double your bet, receive exactly one more card, then auto-stand\n"
-            "**Split** ✂️ first action only, same-value cards: split into two independent hands each with the original bet\n"
-            "Natural 21 pays **1.5×**. Dealer stands on soft 17."
-        )),
-        ("roulette",        (
-            "Spin the wheel — costs 1 **Gamble Token**.\n"
-            "**×36** — single number `0`–`36`\n"
-            "**×2** — `red` · `black` · `even` · `odd` · `1-18` / `low` · `19-36` / `high`\n"
-            "**×3 dozens** — `1-12` · `13-24` · `25-36` (aliases: `dozen1/2/3`)\n"
-            "**×3 columns** — `col1` / `1st` (3n+1) · `col2` / `2nd` (3n+2) · `col3` / `3rd` (3n)\n"
-            "0 only wins on a single-number bet."
-        )),
-        ("givegambletoken", "Admin: give Gamble Tokens to a user."),
-        ("takegambletoken", "Admin: take Gamble Tokens from a user."),
+        ("blackjack", (
+            "Play blackjack — costs 1 Gamble Token.\n"
+            "**Hit** ➕ draw · **Stand** ✋ end turn · "
+            "**Double** ⬆️ first action (doubles bet, one more card) · "
+            "**Split** ✂️ first action (same-value pair only).\n"
+            "Natural 21 pays 1.5×. Dealer stands on soft 17."
+        ), "/blackjack <bet>  or  !blackjack <bet>"),
+        ("roulette", (
+            "Spin the wheel — costs 1 Gamble Token.\n"
+            "**×36** single number `0`–`36` · "
+            "**×2** `red black even odd 1-18 19-36` · "
+            "**×3 dozens** `1-12 13-24 25-36` · "
+            "**×3 columns** `col1/1st  col2/2nd  col3/3rd`"
+        ), "/roulette <bet> <choice>  or  !roulette <bet> <choice>"),
+        ("givegambletoken", "Admin: give Gamble Tokens to a user.",
+         "!givegambletoken @user [amount]"),
+        ("takegambletoken", "Admin: take Gamble Tokens from a user.",
+         "!takegambletoken @user [amount]"),
     ]),
     "games": ("🎮", "Random Games", [
-        ("addgame",         "Add a trivia/guessing game question with optional coin + EXP rewards for the winner."),
-        ("removegame",      "Delete a game and all its answers."),
-        ("enablegame",      "Enable a disabled game so it appears in automatic rotation."),
-        ("disablegame",     "Disable a game without deleting it (excluded from rotation)."),
-        ("addgameanswer",   "Add a valid answer to a game (case-insensitive matching)."),
-        ("removegameanswer","Remove an answer by its ID (see /listgames)."),
-        ("listgames",       "List all games with answers, rewards, and enabled/disabled status."),
-        ("setgamechannel",  "Set the posting channel, the answer window in seconds, and the interval between games."),
-        ("startgames",      "Start the automatic game loop in the configured channel."),
-        ("stopgames",       "Stop the automatic game loop."),
+        ("addgame",         "Add a trivia/guessing question with rewards for the first correct answer.",
+         "/addgame <name> [reward_balance] [reward_exp] [chance] [answer_time]"),
+        ("editgame",        "Edit a game's rewards, chance weight, or per-game answer time.",
+         "/editgame <name> [reward_balance] [reward_exp] [chance] [answer_time] …"),
+        ("removegame",      "Delete a game and all its answers.",
+         "!removegame <name>"),
+        ("enablegame",      "Re-enable a disabled game.",
+         "!enablegame <name>"),
+        ("disablegame",     "Disable a game without deleting it.",
+         "!disablegame <name>"),
+        ("addgameanswer",   "Add a valid answer to a game.",
+         "!addgameanswer <game_name> <answer>"),
+        ("removegameanswer","Remove an answer by ID (see !listgames <name>).",
+         "!removegameanswer <game_name> <answer_id>"),
+        ("addgamepreset",   "Bulk-load answers + hints from a preset (colors, world countries, food, …).",
+         "!addgamepreset <game_name> <preset>"),
+        ("listgames",       "List all games and answers. Pass a name to see that game's answers.",
+         "!listgames [game_name]"),
+        ("addhint",         "Add a hint for a specific answer (shown at configured delays).",
+         "!addhint <game_name> <answer_id> <order 1-5> <hint text>"),
+        ("removehint",      "Remove a hint by its ID.",
+         "!removehint <hint_id>"),
+        ("listhints",       "List all hints for a game (optionally filtered to one answer).",
+         "!listhints <game_name> [answer_id]"),
+        ("setgamechannel",  "Set the posting channel, answer window, interval, and hint delays.",
+         "/setgamechannel <#channel> [interval_seconds] [hint1_delay] [hint2_delay] …"),
+        ("startgames",      "Start the automatic game loop.",
+         "/startgames  or  !startgames"),
+        ("stopgames",       "Stop the automatic game loop.",
+         "!stopgames"),
     ]),
     "trade": ("🤝", "Trading", [
         ("trade", (
-            "Open an interactive trade session with another user.\n"
-            "Both parties click **Set Offer** to enter what they're offering "
-            "(coins, EXP, raffle tickets, and any inventory items/boxes), "
-            "then both click **Confirm** to execute. Either party can cancel at any time. "
-            "Times out after 5 minutes."
-        )),
+            "Open an interactive trade with another user. "
+            "Both click **Set Offer** to enter coins/EXP/tickets/items, "
+            "then both click **Confirm**. Either party can Cancel. Times out after 5 min."
+        ), "/trade <@user>  or  !trade @user"),
     ]),
     "codes": ("🎫", "Redeemable Codes", [
-        ("createcode", "Admin: create a code with any prize mix. Supports limited or unlimited uses, min level/balance, and a required role."),
-        ("deletecode", "Admin: delete a code and its usage history."),
-        ("listcodes",  "Admin: list all active codes with prizes, uses remaining, and requirements."),
-        ("redeem",     "Redeem a code to claim its prizes (each code can only be used once per user)."),
+        ("createcode", "Admin: create a server code. Uses = -1 means unlimited.",
+         "!createcode <CODE> '<json>' [uses] [min_rank] [min_balance]"),
+        ("deletecode", "Admin: delete a code and all its usage history.",
+         "!deletecode <CODE>"),
+        ("listcodes",  "Admin: list all active codes with prizes and requirements.",
+         "!listcodes"),
+        ("redeem",     "Redeem a code to claim its prizes (each code once per user).",
+         "/redeem <code>  or  !redeem <CODE>"),
+    ]),
+    "panels": ("🖥️", "Persistent Panels", [
+        ("setchestchannel", "Post the **Chest Panel** — open EXP/VIP chests via buttons.",
+         "/setchestchannel <#channel>  or  !setchestchannel #channel"),
+        ("setstatchannel",  "Post the **Stats Panel** — balance, rank, tickets, inventory buttons.",
+         "/setstatchannel <#channel>  or  !setstatchannel #channel"),
+        ("setadminpanel",   "Post the **Admin Panel** — economy controls, user lookup, system status.",
+         "/setadminpanel <#channel>  or  !setadminpanel #channel"),
+    ]),
+    "welcome": ("👋", "Welcome System", [
+        ("setwelcome",           "Set the DM new members receive (opens a pop-up text editor).",
+         "/setwelcome"),
+        ("enablewelcome",        "Enable DM welcome messages.",
+         "!enablewelcome"),
+        ("disablewelcome",       "Disable DM welcome messages.",
+         "!disablewelcome"),
+        ("previewwelcome",       "Preview how the welcome DM will look.",
+         "!previewwelcome"),
+        ("setwelcomechannel",    "Set a channel for public join announcements (also opens text editor).",
+         "/setwelcomechannel <#channel>  or  !setwelcomechannel #channel [message]"),
+        ("enablewelcomechannel", "Re-enable channel welcome pings.",
+         "!enablewelcomechannel"),
+        ("disablewelcomechannel","Disable channel welcome pings.",
+         "!disablewelcomechannel"),
+        ("previewwelcomechannel","Preview how the channel welcome looks.",
+         "!previewwelcomechannel"),
+    ]),
+    "verification": ("✅", "Verification System", [
+        ("setverification",    "Post a verification embed; clicking the button grants/removes roles.",
+         "/setverification <#channel> [verified_role] [unverified_role] [message]"),
+        ("disableverification","Remove the verification configuration.",
+         "/disableverification"),
+    ]),
+    "counting": ("🔢", "Counting System", [
+        ("setcountingchannel",   "Set which channel to watch and where to announce prizes.",
+         "/setcountingchannel [#counting_channel] [#announce_channel]  or  !setcountingchannel"),
+        ("enablecounting",       "Enable counting rewards.",
+         "!enablecounting"),
+        ("disablecounting",      "Disable counting rewards.",
+         "!disablecounting"),
+        ("addcountingprize",     "Add a prize to the counting pool. Supports math formulas for weight.",
+         "/addcountingprize <prize_type> [amount] [item_name] [label] [weight_formula]"),
+        ("removecountingprize",  "Remove a counting prize by ID.",
+         "!removecountingprize <prize_id>"),
+        ("listcountingprizes",   "List all counting prizes and their weight formulas.",
+         "!listcountingprizes"),
+        ("addcountingspecial",   "Add a bonus prize given on top at a specific count number.",
+         "/addcountingspecial <number> <prize_type> [amount] [item_name] [label]"),
+        ("removecountingspecial","Remove a special count prize by ID.",
+         "!removecountingspecial <special_id>"),
+        ("listcountingspecials", "List all special count prizes.",
+         "!listcountingspecials"),
+        ("countingstats",        "Show the current count, server record, and your ban status.",
+         "/countingstats"),
+        ("resetcount",           "Admin: reset the count to 0.",
+         "/resetcount"),
+        ("unbancounter",         "Admin: lift a user's counting ban immediately.",
+         "/unbancounter <@user>"),
     ]),
     "admin": ("⚙️", "Admin & System", [
-        ("disablecmd",          "Temporarily disable any bot command by name."),
-        ("enablecmd",           "Re-enable a previously disabled command."),
-        ("enablesystem",        "Enable a major system: **raffle**, **vipkey**, or **gamble**."),
-        ("disablesystem",       "Disable a major system (blocks related commands for all users)."),
-        ("systemstatus",        "Check which major systems are currently enabled or disabled."),
-        ("setraredropchannel",  "Set the announcement channel for rare drops from chests and boxes."),
-        ("addgiveawayrole",     "Give a role giveaway/admin permissions."),
-        ("removegiveawayrole",  "Remove a role's permissions."),
-        ("giveawayroles",       "List all privileged roles."),
+        ("setadminpanel",        "Post the interactive admin panel (economy, user lookup, resets, systems).",
+         "/setadminpanel <#channel>  or  !setadminpanel #channel"),
+        ("disablecmd",           "Disable a command in this server by name.",
+         "/disablecmd <command_name>  or  !disablecmd <command_name>"),
+        ("enablecmd",            "Re-enable a disabled command.",
+         "/enablecmd <command_name>  or  !enablecmd <command_name>"),
+        ("listcmds",             "Show all disabled commands for this server.",
+         "/listcmds  or  !listcmds"),
+        ("enablesystem",         "Enable a major system: raffle / vipkey / gamble.",
+         "/enablesystem <system>  or  !enablesystem <system>"),
+        ("disablesystem",        "Disable a major system.",
+         "/disablesystem <system>  or  !disablesystem <system>"),
+        ("systemstatus",         "Check which systems are enabled or disabled.",
+         "!systemstatus"),
+        ("setlogchannel",        "Set a log channel for a specific event type.",
+         "/setlogchannel <log_type> <#channel>  or  !setlogchannel <type> #channel"),
+        ("removelogchannel",     "Disable logging for an event type.",
+         "/removelogchannel <log_type>  or  !removelogchannel <type>"),
+        ("listlogchannels",      "List all configured log channels.",
+         "!listlogchannels"),
+        ("resetuser",            "Wipe a user's data (balance/exp/inventory/tickets/stats/all).",
+         "/resetuser <@user> <reset_type>  or  !resetuser @user <type>"),
+        ("resetrole",            "Wipe data for every member with a specific role.",
+         "/resetrole <@role> <reset_type>  or  !resetrole @role <type>"),
+        ("disableprefixchannel", "Block prefix commands in a channel (optionally for a specific role).",
+         "/disableprefixchannel <#channel> [role]"),
+        ("enableprefixchannel",  "Allow a role to use prefix commands in a blocked channel.",
+         "/enableprefixchannel <#channel> <role>"),
+        ("resetprefixchannel",   "Remove all prefix restrictions from a channel.",
+         "/resetprefixchannel <#channel>"),
+        ("listprefixchannels",   "Show all prefix restriction rules in this server.",
+         "/listprefixchannels"),
+        ("setraredropchannel",   "Set the rare-drop announcement channel.",
+         "/setraredropchannel <#channel>"),
+        ("addgiveawayrole",      "Give a role admin/giveaway permissions.",
+         "/addgiveawayrole <role>"),
+        ("removegiveawayrole",   "Remove a role's permissions.",
+         "/removegiveawayrole <role>"),
+        ("giveawayroles",        "List all privileged roles.",
+         "!giveawayroles"),
     ]),
 }
-
-# Flat lookup: command_name → (category_title, description)
-_HELP_LOOKUP: dict[str, tuple[str, str]] = {}
+ 
+# Rebuild the flat lookup including usage strings
+_HELP_LOOKUP: dict[str, tuple[str, str, str]] = {}
 for _ck, (_ce, _ct, _cc) in _HELP_CATS.items():
-    for _cn, _cd in _cc:
-        _HELP_LOOKUP[_cn.lower()] = (_ct, _cd)
-
-
-@bot.tree.command(name="help", description="Overview of the bot or detailed info on a specific command")
-@app_commands.describe(command="Command name or category (blank for full overview)")
+    for _entry in _cc:
+        _cn = _entry[0]
+        _cd = _entry[1]
+        _cu = _entry[2] if len(_entry) > 2 else ""
+        _HELP_LOOKUP[_cn.lower()] = (_ct, _cd, _cu)
+ 
+ 
+@bot.tree.command(name="help",
+                  description="Overview of the bot or detailed info on a command")
+@app_commands.describe(command="Command name, category key, or blank for the full overview")
 @command_enabled()
 async def help_cmd(interaction: discord.Interaction, command: str = None):
     if command is None:
@@ -6017,42 +6753,58 @@ async def help_cmd(interaction: discord.Interaction, command: str = None):
             title="📖 Bot Help",
             description=(
                 "A giveaway, economy, gambling, and games bot.\n"
-                "Use `/help <command>` or `/help <category>` for details.\n\u200b"
+                "Use `/help <command>` or `!help <command>` for detailed usage.\n\u200b"
             ),
             color=discord.Color.blurple(),
         )
         for ck, (ce, ct, cc) in _HELP_CATS.items():
-            sample = ", ".join(f"`{n}`" for n, _ in cc[:4])
+            sample = ", ".join(f"`{e[0]}`" for e in cc[:4])
             more   = f" *+{len(cc)-4} more*" if len(cc) > 4 else ""
             embed.add_field(name=f"{ce} {ct}", value=sample + more, inline=False)
-        embed.set_footer(text="/help <command name>  or  /help <category key, e.g. gambling>")
+        embed.set_footer(
+            text="/help <command name>  ·  /help <category key e.g. gambling>")
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-
-    key = command.lower().strip().lstrip("/")
-
-    # Category match
+ 
+    key = command.lower().strip().lstrip("/!")
+ 
+    # ── Category match ────────────────────────────────────────────────────────
     if key in _HELP_CATS:
         ce, ct, cc = _HELP_CATS[key]
         embed = discord.Embed(title=f"{ce} {ct}", color=discord.Color.blurple())
-        for cn, cd in cc:
-            embed.add_field(name=f"`/{cn}`", value=cd, inline=False)
+        for entry in cc:
+            cn = entry[0]; cd = entry[1]; cu = entry[2] if len(entry) > 2 else ""
+            value = cd
+            if cu:
+                value += f"\n```{cu}```"
+            embed.add_field(name=f"`{cn}`", value=value, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-
-    # Command match
+ 
+    # ── Command match ─────────────────────────────────────────────────────────
     if key in _HELP_LOOKUP:
-        ct, cd = _HELP_LOOKUP[key]
-        embed  = discord.Embed(title=f"📖 /{key}", description=cd, color=discord.Color.blurple())
+        ct, cd, cu = _HELP_LOOKUP[key]
+        embed = discord.Embed(
+            title=f"📖 {key}",
+            color=discord.Color.blurple())
+        if cu:
+            embed.add_field(name="🔧 Usage", value=f"```{cu}```", inline=False)
+        embed.add_field(name="📝 Description", value=cd, inline=False)
         embed.set_footer(text=f"Category: {ct}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-
+ 
     await interaction.response.send_message(
         f"❌ No command or category **{command}** found.\n"
         "Valid categories: " + ", ".join(f"`{k}`" for k in _HELP_CATS),
         ephemeral=True,
     )
+ 
+ 
+# Prefix wrapper — also enables !help <command>
+@bot.command(name="help")
+async def pfx_help(ctx, *, command: str = None):
+    await help_cmd._callback(FakeInteraction(ctx), command)
 
 # ═══════════════════════════════════════════════════════
 # PREFIX COMMANDS  (replaces removed slash commands)
@@ -7042,27 +7794,73 @@ async def cmd_listlogchannels(ctx):
                         value=ch.mention if ch else f"<#{channel_id}> *(deleted)*", inline=False)
     await ctx.send(embed=embed)
 
+@bot.tree.command(name="listexpboosts",
+                  description="List all active EXP boosts for this server")
+@command_enabled()
+async def slash_listexpboosts(interaction: discord.Interaction):
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT role_id, boost_percent, channel_id, category_id "
+                "FROM exp_boosts WHERE guild_id=? ORDER BY boost_percent DESC",
+                (interaction.guild.id,)) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            await interaction.response.send_message(
+                "❌ No EXP boosts configured.", ephemeral=True)
+            return
+        embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
+        for role_id, boost, channel_id, category_id in rows:
+            role  = interaction.guild.get_role(role_id)
+            name  = role.mention if role else f"<deleted role {role_id}>"
+            sign  = "+" if boost > 0 else ""
+            if channel_id:
+                ch    = interaction.guild.get_channel(channel_id)
+                scope = ch.mention if ch else f"deleted channel ({channel_id})"
+            elif category_id:
+                cat   = interaction.guild.get_channel(category_id)
+                scope = f"📁 {cat.name}" if cat else f"deleted category ({category_id})"
+            else:
+                scope = "🌐 Global"
+            embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        try:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+ 
+ 
 @bot.command(name="listexpboosts")
 async def cmd_listexpboosts(ctx):
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT role_id,boost_percent,channel_id,category_id FROM exp_boosts "
-            "WHERE guild_id=? ORDER BY boost_percent DESC", (ctx.guild.id,)) as cur:
-            rows = await cur.fetchall()
-    if not rows: await ctx.send("❌ No EXP boosts configured."); return
-    embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
-    for role_id, boost, channel_id, category_id in rows:
-        role = ctx.guild.get_role(role_id)
-        name = role.mention if role else f"<deleted role {role_id}>"
-        sign = "+" if boost > 0 else ""
-        if channel_id:
-            ch = ctx.guild.get_channel(channel_id); scope = ch.mention if ch else "deleted channel"
-        elif category_id:
-            cat = ctx.guild.get_channel(category_id); scope = f"📁 {cat.name}" if cat else "deleted category"
-        else:
-            scope = "🌐 Global"
-        embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
-    await ctx.send(embed=embed)
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT role_id, boost_percent, channel_id, category_id "
+                "FROM exp_boosts WHERE guild_id=? ORDER BY boost_percent DESC",
+                (ctx.guild.id,)) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            await ctx.send("❌ No EXP boosts configured.")
+            return
+        embed = discord.Embed(title="⚡ Active EXP Boosts", color=discord.Color.blurple())
+        for role_id, boost, channel_id, category_id in rows:
+            role  = ctx.guild.get_role(role_id)
+            name  = role.mention if role else f"<deleted role {role_id}>"
+            sign  = "+" if boost > 0 else ""
+            if channel_id:
+                ch    = ctx.guild.get_channel(channel_id)
+                scope = ch.mention if ch else f"deleted channel ({channel_id})"
+            elif category_id:
+                cat   = ctx.guild.get_channel(category_id)
+                scope = f"📁 {cat.name}" if cat else f"deleted category ({category_id})"
+            else:
+                scope = "🌐 Global"
+            embed.add_field(name=name, value=f"{sign}{boost}% | {scope}", inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"❌ Error fetching EXP boosts: {e}")
+
 
 # ═══════════════════════════════════════════════════════
 # LOGGING SYSTEM
@@ -8205,6 +9003,11 @@ async def pfx_addgamepreset(ctx, game_name: str, preset: str):
     if preset not in _PRESET_DATA:
         await ctx.send(f"❌ Valid presets: {', '.join(_PRESET_DATA.keys())}"); return
     await addgamepreset._callback(FakeInteraction(ctx), game_name, preset)
+
+@bot.command(name="setadminpanel")
+async def pfx_setadminpanel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setadminpanel._callback(FakeInteraction(ctx), channel)
 
 # ── Welcome (modal command — prefix not supported) ────────────────────────────
 
