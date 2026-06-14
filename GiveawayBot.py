@@ -6799,12 +6799,6 @@ async def help_cmd(interaction: discord.Interaction, command: str = None):
         "Valid categories: " + ", ".join(f"`{k}`" for k in _HELP_CATS),
         ephemeral=True,
     )
- 
- 
-# Prefix wrapper — also enables !help <command>
-@bot.command(name="help")
-async def pfx_help(ctx, *, command: str = None):
-    await help_cmd._callback(FakeInteraction(ctx), command)
 
 # ═══════════════════════════════════════════════════════
 # PREFIX COMMANDS  (replaces removed slash commands)
