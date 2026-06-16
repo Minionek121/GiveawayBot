@@ -6789,6 +6789,10 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
          "/removegiveawayrole <role>"),
         ("giveawayroles",        "List all privileged roles.",
          "!giveawayroles"),
+         ("cleanuptransfer",
+        "Scan for and remove broken role/channel/category references "
+        "left over from a server transfer. Shows a preview first.",
+        "/cleanuptransfer  or  !cleanuptransfer"),
     ]),
 }
  
@@ -9369,6 +9373,611 @@ async def resetrole(interaction: discord.Interaction,
         "🗑 Role Reset", discord.Color.red(),
         By=interaction.user.mention, Role=role.name,
         Members=str(len(members)), Type=reset_type))
+
+# --- CLEANUP TRANSFER ----------------------------------
+
+async def _get_broken_refs(guild: discord.Guild) -> dict[str, list[str]]:
+    """
+    Scan all tables for role/channel/category IDs that no longer exist
+    in this guild.  Returns {section_label: [human-readable descriptions]}.
+    """
+    gid = guild.id
+    vr  = {r.id for r in guild.roles}      # valid role IDs
+    vc  = {c.id for c in guild.channels}   # valid channel + category IDs
+ 
+    found: dict[str, list[str]] = {}
+ 
+    def note(label: str, desc: str):
+        found.setdefault(label, []).append(desc)
+ 
+    async with get_db() as db:
+ 
+        # ── exp_boosts ────────────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT role_id, boost_percent, channel_id, category_id "
+            "FROM exp_boosts WHERE guild_id=?", (gid,)) as cur:
+            for rid, bp, cid, catid in await cur.fetchall():
+                bad = []
+                if rid not in vr:
+                    bad.append(f"role `{rid}`")
+                if cid and cid not in vc:
+                    bad.append(f"channel `{cid}`")
+                if catid and catid not in vc:
+                    bad.append(f"category `{catid}`")
+                if bad:
+                    sign = "+" if bp > 0 else ""
+                    note("⚡ EXP Boosts",
+                         f"{sign}{bp}% boost — broken: {', '.join(bad)}")
+ 
+        # ── giveaway_roles ────────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT role_id FROM giveaway_roles WHERE guild_id=?", (gid,)) as cur:
+            for (rid,) in await cur.fetchall():
+                if rid not in vr:
+                    note("🎉 Giveaway Roles", f"role `{rid}`")
+ 
+        # ── auto_entry_roles ──────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?", (gid,)) as cur:
+            for (rid,) in await cur.fetchall():
+                if rid not in vr:
+                    note("🎉 Auto-Entry Roles", f"role `{rid}`")
+ 
+        # ── log_channels ──────────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT log_type, channel_id FROM log_channels WHERE guild_id=?",
+            (gid,)) as cur:
+            for lt, cid in await cur.fetchall():
+                if cid not in vc:
+                    note("📋 Log Channels", f"`{lt}` → channel `{cid}`")
+ 
+        # ── raffle_config ─────────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM raffle_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] not in vc:
+                note("🎟 Raffle Channel", f"channel `{row[0]}`")
+ 
+        # ── raffle_info_config ────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM raffle_info_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] not in vc:
+                note("🎟 Raffle Info Board", f"channel `{row[0]}`")
+ 
+        # ── rare_drop_config ──────────────────────────────────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM rare_drop_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] not in vc:
+                note("🌟 Rare Drop Channel", f"channel `{row[0]}`")
+ 
+        # ── prefix_restrictions ───────────────────────────────────────────────
+        async with db.execute(
+            "SELECT channel_id, role_id FROM prefix_restrictions WHERE guild_id=?",
+            (gid,)) as cur:
+            for cid, rid in await cur.fetchall():
+                if cid not in vc:
+                    note("🔒 Prefix Restrictions", f"channel `{cid}`")
+                elif rid and rid not in vr:
+                    note("🔒 Prefix Restrictions",
+                         f"role `{rid}` in channel `{cid}`")
+ 
+        # ── item_store  (field cleared, item kept) ────────────────────────────
+        async with db.execute(
+            "SELECT item_name, role_id FROM item_store WHERE guild_id=?",
+            (gid,)) as cur:
+            for name, rid in await cur.fetchall():
+                if rid and rid not in vr:
+                    note("🛒 Item Store — role cleared",
+                         f"`{name}` had role `{rid}`")
+ 
+        # ── games  (field cleared, game kept) ────────────────────────────────
+        async with db.execute(
+            "SELECT game_name, reward_role_id FROM games "
+            "WHERE guild_id=? AND reward_role_id != 0", (gid,)) as cur:
+            for name, rid in await cur.fetchall():
+                if rid not in vr:
+                    note("🎮 Games — reward role cleared",
+                         f"`{name}` had role `{rid}`")
+ 
+        # ── auto_giveaway_pool  (field cleared, entry kept) ───────────────────
+        async with db.execute(
+            "SELECT prize, reward_role_id FROM auto_giveaway_pool "
+            "WHERE guild_id=? AND reward_role_id != 0", (gid,)) as cur:
+            for prize, rid in await cur.fetchall():
+                if rid not in vr:
+                    note("🎉 Auto Giveaway Pool — reward role cleared",
+                         f"`{prize}` had role `{rid}`")
+ 
+        # ── redeem_codes  (role requirement cleared, code kept) ───────────────
+        async with db.execute(
+            "SELECT code, required_role_id FROM redeem_codes "
+            "WHERE guild_id=? AND required_role_id != 0", (gid,)) as cur:
+            for code, rid in await cur.fetchall():
+                if rid not in vr:
+                    note("🎫 Redeem Codes — role requirement cleared",
+                         f"`{code}` required role `{rid}`")
+ 
+        # ── verification_config  (broken fields cleared) ──────────────────────
+        async with db.execute(
+            "SELECT channel_id, verified_role_id, unverified_role_id "
+            "FROM verification_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                cid, vrid, uvrid = row
+                if cid and cid not in vc:
+                    note("✅ Verification Config — field cleared",
+                         f"channel `{cid}`")
+                if vrid and vrid not in vr:
+                    note("✅ Verification Config — field cleared",
+                         f"verified role `{vrid}`")
+                if uvrid and uvrid not in vr:
+                    note("✅ Verification Config — field cleared",
+                         f"unverified role `{uvrid}`")
+ 
+        # ── welcome_config  (broken channel cleared) ──────────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM welcome_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("👋 Welcome Config — channel cleared",
+                     f"channel `{row[0]}`")
+ 
+        # ── counting_config  (broken channels cleared) ────────────────────────
+        async with db.execute(
+            "SELECT channel_id, announce_channel_id "
+            "FROM counting_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                cid, acid = row
+                if cid and cid not in vc:
+                    note("🔢 Counting Config — channel cleared",
+                         f"counting channel `{cid}`")
+                if acid and acid not in vc:
+                    note("🔢 Counting Config — channel cleared",
+                         f"announce channel `{acid}`")
+ 
+        # ── chest_channel_config  (broken channel cleared) ────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM chest_channel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("📦 Chest Panel — channel cleared",
+                     f"channel `{row[0]}`")
+ 
+        # ── stats_channel_config  (broken channel cleared) ────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM stats_channel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("📊 Stats Panel — channel cleared",
+                     f"channel `{row[0]}`")
+ 
+        # ── admin_panel_config  (broken channel cleared) ──────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM admin_panel_config WHERE guild_id=?",
+            (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("🛠 Admin Panel — channel cleared",
+                     f"channel `{row[0]}`")
+ 
+        # ── auto_giveaway_config  (broken channel → stopped) ─────────────────
+        async with db.execute(
+            "SELECT channel_id FROM auto_giveaway_config WHERE guild_id=?",
+            (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("🎉 Auto Giveaway Config — stopped",
+                     f"channel `{row[0]}` no longer exists")
+ 
+        # ── game_config  (broken channel cleared) ─────────────────────────────
+        async with db.execute(
+            "SELECT channel_id FROM game_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                note("🎮 Game Config — channel cleared",
+                     f"channel `{row[0]}`")
+ 
+    return found
+ 
+ 
+async def _execute_cleanup(guild: discord.Guild) -> dict[str, int]:
+    """
+    Remove or fix every broken reference in the guild.
+    Re-runs the scan itself so the preview and execution are always in sync.
+    Returns {human_label: count_of_items_fixed}.
+    """
+    gid = guild.id
+    vr  = {r.id for r in guild.roles}
+    vc  = {c.id for c in guild.channels}
+ 
+    done: dict[str, int] = {}
+ 
+    def inc(label: str, n: int = 1):
+        done[label] = done.get(label, 0) + n
+ 
+    async with db_lock:
+        async with get_db() as db:
+ 
+            # ── exp_boosts ───────────────────────────────────────────────────
+            async with db.execute(
+                "SELECT role_id, channel_id, category_id "
+                "FROM exp_boosts WHERE guild_id=?", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for rid, cid, catid in rows:
+                if (rid not in vr
+                        or (cid   and cid   not in vc)
+                        or (catid and catid not in vc)):
+                    await db.execute(
+                        "DELETE FROM exp_boosts "
+                        "WHERE guild_id=? AND role_id=? AND channel_id=? AND category_id=?",
+                        (gid, rid, cid, catid))
+                    inc("⚡ EXP Boosts removed")
+ 
+            # ── giveaway_roles ────────────────────────────────────────────────
+            async with db.execute(
+                "SELECT role_id FROM giveaway_roles WHERE guild_id=?", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for (rid,) in rows:
+                if rid not in vr:
+                    await db.execute(
+                        "DELETE FROM giveaway_roles WHERE guild_id=? AND role_id=?",
+                        (gid, rid))
+                    inc("🎉 Giveaway Roles removed")
+ 
+            # ── auto_entry_roles ──────────────────────────────────────────────
+            async with db.execute(
+                "SELECT role_id FROM auto_entry_roles WHERE guild_id=?", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for (rid,) in rows:
+                if rid not in vr:
+                    await db.execute(
+                        "DELETE FROM auto_entry_roles WHERE guild_id=? AND role_id=?",
+                        (gid, rid))
+                    inc("🎉 Auto-Entry Roles removed")
+ 
+            # ── log_channels ──────────────────────────────────────────────────
+            async with db.execute(
+                "SELECT log_type, channel_id FROM log_channels WHERE guild_id=?",
+                (gid,)) as cur:
+                rows = await cur.fetchall()
+            for lt, cid in rows:
+                if cid not in vc:
+                    await db.execute(
+                        "DELETE FROM log_channels WHERE guild_id=? AND log_type=?",
+                        (gid, lt))
+                    inc("📋 Log Channels removed")
+ 
+            # ── raffle_config ─────────────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM raffle_config WHERE guild_id=?", (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] not in vc:
+                await db.execute(
+                    "DELETE FROM raffle_config WHERE guild_id=?", (gid,))
+                inc("🎟 Raffle Channel removed")
+ 
+            # ── raffle_info_config ────────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM raffle_info_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] not in vc:
+                await db.execute(
+                    "DELETE FROM raffle_info_config WHERE guild_id=?", (gid,))
+                inc("🎟 Raffle Info Board removed")
+ 
+            # ── rare_drop_config ──────────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM rare_drop_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] not in vc:
+                await db.execute(
+                    "DELETE FROM rare_drop_config WHERE guild_id=?", (gid,))
+                inc("🌟 Rare Drop Channel removed")
+ 
+            # ── prefix_restrictions ───────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id, role_id FROM prefix_restrictions WHERE guild_id=?",
+                (gid,)) as cur:
+                rows = await cur.fetchall()
+            for cid, rid in rows:
+                if cid not in vc or (rid and rid not in vr):
+                    await db.execute(
+                        "DELETE FROM prefix_restrictions "
+                        "WHERE guild_id=? AND channel_id=? AND role_id=?",
+                        (gid, cid, rid))
+                    inc("🔒 Prefix Restrictions removed")
+ 
+            # ── item_store — clear broken role_id, keep the item ─────────────
+            async with db.execute(
+                "SELECT item_name, role_id FROM item_store WHERE guild_id=?",
+                (gid,)) as cur:
+                rows = await cur.fetchall()
+            for name, rid in rows:
+                if rid and rid not in vr:
+                    await db.execute(
+                        "UPDATE item_store SET role_id=0 "
+                        "WHERE guild_id=? AND item_name=?",
+                        (gid, name))
+                    inc("🛒 Item Store roles cleared")
+ 
+            # ── games — clear broken reward_role_id, keep the game ────────────
+            async with db.execute(
+                "SELECT game_name, reward_role_id FROM games "
+                "WHERE guild_id=? AND reward_role_id != 0", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for name, rid in rows:
+                if rid not in vr:
+                    await db.execute(
+                        "UPDATE games SET reward_role_id=0 "
+                        "WHERE guild_id=? AND game_name=?",
+                        (gid, name))
+                    inc("🎮 Game reward roles cleared")
+ 
+            # ── auto_giveaway_pool — clear broken role, keep entry ────────────
+            async with db.execute(
+                "SELECT id, reward_role_id FROM auto_giveaway_pool "
+                "WHERE guild_id=? AND reward_role_id != 0", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for aid, rid in rows:
+                if rid not in vr:
+                    await db.execute(
+                        "UPDATE auto_giveaway_pool SET reward_role_id=0 WHERE id=?",
+                        (aid,))
+                    inc("🎉 Auto Giveaway Pool roles cleared")
+ 
+            # ── redeem_codes — clear broken required_role_id, keep code ───────
+            async with db.execute(
+                "SELECT code, required_role_id FROM redeem_codes "
+                "WHERE guild_id=? AND required_role_id != 0", (gid,)) as cur:
+                rows = await cur.fetchall()
+            for code, rid in rows:
+                if rid not in vr:
+                    await db.execute(
+                        "UPDATE redeem_codes SET required_role_id=0 "
+                        "WHERE guild_id=? AND code=?",
+                        (gid, code))
+                    inc("🎫 Redeem Code role requirements cleared")
+ 
+            # ── verification_config — clear broken fields individually ─────────
+            async with db.execute(
+                "SELECT channel_id, verified_role_id, unverified_role_id "
+                "FROM verification_config WHERE guild_id=?", (gid,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                cid, vrid, uvrid = row
+                cols = []
+                if cid   and cid   not in vc: cols.append("channel_id=0")
+                if vrid  and vrid  not in vr: cols.append("verified_role_id=0")
+                if uvrid and uvrid not in vr: cols.append("unverified_role_id=0")
+                if cols:
+                    await db.execute(
+                        f"UPDATE verification_config SET {', '.join(cols)} "
+                        f"WHERE guild_id=?", (gid,))
+                    inc("✅ Verification Config fields cleared", len(cols))
+ 
+            # ── welcome_config — clear broken channel_id ──────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM welcome_config WHERE guild_id=?", (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE welcome_config "
+                    "SET channel_id=0, channel_enabled=0 WHERE guild_id=?",
+                    (gid,))
+                inc("👋 Welcome channel cleared")
+ 
+            # ── counting_config — clear broken channel IDs ────────────────────
+            async with db.execute(
+                "SELECT channel_id, announce_channel_id "
+                "FROM counting_config WHERE guild_id=?", (gid,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                cid, acid = row
+                cols = []
+                if cid  and cid  not in vc: cols.append("channel_id=0")
+                if acid and acid not in vc: cols.append("announce_channel_id=0")
+                if cols:
+                    await db.execute(
+                        f"UPDATE counting_config SET {', '.join(cols)} "
+                        f"WHERE guild_id=?", (gid,))
+                    inc("🔢 Counting Config channels cleared", len(cols))
+ 
+            # ── chest_channel_config ──────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM chest_channel_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE chest_channel_config "
+                    "SET channel_id=0, message_id=0 WHERE guild_id=?", (gid,))
+                inc("📦 Chest Panel channel cleared")
+ 
+            # ── stats_channel_config ──────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM stats_channel_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE stats_channel_config "
+                    "SET channel_id=0, message_id=0 WHERE guild_id=?", (gid,))
+                inc("📊 Stats Panel channel cleared")
+ 
+            # ── admin_panel_config ────────────────────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM admin_panel_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE admin_panel_config "
+                    "SET channel_id=0, message_id=0 WHERE guild_id=?", (gid,))
+                inc("🛠 Admin Panel channel cleared")
+ 
+            # ── auto_giveaway_config — stop loop if channel is gone ───────────
+            async with db.execute(
+                "SELECT channel_id FROM auto_giveaway_config WHERE guild_id=?",
+                (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE auto_giveaway_config "
+                    "SET channel_id=0, running=0 WHERE guild_id=?", (gid,))
+                inc("🎉 Auto Giveaway Config stopped")
+                # Also cancel the running task
+                task = auto_giveaway_tasks.pop(gid, None)
+                if task:
+                    task.cancel()
+ 
+            # ── game_config — clear broken channel ────────────────────────────
+            async with db.execute(
+                "SELECT channel_id FROM game_config WHERE guild_id=?", (gid,)) as cur:
+                row = await cur.fetchone()
+            if row and row[0] and row[0] not in vc:
+                await db.execute(
+                    "UPDATE game_config SET channel_id=0 WHERE guild_id=?", (gid,))
+                inc("🎮 Game Config channel cleared")
+                # Also stop the game loop
+                task = game_tasks.pop(gid, None)
+                if task:
+                    task.cancel()
+ 
+            await db.commit()
+ 
+    return done
+ 
+ 
+class _CleanupView(discord.ui.View):
+    """Confirmation view for /cleanuptransfer."""
+ 
+    def __init__(self, guild: discord.Guild, caller_id: int):
+        super().__init__(timeout=120)
+        self.guild     = guild
+        self.caller_id = caller_id
+        self.done      = False
+ 
+    @discord.ui.button(label="✅ Run Cleanup", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction,
+                      btn: discord.ui.Button):
+        if interaction.user.id != self.caller_id:
+            await interaction.response.send_message(
+                "❌ Only the person who ran the scan can confirm.",
+                ephemeral=True)
+            return
+        if self.done:
+            return
+        self.done = True
+ 
+        # Acknowledge immediately so Discord doesn't show "interaction failed"
+        await interaction.response.defer()
+ 
+        result = await _execute_cleanup(self.guild)
+ 
+        if not result:
+            embed = discord.Embed(
+                title="✅ Nothing needed cleaning",
+                description="All references were already valid (nothing changed).",
+                color=discord.Color.green())
+        else:
+            lines = [f"• {label}: **{count}**"
+                     for label, count in result.items()]
+            embed = discord.Embed(
+                title="🧹 Cleanup Complete",
+                description="\n".join(lines),
+                color=discord.Color.green())
+            embed.set_footer(
+                text=f"{sum(result.values())} item(s) removed or fixed")
+ 
+        await interaction.message.edit(embed=embed, view=None)
+ 
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction,
+                     btn: discord.ui.Button):
+        if interaction.user.id != self.caller_id:
+            return
+        self.done = True
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="Cleanup cancelled.",
+                color=discord.Color.greyple()),
+            view=None)
+ 
+    async def on_timeout(self):
+        # View quietly expires — no edit needed
+        pass
+ 
+ 
+@bot.tree.command(
+    name="cleanuptransfer",
+    description="Scan for and remove broken role/channel/category references from a server transfer")
+@command_enabled()
+async def cleanuptransfer(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message(
+            "❌ No permission.", ephemeral=True)
+        return
+ 
+    await interaction.response.defer(ephemeral=True)
+ 
+    found = await _get_broken_refs(interaction.guild)
+ 
+    if not found:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="✅ No broken references found",
+                description=(
+                    "Every role, channel, and category stored in the database "
+                    "still exists in this server — nothing needs cleaning up."
+                ),
+                color=discord.Color.green()),
+            ephemeral=True)
+        return
+ 
+    # Build the preview embed
+    total = sum(len(v) for v in found.values())
+    embed = discord.Embed(
+        title="🔍 Broken References Found",
+        description=(
+            "The following database entries reference **roles, channels, or "
+            "categories that no longer exist** in this server.\n\n"
+            "Click **✅ Run Cleanup** to remove or fix them. "
+            "Valid entries (e.g. `@Server Booster — +25% | 🌐 Global`) "
+            "are **not touched**.\n\u200b"
+        ),
+        color=discord.Color.orange())
+ 
+    for label, items in found.items():
+        # Show up to 5 examples; truncate the rest
+        preview = "\n".join(items[:5])
+        if len(items) > 5:
+            preview += f"\n*… +{len(items) - 5} more*"
+        embed.add_field(
+            name=f"{label}  ({len(items)})",
+            value=preview,
+            inline=False)
+ 
+    embed.set_footer(
+        text=f"{total} broken reference(s) found — confirm below to fix them all")
+ 
+    await interaction.followup.send(
+        embed=embed,
+        view=_CleanupView(interaction.guild, interaction.user.id),
+        ephemeral=True)
+
+bot.command(name="cleanuptransfer")
+async def pfx_cleanuptransfer(ctx):
+    if not await _is_allowed_ctx(ctx):
+        await ctx.send("❌ No permission.")
+        return
+    await cleanuptransfer._callback(FakeInteraction(ctx))
 
 
 # ═══════════════════════════════════════════════════════
