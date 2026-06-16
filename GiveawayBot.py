@@ -9896,7 +9896,7 @@ class _CleanupView(discord.ui.View):
             embed.set_footer(
                 text=f"{sum(result.values())} item(s) removed or fixed")
  
-        await interaction.message.edit(embed=embed, view=None)
+        await interaction.edit_original_response(embed=embed, view=None)
  
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction,
