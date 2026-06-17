@@ -6668,8 +6668,36 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
         ), "/trade <@user>  or  !trade @user"),
     ]),
     "codes": ("🎫", "Redeemable Codes", [
-        ("createcode", "Admin: create a server code. Uses = -1 means unlimited.",
-         "!createcode <CODE> '<json>' [uses] [min_rank] [min_balance]"),
+         ("createcode",
+         # ── description shown in /help createcode ──────────────────────────
+         "Admin: create a redeemable code.\n"
+         "\n"
+         "**Slash command** `/createcode` — the easiest way.\n"
+         "Each prize type has its own field; no JSON needed.\n"
+         "\n"
+         "**Prefix command** `!createcode` — for scripting / bulk creation.\n"
+         "The third argument is a `prize_json` string — a JSON object with "
+         "any combination of these keys:\n"
+         "```\n"
+         "balance       — coins\n"
+         "exp           — EXP (usable)\n"
+         "tickets       — raffle tickets\n"
+         "gamble_tokens — Gamble Tokens\n"
+         "vip_keys      — VIP Chest Keys\n"
+         "item          — item / box name  (string)\n"
+         "item_qty      — quantity of item (default 1)\n"
+         "```\n"
+         "**Example prefix usage:**\n"
+         '`!createcode SUMMER25 \'{"balance":500,"vip_keys":1}\' 100`\n'
+         "→ code `SUMMER25`, prize 💰500 + 🔑1 VIP key, 100 total uses\n"
+         "\n"
+         "`uses` defaults to **-1** (unlimited). "
+         "`min_rank` and `min_balance` default to **0** (no requirement).",
+         # ── usage line shown under 🔧 Usage ────────────────────────────────
+         "/createcode <code> [uses] [min_rank] [min_balance] "
+         "[required_role] [balance] [exp] [tickets] [gamble_tokens] "
+         "[vip_keys] [item] [item_qty]\n"
+         "or: !createcode <CODE> '<prize_json>' [uses] [min_rank] [min_balance]"),
         ("deletecode", "Admin: delete a code and all its usage history.",
          "!deletecode <CODE>"),
         ("listcodes",  "Admin: list all active codes with prizes and requirements.",
@@ -7475,6 +7503,111 @@ async def cmd_removerarebox(ctx, box: str, prize_id: int):
     await ctx.send(f"🗑 Prize #{prize_id} in **{box}** is no longer a rare drop.")
 
 # ── Codes ─────────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="createcode",
+                  description="Create a redeemable code with prizes")
+@app_commands.describe(
+    code            = "Code name (auto-uppercased, e.g. SUMMER25)",
+    uses            = "Max total uses across all users  (-1 = unlimited, default -1)",
+    min_rank        = "Minimum Activity Rank required to redeem  (default 0 = anyone)",
+    min_balance     = "Minimum coin balance required to redeem  (default 0)",
+    required_role   = "Role the user must have to redeem",
+    balance         = "Coins to award on redeem",
+    exp             = "EXP to award on redeem",
+    tickets         = "Raffle tickets to award on redeem",
+    gamble_tokens   = "Gamble Tokens to award on redeem",
+    vip_keys        = "VIP Chest Keys to award on redeem",
+    item            = "Item or box name to award on redeem",
+    item_qty        = "Quantity of the item  (default 1)",
+)
+@command_enabled()
+async def slash_createcode(
+    interaction:  discord.Interaction,
+    code:         str,
+    uses:         int              = -1,
+    min_rank:     int              = 0,
+    min_balance:  int              = 0,
+    required_role: discord.Role   = None,
+    balance:      int              = 0,
+    exp:          int              = 0,
+    tickets:      int              = 0,
+    gamble_tokens: int             = 0,
+    vip_keys:     int              = 0,
+    item:         str              = None,
+    item_qty:     int              = 1,
+):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+ 
+    code = code.upper().strip()
+ 
+    # At least one prize must be set
+    if not any([balance > 0, exp > 0, tickets > 0,
+                gamble_tokens > 0, vip_keys > 0, item]):
+        await interaction.response.send_message(
+            "❌ You must include at least one prize "
+            "(balance, exp, tickets, gamble_tokens, vip_keys, or item).",
+            ephemeral=True)
+        return
+ 
+    prize: dict = {
+        "balance":       max(0, balance),
+        "exp":           max(0, exp),
+        "tickets":       max(0, tickets),
+        "gamble_tokens": max(0, gamble_tokens),
+        "vip_keys":      max(0, vip_keys),
+    }
+    if item:
+        prize["item"]     = item.strip()
+        prize["item_qty"] = max(1, item_qty)
+ 
+    async with db_lock:
+        async with get_db() as db:
+            try:
+                await db.execute(
+                    "INSERT INTO redeem_codes"
+                    "(guild_id, code, prize_json, uses_left,"
+                    " min_level, min_balance, required_role_id)"
+                    " VALUES(?,?,?,?,?,?,?)",
+                    (interaction.guild.id, code, json.dumps(prize),
+                     uses, min_rank, min_balance,
+                     required_role.id if required_role else 0))
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                await interaction.response.send_message(
+                    f"❌ Code **{code}** already exists in this server.",
+                    ephemeral=True)
+                return
+ 
+    # Build a readable prize summary
+    parts = []
+    if prize["balance"]       > 0: parts.append(f"💰 {prize['balance']:,} coins")
+    if prize["exp"]           > 0: parts.append(f"⭐ {prize['exp']:,} EXP")
+    if prize["tickets"]       > 0: parts.append(f"🎟 {prize['tickets']} ticket(s)")
+    if prize["gamble_tokens"] > 0: parts.append(f"🎲 {prize['gamble_tokens']} Gamble Token(s)")
+    if prize["vip_keys"]      > 0: parts.append(f"🔑 {prize['vip_keys']} VIP Key(s)")
+    if item:                        parts.append(f"🎒 {max(1,item_qty)}x {item.strip()}")
+ 
+    uses_str = "unlimited" if uses == -1 else str(uses)
+ 
+    embed = discord.Embed(title="🎫 Code Created", color=discord.Color.green())
+    embed.add_field(name="Code",  value=f"`{code}`",              inline=True)
+    embed.add_field(name="Uses",  value=uses_str,                  inline=True)
+    embed.add_field(name="Prize", value=" + ".join(parts) or "—", inline=False)
+    if min_rank:      embed.add_field(name="Min Rank",    value=str(min_rank),            inline=True)
+    if min_balance:   embed.add_field(name="Min Balance", value=f"{min_balance:,} coins", inline=True)
+    if required_role: embed.add_field(name="Required Role", value=required_role.mention,  inline=True)
+ 
+    await interaction.response.send_message(embed=embed)
+ 
+    await log_event(interaction.guild.id, "code", _log_embed(
+        "🎫 Code Created", discord.Color.green(),
+        By=interaction.user.mention, Code=code,
+        Prize=" + ".join(parts) or "—", Uses=uses_str))
+    await log_event(interaction.guild.id, "admin", _log_embed(
+        "⚙️ createcode", discord.Color.orange(),
+        By=interaction.user.mention, Code=code, Uses=uses_str))
 
 @bot.command(name="createcode")
 async def cmd_createcode(ctx, code: str, prize_json: str, uses: int = -1,
