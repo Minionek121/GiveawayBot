@@ -1924,19 +1924,6 @@ async def on_ready():
                     _msg_count_flush_loop]:
         bot.loop.create_task(task_fn())
 
-
-    # Clear global commands so nothing appears twice in any server.
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync(guild=None)
-
-    print(f"[Sync] Done — {ok} succeeded, {fail} failed")
-    print(f"Logged in as {bot.user}")
-
-    for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
-                    game_loop, daily_key_loop, daily_gamble_loop]:
-        bot.loop.create_task(task_fn())
-
-
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     """Sync slash commands the moment the bot is added to a new server."""
