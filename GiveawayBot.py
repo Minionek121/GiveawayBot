@@ -439,7 +439,22 @@ async def setup_database():
                 channel_id INTEGER DEFAULT 0,
                 message_id INTEGER DEFAULT 0)""")
 
-
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_reset_config(
+                guild_id INTEGER PRIMARY KEY,
+                enabled  INTEGER DEFAULT 0)""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_reset_rules(
+                guild_id      INTEGER,
+                reset_type    TEXT,
+                delay_seconds INTEGER DEFAULT 0,
+                PRIMARY KEY(guild_id, reset_type))""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_reset_pending(
+                guild_id    INTEGER,
+                user_id     INTEGER,
+                reset_type  TEXT,
+                reset_after INTEGER,
+                PRIMARY KEY(guild_id, user_id, reset_type))""")
 
             # Migration: add message requirement to auto-entry roles
             try:
@@ -927,6 +942,271 @@ async def get_gamble_tokens(guild_id: int, user_id: int) -> int:
     owned = {n.lower(): q for n, q in inv}
     return owned.get(GAMBLE_TOKEN.lower(), 0)
 
+# =======================================================
+# AUTO RESET HELPERS IG
+# =======================================================
+
+import re as _re
+ 
+ 
+def _parse_duration(s: str) -> int | None:
+    """
+    Parse a human duration string into seconds.
+    Accepts: plain integer (seconds), or combos of d/h/m/s.
+    Examples: "0", "30", "3d", "12h", "1d12h", "90m", "3600"
+    Returns None if the string is not recognised.
+    """
+    s = s.strip().lower()
+    if not s:
+        return None
+    try:
+        return max(0, int(s))
+    except ValueError:
+        pass
+    total = 0
+    found = False
+    for amount, unit in _re.findall(r'(\d+)\s*([dhms])', s):
+        n = int(amount)
+        if   unit == 'd': total += n * 86400; found = True
+        elif unit == 'h': total += n * 3600;  found = True
+        elif unit == 'm': total += n * 60;    found = True
+        elif unit == 's': total += n;          found = True
+    return total if found else None
+ 
+ 
+def _fmt_duration(seconds: int) -> str:
+    """Format a seconds value as a concise human string."""
+    if seconds == 0:
+        return "immediately"
+    parts = []
+    for unit, div in [("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)]:
+        n, seconds = divmod(seconds, div)
+        if n:
+            parts.append(f"{n} {unit}{'s' if n != 1 else ''}")
+    return " ".join(parts)
+ 
+ 
+# ── Background loop ────────────────────────────────────────────────────────
+ 
+async def auto_reset_loop():
+    """Check every 60 s for pending auto-resets that are due and execute them."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            now = int(datetime.now(UTC).timestamp())
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT guild_id, user_id, reset_type "
+                    "FROM auto_reset_pending WHERE reset_after <= ?",
+                    (now,)) as cur:
+                    due = await cur.fetchall()
+ 
+            for gid, uid, reset_type in due:
+                guild = bot.get_guild(gid)
+ 
+                # Guild not in cache → clean up silently
+                if guild is None:
+                    async with db_lock:
+                        async with get_db() as db:
+                            await db.execute(
+                                "DELETE FROM auto_reset_pending "
+                                "WHERE guild_id=? AND user_id=?",
+                                (gid, uid))
+                            await db.commit()
+                    continue
+ 
+                # If the member rejoined they were already removed from pending
+                # by on_member_join.  Belt-and-suspenders check just in case:
+                if guild.get_member(uid) is not None:
+                    async with db_lock:
+                        async with get_db() as db:
+                            await db.execute(
+                                "DELETE FROM auto_reset_pending "
+                                "WHERE guild_id=? AND user_id=?",
+                                (gid, uid))
+                            await db.commit()
+                    continue
+ 
+                # Member is still gone — execute the reset
+                try:
+                    await _do_reset(gid, uid, reset_type)
+                    async with db_lock:
+                        async with get_db() as db:
+                            await db.execute(
+                                "DELETE FROM auto_reset_pending "
+                                "WHERE guild_id=? AND user_id=? AND reset_type=?",
+                                (gid, uid, reset_type))
+                            await db.commit()
+                    await log_event(gid, "admin", _log_embed(
+                        "🔄 Auto-Reset Executed", discord.Color.orange(),
+                        User=f"<@{uid}>",
+                        Type=reset_type,
+                        Reason="Member left and grace period expired"))
+                except Exception as e:
+                    print(f"[AutoReset] execute error gid={gid} uid={uid} "
+                          f"type={reset_type}: {e}")
+ 
+        except Exception as e:
+            print(f"[AutoReset] loop error: {e}")
+ 
+        await asyncio.sleep(60)
+ 
+ 
+# ── Slash commands ─────────────────────────────────────────────────────────
+ 
+_AR_CHOICES = [
+    app_commands.Choice(name="Balance",   value="balance"),
+    app_commands.Choice(name="EXP",       value="exp"),
+    app_commands.Choice(name="Inventory", value="inventory"),
+    app_commands.Choice(name="Tickets",   value="tickets"),
+    app_commands.Choice(name="Stats",     value="stats"),
+]
+ 
+ 
+@bot.tree.command(name="setautoresetrule",
+                  description="Add or update an auto-reset rule for members who leave")
+@app_commands.describe(
+    reset_type="Which data category to reset",
+    delay="Time to wait before resetting after leave — "
+          "'0' = immediately, or e.g. '3d', '12h', '30m', '7200' (seconds). "
+          "If they rejoin before this expires the reset is cancelled.")
+@app_commands.choices(reset_type=_AR_CHOICES)
+@command_enabled()
+async def setautoresetrule(interaction: discord.Interaction,
+                            reset_type: str, delay: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    secs = _parse_duration(delay)
+    if secs is None:
+        await interaction.response.send_message(
+            "❌ Invalid delay format. Use `0` for immediate, or a value like "
+            "`3d`, `12h`, `30m`, `90s`, or a plain number of seconds.",
+            ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_reset_rules"
+                "(guild_id, reset_type, delay_seconds) VALUES(?,?,?)",
+                (interaction.guild.id, reset_type, secs))
+            await db.commit()
+    delay_str = _fmt_duration(secs)
+    await interaction.response.send_message(
+        f"✅ **{reset_type}** will auto-reset **{delay_str}** after a member leaves.\n"
+        f"ℹ️ If they rejoin within that window the reset is cancelled automatically.")
+ 
+ 
+@bot.tree.command(name="removeautoresetrule",
+                  description="Remove a data category from auto-reset")
+@app_commands.describe(reset_type="Which rule to remove")
+@app_commands.choices(reset_type=_AR_CHOICES)
+@command_enabled()
+async def removeautoresetrule(interaction: discord.Interaction, reset_type: str):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM auto_reset_rules WHERE guild_id=? AND reset_type=?",
+                (interaction.guild.id, reset_type))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 **{reset_type}** removed from auto-reset rules.")
+ 
+ 
+@bot.tree.command(name="enableautoreset",
+                  description="Enable automatic data reset when members leave the server")
+@command_enabled()
+async def enableautoreset(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM auto_reset_rules WHERE guild_id=?",
+            (interaction.guild.id,)) as cur:
+            rule_count = (await cur.fetchone())[0]
+    if rule_count == 0:
+        await interaction.response.send_message(
+            "❌ No rules configured yet — add at least one with `/setautoresetrule` first.",
+            ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_reset_config(guild_id, enabled) VALUES(?,1)",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message(
+        "✅ Auto-reset on leave **enabled**. "
+        "Data will be reset for members who don't rejoin within the configured delays.")
+ 
+ 
+@bot.tree.command(name="disableautoreset",
+                  description="Disable automatic data reset on member leave "
+                               "(pending resets already queued are kept but paused)")
+@command_enabled()
+async def disableautoreset(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_reset_config(guild_id, enabled) VALUES(?,0)",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message(
+        "🔒 Auto-reset on leave **disabled**.\n"
+        "No new resets will be queued. Use `/enableautoreset` to turn it back on.")
+ 
+ 
+@bot.tree.command(name="listautoresetrules",
+                  description="Show the auto-reset configuration for this server")
+@command_enabled()
+async def listautoresetrules(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT enabled FROM auto_reset_config WHERE guild_id=?", (gid,)) as cur:
+            cfg = await cur.fetchone()
+        async with db.execute(
+            "SELECT reset_type, delay_seconds "
+            "FROM auto_reset_rules WHERE guild_id=? ORDER BY reset_type",
+            (gid,)) as cur:
+            rules = await cur.fetchall()
+        async with db.execute(
+            "SELECT COUNT(*) FROM auto_reset_pending WHERE guild_id=?", (gid,)) as cur:
+            pending = (await cur.fetchone())[0]
+ 
+    enabled   = bool(cfg and cfg[0])
+    status_em = "✅ Enabled" if enabled else "🔒 Disabled"
+    color     = discord.Color.orange() if enabled else discord.Color.greyple()
+ 
+    embed = discord.Embed(title="🔄 Auto-Reset Configuration", color=color)
+    embed.description = f"**Status:** {status_em}"
+ 
+    if rules:
+        for rt, secs in rules:
+            embed.add_field(
+                name=rt.capitalize(),
+                value=f"Resets **{_fmt_duration(secs)}** after leave",
+                inline=True)
+    else:
+        embed.add_field(
+            name="No rules configured",
+            value="Use `/setautoresetrule` to add one.",
+            inline=False)
+ 
+    if pending:
+        embed.set_footer(
+            text=f"{pending} pending reset(s) currently queued "
+                 f"({'will fire' if enabled else 'paused — auto-reset is disabled'})")
+ 
+    await interaction.response.send_message(embed=embed)
+
 # ═══════════════════════════════════════════════════════
 # RAFFLE HELPERS
 # ═══════════════════════════════════════════════════════
@@ -1136,6 +1416,32 @@ async def on_member_join(member: discord.Member):
         ID=str(member.id),
         Member_Count=str(member.guild.member_count)))
 
+    # --- auto reset cancel ------------------------------------------------
+
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT reset_type FROM auto_reset_pending "
+                "WHERE guild_id=? AND user_id=?",
+                (member.guild.id, member.id)) as cur:
+                ar_pending = await cur.fetchall()
+        if ar_pending:
+            async with db_lock:
+                async with get_db() as db:
+                    await db.execute(
+                        "DELETE FROM auto_reset_pending "
+                        "WHERE guild_id=? AND user_id=?",
+                        (member.guild.id, member.id))
+                    await db.commit()
+            types_str = ", ".join(r[0] for r in ar_pending)
+            await log_event(member.guild.id, "admin", _log_embed(
+                "🔄 Auto-Reset Cancelled", discord.Color.green(),
+                User=f"{member} ({member.mention})",
+                Reason="Rejoined within grace period",
+                Cancelled=types_str))
+    except Exception as ar_e:
+        print(f"[AutoReset] cancel error for {member}: {ar_e}")
+
     # ── welcome config ────────────────────────────────────────────────────
     async with get_db() as db:
         async with db.execute(
@@ -1209,6 +1515,33 @@ async def on_member_remove(member: discord.Member):
         Member=f"{member} ({member.id})",
         Joined=joined,
         Roles=roles_str or "None"))
+    try:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT enabled FROM auto_reset_config WHERE guild_id=?",
+                (member.guild.id,)) as cur:
+                ar_cfg = await cur.fetchone()
+        if ar_cfg and ar_cfg[0]:
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT reset_type, delay_seconds "
+                    "FROM auto_reset_rules WHERE guild_id=?",
+                    (member.guild.id,)) as cur:
+                    ar_rules = await cur.fetchall()
+            if ar_rules:
+                ar_now = int(datetime.now(UTC).timestamp())
+                async with db_lock:
+                    async with get_db() as db:
+                        for ar_type, ar_delay in ar_rules:
+                            await db.execute(
+                                "INSERT OR REPLACE INTO auto_reset_pending"
+                                "(guild_id,user_id,reset_type,reset_after)"
+                                " VALUES(?,?,?,?)",
+                                (member.guild.id, member.id, ar_type,
+                                 ar_now + ar_delay))
+                        await db.commit()
+    except Exception as ar_e:
+        print(f"[AutoReset] queue error for {member}: {ar_e}")
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -1921,7 +2254,7 @@ async def on_ready():
 
     for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
                     game_loop, daily_key_loop, daily_gamble_loop,
-                    _msg_count_flush_loop]:
+                    _msg_count_flush_loop, auto_reset_loop]:
         bot.loop.create_task(task_fn())
 
 @bot.event
@@ -6809,6 +7142,29 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
         "left over from a server transfer. Shows a preview first.",
         "/cleanuptransfer  or  !cleanuptransfer"),
     ]),
+    "autoreset": ("🔄", "Auto-Reset on Leave", [
+        ("enableautoreset",
+         "Enable automatic data reset for members who leave. "
+         "Requires at least one rule to be configured first.",
+         "/enableautoreset  or  !enableautoreset"),
+        ("disableautoreset",
+         "Disable auto-reset on leave (rules and any pending resets are kept but paused).",
+         "/disableautoreset  or  !disableautoreset"),
+        ("setautoresetrule",
+         "Add or update a rule: choose which data to reset and how long to wait "
+         "after the member leaves before resetting. "
+         "If they rejoin within the delay the reset is cancelled automatically.\n"
+         "Delay format: `0` = immediate · `3d` = 3 days · `12h` = 12 hours · "
+         "`30m` = 30 minutes · or plain seconds e.g. `86400`.",
+         "/setautoresetrule <reset_type> <delay>  or  "
+         "!setautoresetrule <balance|exp|inventory|tickets|stats> <delay>"),
+        ("removeautoresetrule",
+         "Remove a data category from auto-reset rules.",
+         "/removeautoresetrule <reset_type>  or  !removeautoresetrule <type>"),
+        ("listautoresetrules",
+         "Show all auto-reset rules, their delays, and how many resets are currently pending.",
+         "/listautoresetrules  or  !listautoresetrules"),
+    ]),
 }
  
 # Rebuild the flat lookup including usage strings
@@ -8017,6 +8373,34 @@ async def cmd_listexpboosts(ctx):
             await ctx.send(embed=extra)
     except Exception as e:
         await ctx.send(f"❌ Error fetching EXP boosts: {e}")
+
+@bot.command(name="setautoresetrule")
+async def pfx_setautoresetrule(ctx, reset_type: str, delay: str):
+    """Usage: !setautoresetrule <balance|exp|inventory|tickets|stats> <delay>"""
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    valid = {"balance", "exp", "inventory", "tickets", "stats"}
+    if reset_type not in valid:
+        await ctx.send(f"❌ Valid types: {', '.join(sorted(valid))}"); return
+    await setautoresetrule._callback(FakeInteraction(ctx), reset_type, delay)
+ 
+@bot.command(name="removeautoresetrule")
+async def pfx_removeautoresetrule(ctx, reset_type: str):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removeautoresetrule._callback(FakeInteraction(ctx), reset_type)
+ 
+@bot.command(name="enableautoreset")
+async def pfx_enableautoreset(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await enableautoreset._callback(FakeInteraction(ctx))
+ 
+@bot.command(name="disableautoreset")
+async def pfx_disableautoreset(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await disableautoreset._callback(FakeInteraction(ctx))
+ 
+@bot.command(name="listautoresetrules")
+async def pfx_listautoresetrules(ctx):
+    await listautoresetrules._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
 # LOGGING SYSTEM
