@@ -36,8 +36,9 @@ bot = commands.Bot(command_prefix=_get_prefix, intents=intents, help_command=Non
 
 VIP_CHEST_KEY       = "VIP Chest Key"
 GAMBLE_TOKEN        = "Gamble Token"
-RAFFLE_TICKET_PRICE = 100
-RAFFLE_PRIZE        = 0
+mega_TICKET_PRICE = 400000
+mega_PRIZE        = 0
+MEGA_TICKET_CAP = 250
 CHEST_COST          = 1000
 LEVEL_DIVISOR       = 700
 BOT_OWNER_ID = 906291437895843901
@@ -166,16 +167,16 @@ async def setup_database():
                 reward INTEGER, end_time INTEGER, required_role INTEGER, template TEXT)""")
             await db.execute("CREATE TABLE IF NOT EXISTS balances(user_id INTEGER PRIMARY KEY, balance INTEGER)")
             await db.execute("CREATE TABLE IF NOT EXISTS exp_history(user_id INTEGER, amount INTEGER, timestamp INTEGER, is_bonus INTEGER DEFAULT 0)")
-            await db.execute("""CREATE TABLE IF NOT EXISTS raffle(
+            await db.execute("""CREATE TABLE IF NOT EXISTS mega(
                 guild_id INTEGER, user_id INTEGER, tickets INTEGER, PRIMARY KEY(guild_id,user_id))""")
             await db.execute("CREATE TABLE IF NOT EXISTS giveaway_winners(message_id INTEGER PRIMARY KEY, winner_id INTEGER, reward INTEGER)")
-            await db.execute("CREATE TABLE IF NOT EXISTS raffle_config(guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
+            await db.execute("CREATE TABLE IF NOT EXISTS mega_config(guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
             await db.execute("CREATE TABLE IF NOT EXISTS spent_exp(user_id INTEGER PRIMARY KEY, amount INTEGER)")
             await db.execute("CREATE TABLE IF NOT EXISTS item_store(item_name TEXT PRIMARY KEY, price INTEGER, role_id INTEGER, description TEXT)")
             await db.execute("""CREATE TABLE IF NOT EXISTS user_stats(
                 user_id INTEGER PRIMARY KEY, total_exp INTEGER DEFAULT 0,
                 gifted_balance INTEGER DEFAULT 0, chests_opened INTEGER DEFAULT 0,
-                raffle_tickets_bought INTEGER DEFAULT 0)""")
+                mega_tickets_bought INTEGER DEFAULT 0)""")
             # New tables
             await db.execute("""CREATE TABLE IF NOT EXISTS inventory(
                 user_id INTEGER, item_name TEXT, quantity INTEGER DEFAULT 0,
@@ -184,7 +185,7 @@ async def setup_database():
                 guild_id INTEGER, role_id INTEGER, boost_percent REAL,
                 PRIMARY KEY(guild_id, role_id))""")
             await db.execute("CREATE TABLE IF NOT EXISTS rare_drop_config(guild_id INTEGER PRIMARY KEY, channel_id INTEGER)")
-            await db.execute("""CREATE TABLE IF NOT EXISTS raffle_info_config(
+            await db.execute("""CREATE TABLE IF NOT EXISTS mega_info_config(
                 guild_id INTEGER PRIMARY KEY, channel_id INTEGER, message_id INTEGER)""")
             await db.execute("""CREATE TABLE IF NOT EXISTS abuse_boxes(
                 guild_id INTEGER, box_name TEXT, PRIMARY KEY(guild_id, box_name))""")
@@ -265,7 +266,7 @@ async def setup_database():
                 interval_seconds INTEGER NOT NULL,
                 duration_seconds INTEGER NOT NULL,
                 running INTEGER DEFAULT 0)""")
-            await db.execute("""CREATE TABLE IF NOT EXISTS raffle_history(
+            await db.execute("""CREATE TABLE IF NOT EXISTS mega_history(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER,
                 draw_timestamp INTEGER,
@@ -305,7 +306,7 @@ async def setup_database():
                 ("user_stats",
                  "CREATE TABLE user_stats(guild_id INTEGER, user_id INTEGER, "
                  "total_exp INTEGER DEFAULT 0, gifted_balance INTEGER DEFAULT 0, "
-                 "chests_opened INTEGER DEFAULT 0, raffle_tickets_bought INTEGER DEFAULT 0, "
+                 "chests_opened INTEGER DEFAULT 0, mega_tickets_bought INTEGER DEFAULT 0, "
                  "PRIMARY KEY(guild_id, user_id))"),
                 ("inventory",
                  "CREATE TABLE inventory(guild_id INTEGER, user_id INTEGER, item_name TEXT, quantity INTEGER DEFAULT 0, PRIMARY KEY(guild_id,user_id,item_name))"),
@@ -491,6 +492,22 @@ async def setup_database():
             await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_user_entries(
                 guild_id INTEGER, user_id INTEGER, entries REAL DEFAULT 0,
                 PRIMARY KEY(guild_id, user_id))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS mega_mega_config(
+                guild_id INTEGER PRIMARY KEY,
+                ticket_divisor REAL DEFAULT 1,
+                payout_multiplier REAL DEFAULT 1,
+                winners INTEGER DEFAULT 1)""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS mega_mega_bought(
+                guild_id INTEGER, user_id INTEGER, bought INTEGER DEFAULT 0,
+                PRIMARY KEY(guild_id, user_id))""")
+ 
+            try:
+                await db.execute("ALTER TABLE mega_history ADD COLUMN winners_json TEXT")
+            except aiosqlite.OperationalError:
+                pass
+
                 
             # Migration: add message requirement to auto-entry roles
             try:
@@ -1244,17 +1261,17 @@ async def listautoresetrules(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 # ═══════════════════════════════════════════════════════
-# RAFFLE HELPERS
+# mega HELPERS
 # ═══════════════════════════════════════════════════════
 
 async def get_tickets(guild_id, user_id):
     async with db_lock:
         async with get_db() as db:
-            async with db.execute("SELECT tickets FROM raffle WHERE guild_id=? AND user_id=?",
+            async with db.execute("SELECT tickets FROM mega WHERE guild_id=? AND user_id=?",
                                   (guild_id, user_id)) as cur:
                 row = await cur.fetchone()
             if not row:
-                await db.execute("INSERT INTO raffle VALUES(?,?,?)", (guild_id, user_id, 0))
+                await db.execute("INSERT INTO mega VALUES(?,?,?)", (guild_id, user_id, 0))
                 await db.commit()
                 return 0
             return row[0]
@@ -1264,9 +1281,41 @@ async def add_tickets(guild_id, user_id, amount):
     new_tickets = max(0, tickets + amount)
     async with db_lock:
         async with get_db() as db:
-            await db.execute("UPDATE raffle SET tickets=? WHERE guild_id=? AND user_id=?",
+            await db.execute("UPDATE mega SET tickets=? WHERE guild_id=? AND user_id=?",
                              (new_tickets, guild_id, user_id))
             await db.commit()
+
+def _weighted_sample_without_replacement(items_weights: list, k: int) -> list:
+    """Pick up to k unique items without replacement, weighted by their value."""
+    pool = [(it, w) for it, w in items_weights if w > 0]
+    chosen = []
+    for _ in range(min(k, len(pool))):
+        total = sum(w for _, w in pool)
+        if total <= 0:
+            break
+        r = random.uniform(0, total)
+        upto = 0.0
+        for i, (it, w) in enumerate(pool):
+            upto += w
+            if upto >= r:
+                chosen.append(it)
+                pool.pop(i)
+                break
+    return chosen
+ 
+ async def _process_mega_ticket_message(message: discord.Message):
+    """Award 1 mega ticket for any 3+ word message (not a command)."""
+    if not message.guild:
+        return
+    gid = message.guild.id
+    if not await is_system_enabled(gid, "mega"):
+        return
+    content = message.content.strip()
+    if not content or content.startswith(_BOT_PREFIX):
+        return
+    if len(content.split()) < 3:
+        return
+    await add_tickets(gid, message.author.id, 1)
 
 # --- MESSAGE HELPERS --------------------------
 
@@ -1408,6 +1457,7 @@ async def on_message(message):
                     session["event"].set()
         await _process_counting(message)
         await _process_power_giveaway_message(message)
+        await _process_mega_ticket_message(message)
     now = datetime.now().timestamp()
     key = (message.guild.id, message.author.id)
     last_time = last_message_exp.get(key, 0)
@@ -1741,7 +1791,7 @@ class _APModal_Economy(discord.ui.Modal):
         _cfgs = {
             "balance": ("💰 Modify Balance",  "Coins — positive adds, negative removes",    "💰", "coins"),
             "exp":     ("⭐ Modify EXP",      "Usable EXP — positive adds, negative removes","⭐", "EXP"),
-            "tickets": ("🎟 Modify Tickets",  "Raffle tickets — positive adds, negative removes","🎟","tickets"),
+            "tickets": ("🎟 Modify Tickets",  "mega tickets — positive adds, negative removes","🎟","tickets"),
             "vipkey":  ("🔑 Modify VIP Keys", "Keys — positive adds, negative removes",     "🔑", "VIP Keys"),
             "token":   ("🎲 Modify Tokens",   "Gamble Tokens — positive adds, negative removes","🎲","Gamble Tokens"),
         }
@@ -1919,7 +1969,7 @@ class _APModal_CheckUser(discord.ui.Modal, title="🔍 Check User Stats"):
  
         async with get_db() as db:
             async with db.execute(
-                "SELECT COALESCE(SUM(tickets),0) FROM raffle WHERE guild_id=?",
+                "SELECT COALESCE(SUM(tickets),0) FROM mega WHERE guild_id=?",
                 (gid,)) as cur:
                 total_tix = (await cur.fetchone())[0]
         chance = (tickets / total_tix * 100) if total_tix else 0
@@ -2006,7 +2056,7 @@ async def _build_admin_panel_embed() -> discord.Embed:
         value=(
             "**💰 Balance** — coins\n"
             "**⭐ EXP** — usable EXP (bonus, doesn't change Activity Rank total)\n"
-            "**🎟 Tickets** — raffle tickets\n"
+            "**🎟 Tickets** — mega tickets\n"
             "**🔑 VIP Keys** — VIP Chest Keys\n"
             "**🎲 Tokens** — Gamble Tokens"
         ), inline=False)
@@ -2157,8 +2207,8 @@ class AdminPanelView(discord.ui.View):
                 bal_cnt, total_bal = await cur.fetchone()
             async with db.execute(
                 "SELECT COUNT(*), COALESCE(SUM(tickets),0) "
-                "FROM raffle WHERE guild_id=?", (gid,)) as cur:
-                raffle_cnt, total_tix = await cur.fetchone()
+                "FROM mega WHERE guild_id=?", (gid,)) as cur:
+                mega_cnt, total_tix = await cur.fetchone()
             async with db.execute(
                 "SELECT COALESCE(SUM(chests_opened),0) "
                 "FROM user_stats WHERE guild_id=?", (gid,)) as cur:
@@ -2172,8 +2222,8 @@ class AdminPanelView(discord.ui.View):
             timestamp=datetime.now(UTC))
         embed.add_field(name="💰 Coins in circulation", value=f"{total_bal:,}",    inline=True)
         embed.add_field(name="👥 Users w/ balance",      value=f"{bal_cnt:,}",     inline=True)
-        embed.add_field(name="🎟 Raffle pool",           value=f"{total_tix:,}",   inline=True)
-        embed.add_field(name="🎟 Raffle participants",   value=f"{raffle_cnt:,}",  inline=True)
+        embed.add_field(name="🎟 mega pool",           value=f"{total_tix:,}",   inline=True)
+        embed.add_field(name="🎟 mega participants",   value=f"{mega_cnt:,}",  inline=True)
         embed.add_field(name="📦 Chests opened (total)", value=f"{total_chests:,}",inline=True)
         embed.add_field(name="🎉 Giveaways run",         value=f"{total_ga:,}",    inline=True)
         embed.set_footer(text="Live snapshot")
@@ -2289,7 +2339,7 @@ async def on_ready():
     print(f"[Sync] Done — {ok} succeeded, {fail} failed")
     print(f"Logged in as {bot.user}")
 
-    for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
+    for task_fn in [mega_loop, giveaway_watcher, mega_info_loop,
                     game_loop, daily_key_loop, daily_gamble_loop,
                     _msg_count_flush_loop, auto_reset_loop, power_giveaway_loop]:
         bot.loop.create_task(task_fn())
@@ -2405,7 +2455,7 @@ async def level(interaction: discord.Interaction, user: discord.Member = None):
     winners="Number of winners",
     reward_balance="Coin reward per winner",
     reward_exp="EXP reward per winner",
-    reward_tickets="Raffle tickets per winner",
+    reward_tickets="mega tickets per winner",
     reward_gamble_tokens="Gamble tokens per winner",
     reward_vip_keys="VIP Chest Keys per winner",
     reward_role="Role to give each winner (must be below your highest role)",
@@ -2744,7 +2794,7 @@ async def auto_giveaway_loop(guild_id: int):
     chance="Selection weight — higher = picked more often (default 1.0)",
     reward_balance="Coin reward per winner",
     reward_exp="EXP reward per winner",
-    reward_tickets="Raffle tickets per winner",
+    reward_tickets="mega tickets per winner",
     reward_gamble_tokens="Gamble tokens per winner",
     reward_vip_keys="VIP Chest Keys per winner",
     reward_role="Role to give each winner",
@@ -3117,7 +3167,7 @@ bot.tree.add_command(power_group)
     winners_channel="Channel where winners are announced",
     default_entries="Entries every member starts with (default 0)",
     reward_balance="Coins per winner", reward_exp="EXP per winner",
-    reward_tickets="Raffle tickets per winner", reward_gamble_tokens="Gamble tokens per winner",
+    reward_tickets="mega tickets per winner", reward_gamble_tokens="Gamble tokens per winner",
     reward_vip_keys="VIP keys per winner", reward_role="Role given to each winner",
     reward_item="Item/box per winner", reward_item_qty="Quantity of item (default 1)")
 async def power_setup(interaction: discord.Interaction, prize: str, winners: int,
@@ -3374,116 +3424,164 @@ async def pfx_power_status(ctx):
     await power_status._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
-# RAFFLE SYSTEM
+# mega SYSTEM
 # ═══════════════════════════════════════════════════════
 
-@bot.tree.command(name="buytickets", description="Buy raffle tickets (100 coins each)")
+@bot.tree.command(name="buytickets",
+                  description="Buy mega mega tickets (100 coins each, max 250 bought per round)")
 @command_enabled()
 async def buytickets(interaction: discord.Interaction, amount: int):
-    if not await is_system_enabled(interaction.guild.id, "raffle"):
-        await interaction.response.send_message("❌ Raffle system is disabled.", ephemeral=True); return
+    gid, uid = interaction.guild.id, interaction.user.id
+    if not await is_system_enabled(gid, "mega"):
+        await interaction.response.send_message("❌ mega system is disabled.", ephemeral=True); return
     if amount <= 0:
         await interaction.response.send_message("❌ Amount must be > 0."); return
-    price = amount * RAFFLE_TICKET_PRICE
-    bal   = await get_balance(interaction.guild.id, interaction.user.id)
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT bought FROM mega_mega_bought WHERE guild_id=? AND user_id=?",
+            (gid, uid)) as cur:
+            row = await cur.fetchone()
+    current_bought = row[0] if row else 0
+    remaining_cap  = MEGA_TICKET_CAP - current_bought
+    if remaining_cap <= 0:
+        await interaction.response.send_message(
+            f"❌ You've already bought the maximum **{MEGA_TICKET_CAP}** mega tickets this round.")
+        return
+    if amount > remaining_cap:
+        await interaction.response.send_message(
+            f"❌ You can only buy **{remaining_cap}** more mega ticket(s) this round "
+            f"(max {MEGA_TICKET_CAP}).")
+        return
+ 
+    price = amount * mega_TICKET_PRICE
+    bal   = await get_balance(gid, uid)
     if bal < price:
         await interaction.response.send_message("❌ Not enough balance."); return
-    await add_balance(interaction.guild.id, interaction.user.id, -price)
-    await add_tickets(interaction.guild.id, interaction.user.id, amount)
-    user_tickets = await get_tickets(interaction.guild.id, interaction.user.id)
+ 
+    await add_balance(gid, uid, -price)
+    await add_tickets(gid, uid, amount)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO mega_mega_bought(guild_id,user_id,bought) VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET bought=bought+excluded.bought",
+                (gid, uid, amount))
+            await db.commit()
+    await add_stat(gid, uid, "mega_tickets_bought", amount)
+ 
+    user_tickets = await get_tickets(gid, uid)
     async with get_db() as db:
-        async with db.execute("SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
-                              (interaction.guild.id,)) as cur:
+        async with db.execute("SELECT SUM(tickets) FROM mega WHERE guild_id=?", (gid,)) as cur:
             total = (await cur.fetchone())[0] or 0
     chance = (user_tickets / total * 100) if total > 0 else 0
     await interaction.response.send_message(
-        f"🎟 Bought {amount} tickets.\nYou now have **{user_tickets}** tickets.\n"
+        f"🎟 Bought {amount} mega ticket(s) for {price:,} coins.\n"
+        f"You now have **{user_tickets}** mega ticket(s) total "
+        f"({current_bought + amount}/{MEGA_TICKET_CAP} bought this round).\n"
         f"Win chance: **{chance:.2f}%**")
-    await add_stat(interaction.guild.id, interaction.user.id, "raffle_tickets_bought", amount)
 
-@bot.tree.command(name="rafflechance", description="Check raffle tickets and win chance")
+@bot.tree.command(name="megachance", description="Check mega tickets and win chance")
 @command_enabled()
-async def rafflechance(interaction: discord.Interaction, user: discord.Member = None):
+async def megachance(interaction: discord.Interaction, user: discord.Member = None):
     user    = user or interaction.user
     tickets = await get_tickets(interaction.guild.id, user.id)
     async with get_db() as db:
-        async with db.execute("SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
+        async with db.execute("SELECT SUM(tickets) FROM mega WHERE guild_id=?",
                               (interaction.guild.id,)) as cur:
             total = (await cur.fetchone())[0] or 0
     chance = (tickets / total * 100) if total > 0 else 0
-    embed = discord.Embed(title="🎟 Raffle Stats", color=discord.Color.gold())
+    embed = discord.Embed(title="🎟 mega Stats", color=discord.Color.gold())
     embed.add_field(name="User",        value=user.mention,       inline=False)
     embed.add_field(name="Tickets",     value=f"{tickets:,}",     inline=False)
     embed.add_field(name="Win Chance",  value=f"{chance:.2f}%",   inline=False)
     embed.add_field(name="Total Pool",  value=f"{total:,}",       inline=False)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="setrafflechannel", description="Set the channel where raffle winners are announced")
+@bot.tree.command(name="setmegachannel", description="Set the channel where mega winners are announced")
 @command_enabled()
-async def setrafflechannel(interaction: discord.Interaction, channel: discord.TextChannel):
+async def setmegachannel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     async with db_lock:
         async with get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO raffle_config VALUES(?,?)",
+            await db.execute("INSERT OR REPLACE INTO mega_config VALUES(?,?)",
                              (interaction.guild.id, channel.id))
             await db.commit()
-    await interaction.response.send_message(f"✅ Raffle announcements → {channel.mention}")
+    await interaction.response.send_message(f"✅ mega announcements → {channel.mention}")
 
-async def raffle_loop():
+async def mega_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         now    = datetime.now(UTC)
         target = now.replace(hour=16, minute=0, second=0, microsecond=0)
         if now >= target: target += timedelta(days=1)
-        print(f"[Raffle] Next draw in {(target-now).total_seconds():.0f}s")
+        print(f"[mega] Next draw in {(target-now).total_seconds():.0f}s")
         await asyncio.sleep((target - now).total_seconds())
-
+ 
         for guild in bot.guilds:
-            if not await is_system_enabled(guild.id, "raffle"): continue
+            if not await is_system_enabled(guild.id, "mega"): continue
             async with get_db() as db:
                 async with db.execute(
-                    "SELECT user_id,tickets FROM raffle WHERE guild_id=? ORDER BY tickets DESC",
-                    (guild.id,)) as cur:
+                    "SELECT user_id,tickets FROM mega WHERE guild_id=? AND tickets>0 "
+                    "ORDER BY tickets DESC", (guild.id,)) as cur:
                     entries = await cur.fetchall()
             if not entries:
                 continue
-
-            total   = sum(t for _, t in entries)
-            pool    = []
-            for uid, t in entries: pool.extend([uid] * t)
-            winner_id      = random.choice(pool)
-            winner_tickets = next((t for uid, t in entries if uid == winner_id), 0)
-            top5           = entries[:5]   # already sorted desc by SQL
-
+ 
+            total = sum(t for _, t in entries)
+ 
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT ticket_divisor, payout_multiplier, winners "
+                    "FROM mega_mega_config WHERE guild_id=?", (guild.id,)) as cur:
+                    payout_cfg = await cur.fetchone()
+            divisor, multiplier, winners_count = payout_cfg if payout_cfg else (1.0, 1.0, 1)
+ 
+            total_payout = (total / divisor) * mega_TICKET_PRICE * multiplier
+            per_winner   = round(total_payout / winners_count)
+ 
+            winner_ids = _weighted_sample_without_replacement(entries, winners_count)
+            top5       = entries[:5]
+ 
+            for wid in winner_ids:
+                await add_balance(guild.id, wid, per_winner)
+ 
             # ── Save history ─────────────────────────────────────────
+            winners_payload = [[wid, per_winner] for wid in winner_ids]
             async with db_lock:
                 async with get_db() as db:
                     await db.execute(
-                        "INSERT INTO raffle_history"
-                        "(guild_id,draw_timestamp,winner_id,winner_tickets,total_tickets,top_json) "
-                        "VALUES(?,?,?,?,?,?)",
+                        "INSERT INTO mega_history"
+                        "(guild_id,draw_timestamp,winner_id,winner_tickets,total_tickets,"
+                        "top_json,winners_json) VALUES(?,?,?,?,?,?,?)",
                         (guild.id, int(datetime.now(UTC).timestamp()),
-                         winner_id, winner_tickets, total,
-                         json.dumps([[uid, t] for uid, t in top5])))
+                         winner_ids[0] if winner_ids else 0,
+                         next((t for uid, t in entries
+                               if winner_ids and uid == winner_ids[0]), 0),
+                         total, json.dumps([[uid, t] for uid, t in top5]),
+                         json.dumps(winners_payload)))
                     await db.commit()
-
-            await add_balance(guild.id, winner_id, RAFFLE_PRIZE)
-
+ 
             async with get_db() as db:
-                async with db.execute("SELECT channel_id FROM raffle_config WHERE guild_id=?",
+                async with db.execute("SELECT channel_id FROM mega_config WHERE guild_id=?",
                                       (guild.id,)) as cur:
                     row = await cur.fetchone()
             ann = bot.get_channel(row[0]) if row else guild.system_channel
-            if ann:
-                await ann.send(f"🎉 <@{winner_id}> won the daily raffle and will receive a huge pet!")
-                await log_event(guild.id, "raffle", _log_embed(
-                    "🎟 Daily Raffle Draw", discord.Color.gold(),
-                    Winner=f"<@{winner_id}>", Guild=guild.name))
-
+            if ann and winner_ids:
+                mentions = ", ".join(f"<@{wid}>" for wid in winner_ids)
+                await ann.send(
+                    f"🎉 {mentions} won the daily **Mega mega** and will each receive "
+                    f"**{per_winner:,} coins**!")
+                await log_event(guild.id, "mega", _log_embed(
+                    "🎟 Mega mega Draw", discord.Color.gold(),
+                    Winners=mentions, Per_Winner=f"{per_winner:,}",
+                    Total_Pool=f"{total:,} tickets", Guild=guild.name))
+ 
             async with db_lock:
                 async with get_db() as db:
-                    await db.execute("DELETE FROM raffle WHERE guild_id=?", (guild.id,))
+                    await db.execute("DELETE FROM mega WHERE guild_id=?", (guild.id,))
+                    await db.execute("DELETE FROM mega_mega_bought WHERE guild_id=?", (guild.id,))
                     await db.commit()
 
 # ═══════════════════════════════════════════════════════
@@ -4055,12 +4153,12 @@ async def _do_reset(guild_id: int, user_id: int, reset_type: str):
                     (guild_id, user_id))
             if reset_type in ("tickets", "all"):
                 await db.execute(
-                    "UPDATE raffle SET tickets=0 WHERE guild_id=? AND user_id=?",
+                    "UPDATE mega SET tickets=0 WHERE guild_id=? AND user_id=?",
                     (guild_id, user_id))
             if reset_type in ("stats", "all"):
                 await db.execute(
                     "UPDATE user_stats SET total_exp=0, gifted_balance=0, "
-                    "chests_opened=0, raffle_tickets_bought=0 "
+                    "chests_opened=0, mega_tickets_bought=0 "
                     "WHERE guild_id=? AND user_id=?",
                     (guild_id, user_id))
             await db.commit()
@@ -4118,15 +4216,15 @@ async def listcmds(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ═══════════════════════════════════════════════════════
-# SYSTEM TOGGLES  (raffle / vipkey / gamble)
+# SYSTEM TOGGLES  (mega / vipkey / gamble)
 # ═══════════════════════════════════════════════════════
 
 _SYSTEM_CHOICES = [
-    app_commands.Choice(name="Raffle (buying tickets, daily draw)",      value="raffle"),
+    app_commands.Choice(name="mega (buying tickets, daily draw)",      value="mega"),
     app_commands.Choice(name="VIP Key (daily keys, vipchest command)",   value="vipkey"),
     app_commands.Choice(name="Gambling (tokens, blackjack, roulette)",   value="gamble"),
 ]
-_SYSTEM_LABELS = {"raffle": "🎟 Raffle system", "vipkey": "🔑 VIP Key system", "gamble": "🎲 Gambling system"}
+_SYSTEM_LABELS = {"mega": "🎟 mega system", "vipkey": "🔑 VIP Key system", "gamble": "🎲 Gambling system"}
 
 @bot.tree.command(name="enablesystem", description="Enable a major bot system")
 @app_commands.describe(system="Which system to enable")
@@ -4710,7 +4808,7 @@ async def removeautoentryrole(interaction: discord.Interaction, role: discord.Ro
 async def _build_stats_embed(guild: discord.Guild) -> discord.Embed:
     async with get_db() as db:
         async with db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(tickets),0) FROM raffle "
+            "SELECT COUNT(*), COALESCE(SUM(tickets),0) FROM mega "
             "WHERE guild_id=? AND tickets>0", (guild.id,)) as cur:
             members, pool = await cur.fetchone()
     embed = discord.Embed(
@@ -4721,7 +4819,7 @@ async def _build_stats_embed(guild: discord.Guild) -> discord.Embed:
         ),
         color=discord.Color.blurple())
     embed.add_field(
-        name="🎟 Current Raffle Pool",
+        name="🎟 Current mega Pool",
         value=f"{pool:,} tickets across {members:,} member(s)",
         inline=False)
     embed.set_footer(text="Results are only visible to you")
@@ -4789,7 +4887,7 @@ class StatsChannelView(discord.ui.View):
                         value=f"{usable // CHEST_COST}", inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="🎟 Raffle Tickets", style=discord.ButtonStyle.secondary,
+    @discord.ui.button(label="🎟 mega Tickets", style=discord.ButtonStyle.secondary,
                        custom_id="stats_panel:tickets", row=0)
     async def check_tickets(self, interaction: discord.Interaction, btn: discord.ui.Button):
         gid     = interaction.guild.id
@@ -4797,11 +4895,11 @@ class StatsChannelView(discord.ui.View):
         tickets = await get_tickets(gid, uid)
         async with get_db() as db:
             async with db.execute(
-                "SELECT COALESCE(SUM(tickets),0) FROM raffle WHERE guild_id=?",
+                "SELECT COALESCE(SUM(tickets),0) FROM mega WHERE guild_id=?",
                 (gid,)) as cur:
                 total = (await cur.fetchone())[0]
         chance = (tickets / total * 100) if total else 0
-        embed = discord.Embed(title="🎟 Your Raffle Stats", color=discord.Color.gold())
+        embed = discord.Embed(title="🎟 Your mega Stats", color=discord.Color.gold())
         embed.add_field(name="Your Tickets",  value=f"{tickets:,}",    inline=True)
         embed.add_field(name="Total Pool",    value=f"{total:,}",      inline=True)
         embed.add_field(name="Win Chance",    value=f"{chance:.2f}%",  inline=True)
@@ -4949,8 +5047,8 @@ class LeaderboardView(discord.ui.View):
     app_commands.Choice(name="Total EXP",              value="total_exp"),
     app_commands.Choice(name="Usable EXP",             value="current_exp"),
     app_commands.Choice(name="Balance",                value="balance"),
-    app_commands.Choice(name="Lifetime Tickets",       value="raffle_tickets_bought"),
-    app_commands.Choice(name="Current Raffle Tickets", value="current_tickets"),
+    app_commands.Choice(name="Lifetime Tickets",       value="mega_tickets_bought"),
+    app_commands.Choice(name="Current mega Tickets", value="current_tickets"),
     app_commands.Choice(name="Chests Opened",          value="chests_opened"),
     app_commands.Choice(name="Gifted Balance",         value="gifted_balance"),
 ])
@@ -4979,7 +5077,7 @@ async def leaderboard(interaction: discord.Interaction,
                 all_data = [(uid, int(amt)) for uid, amt in await cur.fetchall()]
         elif value == "current_tickets":
             async with db.execute(
-                "SELECT user_id, tickets FROM raffle "
+                "SELECT user_id, tickets FROM mega "
                 "WHERE guild_id=? AND tickets>0 ORDER BY tickets DESC",
                 (gid,)) as cur:
                 all_data = list(await cur.fetchall())
@@ -5010,7 +5108,7 @@ async def leaderboard(interaction: discord.Interaction,
         "total_exp":             "🏆 Total EXP",
         "current_exp":           "⭐ Usable EXP",
         "balance":               "💰 Balance",
-        "raffle_tickets_bought": "🎟 Lifetime Tickets",
+        "mega_tickets_bought": "🎟 Lifetime Tickets",
         "current_tickets":       "🎫 Current Tickets",
         "chests_opened":         "📦 Chests Opened",
         "gifted_balance":        "💸 Gifted Balance",
@@ -5069,15 +5167,15 @@ async def setraredropchannel(interaction: discord.Interaction, channel: discord.
     await interaction.response.send_message(f"✅ Rare drop announcements → {channel.mention}")
 
 # ═══════════════════════════════════════════════════════
-# RAFFLE INFO CHANNEL
+# mega INFO CHANNEL
 # ═══════════════════════════════════════════════════════
 
-def build_raffle_info_embed(guild, total_tickets, top_entries, prev=None):
+def build_mega_info_embed(guild, total_tickets, top_entries, prev=None):
     now    = datetime.now(UTC)
     target = now.replace(hour=16, minute=0, second=0, microsecond=0)
     if now >= target: target += timedelta(days=1)
     end_ts = int(target.timestamp())
-    embed  = discord.Embed(title="🎟 Live Raffle Status", color=discord.Color.gold())
+    embed  = discord.Embed(title="🎟 Live mega Status", color=discord.Color.gold())
     embed.add_field(name="⏰ Next Draw",
                     value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)", inline=False)
     embed.add_field(name="🎫 Total Tickets", value=f"{total_tickets:,}", inline=False)
@@ -5095,55 +5193,55 @@ def build_raffle_info_embed(guild, total_tickets, top_entries, prev=None):
     else:
         embed.add_field(name="🏆 Top Participants", value="No tickets yet.", inline=False)
 
-    # ── Previous raffle ──────────────────────────────────────────────
+    # ── Previous mega ──────────────────────────────────────────────
     if prev:
-        draw_dt   = datetime.fromtimestamp(prev["ts"], UTC)
-        date_str  = draw_dt.strftime("%Y-%m-%d %H:%M UTC")
-        winner    = guild.get_member(prev["winner_id"])
-        wname     = winner.display_name if winner else f"<@{prev['winner_id']}>"
-        wpct      = (prev["winner_tickets"] / prev["total"] * 100) if prev["total"] else 0
-        lines2    = [
-            f"🏆 **{wname}** — {prev['winner_tickets']:,} tickets ({wpct:.1f}%)",
-            f"📊 Pool: {prev['total']:,} tickets",
-        ]
+        draw_dt      = datetime.fromtimestamp(prev["ts"], UTC)
+        date_str     = draw_dt.strftime("%Y-%m-%d %H:%M UTC")
+        winners_list = prev.get("winners") or [[prev["winner_id"], None]]
+        win_lines = []
+        for w_uid, w_amt in winners_list:
+            m  = guild.get_member(w_uid)
+            mn = m.display_name if m else f"<@{w_uid}>"
+            win_lines.append(f"🏆 **{mn}**" + (f" — {w_amt:,} coins" if w_amt else ""))
+        lines2 = win_lines + [f"📊 Pool: {prev['total']:,} tickets"]
         for i, (uid, t) in enumerate(prev.get("top", [])[:3]):
             m    = guild.get_member(uid)
             mn   = m.display_name if m else f"<@{uid}>"
             pct2 = (t / prev["total"] * 100) if prev["total"] else 0
             lines2.append(f"{'🥇🥈🥉'[i]} {mn} — {t:,} ({pct2:.1f}%)")
-        embed.add_field(name=f"📜 Previous Draw ({date_str})",
+        embed.add_field(name=f"📜 Previous Mega mega Draw ({date_str})",
                         value="\n".join(lines2), inline=False)
 
     embed.set_footer(text=f"Updated: {datetime.now(UTC).strftime('%H:%M:%S UTC')}")
     return embed
 
-@bot.tree.command(name="setraffleinfochannel", description="Set channel for the live raffle status board")
+@bot.tree.command(name="setmegainfochannel", description="Set channel for the live mega status board")
 @command_enabled()
-async def setraffleinfochannel(interaction: discord.Interaction, channel: discord.TextChannel):
+async def setmegainfochannel(interaction: discord.Interaction, channel: discord.TextChannel):
     if not await is_allowed_to_giveaway(interaction):
         await interaction.response.send_message("❌ No permission.", ephemeral=True); return
     async with get_db() as db:
-        async with db.execute("SELECT user_id,tickets FROM raffle WHERE guild_id=? ORDER BY tickets DESC LIMIT 5",
+        async with db.execute("SELECT user_id,tickets FROM mega WHERE guild_id=? ORDER BY tickets DESC LIMIT 5",
                               (interaction.guild.id,)) as cur:
             top = await cur.fetchall()
-        async with db.execute("SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
+        async with db.execute("SELECT SUM(tickets) FROM mega WHERE guild_id=?",
                               (interaction.guild.id,)) as cur:
             total = (await cur.fetchone())[0] or 0
-    embed = build_raffle_info_embed(interaction.guild, total, top)
+    embed = build_mega_info_embed(interaction.guild, total, top)
     info_msg = await channel.send(embed=embed)
     async with db_lock:
         async with get_db() as db:
-            await db.execute("INSERT OR REPLACE INTO raffle_info_config VALUES(?,?,?)",
+            await db.execute("INSERT OR REPLACE INTO mega_info_config VALUES(?,?,?)",
                              (interaction.guild.id, channel.id, info_msg.id))
             await db.commit()
-    await interaction.response.send_message(f"✅ Live raffle board posted in {channel.mention}.")
+    await interaction.response.send_message(f"✅ Live mega board posted in {channel.mention}.")
 
-async def raffle_info_loop():
+async def mega_info_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         async with get_db() as db:
             async with db.execute(
-                "SELECT guild_id,channel_id,message_id FROM raffle_info_config") as cur:
+                "SELECT guild_id,channel_id,message_id FROM mega_info_config") as cur:
                 configs = await cur.fetchall()
         for guild_id, channel_id, message_id in configs:
             try:
@@ -5153,28 +5251,29 @@ async def raffle_info_loop():
 
                 async with get_db() as db:
                     async with db.execute(
-                        "SELECT user_id,tickets FROM raffle WHERE guild_id=? "
+                        "SELECT user_id,tickets FROM mega WHERE guild_id=? "
                         "ORDER BY tickets DESC LIMIT 5", (guild_id,)) as cur:
                         top = await cur.fetchall()
                     async with db.execute(
-                        "SELECT SUM(tickets) FROM raffle WHERE guild_id=?",
+                        "SELECT SUM(tickets) FROM mega WHERE guild_id=?",
                         (guild_id,)) as cur:
                         total = (await cur.fetchone())[0] or 0
                     # Fetch most recent history entry
                     async with db.execute(
-                        "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
-                        "FROM raffle_history WHERE guild_id=? "
+                        "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,"
+                        "top_json,winners_json FROM mega_history WHERE guild_id=? "
                         "ORDER BY draw_timestamp DESC LIMIT 1",
                         (guild_id,)) as cur:
                         h = await cur.fetchone()
-
+ 
                 prev = None
                 if h:
-                    ts, wid, wt, tot, tj = h
+                    ts, wid, wt, tot, tj, wj = h
                     prev = {"ts": ts, "winner_id": wid, "winner_tickets": wt,
-                            "total": tot, "top": json.loads(tj) if tj else []}
+                            "total": tot, "top": json.loads(tj) if tj else [],
+                            "winners": json.loads(wj) if wj else []}
 
-                embed = build_raffle_info_embed(guild, total, top, prev)
+                embed = build_mega_info_embed(guild, total, top, prev)
                 try:
                     msg = await channel.fetch_message(message_id)
                     await msg.edit(embed=embed)
@@ -5183,11 +5282,11 @@ async def raffle_info_loop():
                     async with db_lock:
                         async with get_db() as db:
                             await db.execute(
-                                "UPDATE raffle_info_config SET message_id=? WHERE guild_id=?",
+                                "UPDATE mega_info_config SET message_id=? WHERE guild_id=?",
                                 (new_msg.id, guild_id))
                             await db.commit()
             except Exception as e:
-                print(f"[RaffleInfoLoop] {guild_id}: {e}")
+                print(f"[megaInfoLoop] {guild_id}: {e}")
         await asyncio.sleep(60)
 
 # --- MY WININGS ----------------------------------------
@@ -5468,7 +5567,7 @@ class TradeSession:
 class TradeOfferModal(discord.ui.Modal, title="Set Your Trade Offer"):
     balance_input = discord.ui.TextInput(label="Balance to offer (0 for none)", default="0", max_length=20)
     exp_input     = discord.ui.TextInput(label="EXP to offer (0 for none)",     default="0", max_length=20)
-    tickets_input = discord.ui.TextInput(label="Raffle tickets (0 for none)",   default="0", max_length=20)
+    tickets_input = discord.ui.TextInput(label="mega tickets (0 for none)",   default="0", max_length=20)
     items_input   = discord.ui.TextInput(label="Items/boxes (blank for none)",
                                          placeholder="Name:qty, Name2:qty2",
                                          required=False, max_length=300)
@@ -6900,7 +6999,7 @@ _PRESET_CHOICES = [app_commands.Choice(name=f"{k} ({len(v['answers_hints'])} ent
     name="The question/prompt shown to players",
     reward_balance="Coin reward for winner",
     reward_exp="EXP reward for winner",
-    reward_tickets="Raffle ticket reward",
+    reward_tickets="mega ticket reward",
     reward_gamble_tokens="Gamble token reward",
     reward_vip_keys="VIP Chest Key reward",
     reward_item="Item or box name reward (optional)",
@@ -7373,7 +7472,7 @@ _STAT_CHOICES = [
     app_commands.Choice(name="Total EXP",        value="total_exp"),
     app_commands.Choice(name="Gifted Balance",    value="gifted_balance"),
     app_commands.Choice(name="Chests Opened",     value="chests_opened"),
-    app_commands.Choice(name="Lifetime Tickets",  value="raffle_tickets_bought"),
+    app_commands.Choice(name="Lifetime Tickets",  value="mega_tickets_bought"),
 ]
         
 # ─── HELP SYSTEM ─────────────────────────────────────────────────────────────
@@ -7444,21 +7543,29 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
         ("removeleaderboardstat","Admin: directly subtract from a leaderboard stat.",
          "!removeleaderboardstat @user <stat> <amount>"),
     ]),
-    "raffle": ("🎟", "Raffle", [
-        ("buytickets",          "Buy raffle tickets (100 coins each). More tickets = higher chance.",
+    "mega": ("🎟", "Mega", [
+        ("buytickets",
+         "Buy mega raffle tickets (400k coins each). Capped at 250 BOUGHT per mega — "
+         "but you can also EARN unlimited tickets by sending any 3+ word message.",
          "/buytickets <amount>  or  !buytickets <amount>"),
-        ("rafflechance",        "Check a user's ticket count and win probability.",
-         "/rafflechance [@user]  or  !rafflechance [@user]"),
+        ("setmegapayout",
+         "Admin: configure the mega raffle payout formula and winner count.\n"
+         "Formula: (total tickets ÷ divisor) × 100 × multiplier ÷ winners = payout per winner.\n"
+         "Divisor and multiplier must be > 0 (any value, however tiny or huge).",
+         "/setmegapayout <ticket_divisor> <payout_multiplier> [winners]  or  "
+         "!setmegapayout <divisor> <multiplier> [winners]"),
+        ("megachance",        "Check a user's ticket count and win probability.",
+         "/megachance [@user]  or  !megachance [@user]"),
         ("addtickets",          "Admin: add tickets to a user.",
          "!addtickets @user <amount>"),
         ("removetickets",       "Admin: remove tickets from a user.",
          "!removetickets @user <amount>"),
-        ("checkrafflehistory",  "Admin: see the last 10 raffle draws.",
-         "!checkrafflehistory"),
-        ("setrafflechannel",    "Set the channel for daily raffle winner announcements.",
-         "/setrafflechannel <#channel>  or  !setrafflechannel #channel"),
-        ("setraffleinfochannel","Post a live raffle status board (auto-updates every 60 s).",
-         "/setraffleinfochannel <#channel>  or  !setraffleinfochannel #channel"),
+        ("checkmegahistory",  "Admin: see the last 10 mega draws.",
+         "!checkmegahistory"),
+        ("setmegachannel",    "Set the channel for daily mega winner announcements.",
+         "/setmegachannel <#channel>  or  !setmegachannel #channel"),
+        ("setmegainfochannel","Post a live mega status board (auto-updates every 60 s).",
+         "/setmegainfochannel <#channel>  or  !setmegainfochannel #channel"),
     ]),
     "chests": ("📦", "Chests", [
         ("chest",               "Open EXP chest(s). Costs 1,000 EXP each.",
@@ -7601,7 +7708,7 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
          "```\n"
          "balance       — coins\n"
          "exp           — EXP (usable)\n"
-         "tickets       — raffle tickets\n"
+         "tickets       — mega tickets\n"
          "gamble_tokens — Gamble Tokens\n"
          "vip_keys      — VIP Chest Keys\n"
          "item          — item / box name  (string)\n"
@@ -7692,7 +7799,7 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
          "/enablecmd <command_name>  or  !enablecmd <command_name>"),
         ("listcmds",             "Show all disabled commands for this server.",
          "/listcmds  or  !listcmds"),
-        ("enablesystem",         "Enable a major system: raffle / vipkey / gamble.",
+        ("enablesystem",         "Enable a major system: mega / vipkey / gamble.",
          "/enablesystem <system>  or  !enablesystem <system>"),
         ("disablesystem",        "Disable a major system.",
          "/disablesystem <system>  or  !disablesystem <system>"),
@@ -8017,7 +8124,7 @@ async def cmd_giveawayroles(ctx):
     mentions = [r.mention for row in rows if (r := ctx.guild.get_role(row[0]))]
     await ctx.send("🎉 Giveaway Roles:\n" + ("\n".join(mentions) if mentions else "None found."))
 
-# ── Raffle ────────────────────────────────────────────────────────────────────
+# ── mega ────────────────────────────────────────────────────────────────────
 
 @bot.command(name="addtickets")
 async def cmd_addtickets(ctx, user: discord.Member, amount: int):
@@ -8031,26 +8138,81 @@ async def cmd_removetickets(ctx, user: discord.Member, amount: int):
     await add_tickets(ctx.guild.id, user.id, -amount)
     await ctx.send(f"❌ Removed {amount} tickets from {user.mention}.")
 
-@bot.command(name="checkrafflehistory")
-async def cmd_checkrafflehistory(ctx):
+@bot.command(name="checkmegahistory")
+async def cmd_checkmegahistory(ctx):
     async with get_db() as db:
         async with db.execute(
-            "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
-            "FROM raffle_history WHERE guild_id=? ORDER BY draw_timestamp DESC LIMIT 10",
+            "SELECT draw_timestamp,winner_id,winner_tickets,total_tickets,top_json,winners_json "
+            "FROM mega_history WHERE guild_id=? ORDER BY draw_timestamp DESC LIMIT 10",
             (ctx.guild.id,)) as cur:
             rows = await cur.fetchall()
-    if not rows: await ctx.send("❌ No raffle history yet."); return
-    embed = discord.Embed(title="📜 Recent Raffle History (last 10)", color=discord.Color.gold())
-    for ts, wid, wt, tot, tj in rows:
-        draw_dt = datetime.fromtimestamp(ts, UTC)
+    if not rows:
+        await ctx.send("❌ No mega history yet."); return
+    embed = discord.Embed(title="📜 Recent Mega mega Draws (last 10)", color=discord.Color.gold())
+    for ts, wid, wt, tot, tj, wj in rows:
+        draw_dt  = datetime.fromtimestamp(ts, UTC)
         date_str = draw_dt.strftime("%Y-%m-%d %H:%M UTC")
-        winner = ctx.guild.get_member(wid)
-        wname = winner.display_name if winner else "*[Left Server]*"
-        wpct = (wt / tot * 100) if tot else 0
+        try:
+            winners_list = json.loads(wj) if wj else [[wid, None]]
+        except Exception:
+            winners_list = [[wid, None]]
+        names = []
+        for w_uid, w_amt in winners_list:
+            m  = ctx.guild.get_member(w_uid)
+            nm = m.display_name if m else "*[Left Server]*"
+            names.append(nm + (f" (+{w_amt:,})" if w_amt else ""))
         embed.add_field(name=f"🗓 {date_str}",
-                        value=f"🏆 **{wname}** — {wt:,} tickets ({wpct:.1f}%) | Pool: {tot:,}",
+                        value=f"🏆 {', '.join(names)} | Pool: {tot:,} tickets",
                         inline=False)
     await ctx.send(embed=embed)
+
+from typing import Optional
+ 
+@bot.tree.command(name="setmegapayout", description="Configure the mega mega payout formula")
+@app_commands.describe(
+    ticket_divisor=(
+        "Divisor in the payout formula — must be > 0. "
+        "(total_tickets / this) × ticket_price × multiplier ÷ winners = payout per winner."),
+    payout_multiplier="Multiplier in the formula. Must be > 0 — can be tiny (0.00000001) or huge (999999999).",
+    winners="Winners for the daily draw, splitting the payout evenly. Leave blank to keep current value."
+)
+@command_enabled()
+async def setmegapayout(interaction: discord.Interaction, ticket_divisor: float,
+                        payout_multiplier: float, winners: Optional[int] = None):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if ticket_divisor <= 0 or payout_multiplier <= 0:
+        await interaction.response.send_message(
+            "❌ Both divisor and multiplier must be greater than 0.", ephemeral=True); return
+    if winners is not None and winners < 1:
+        await interaction.response.send_message("❌ Winners must be ≥ 1.", ephemeral=True); return
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT winners FROM mega_mega_config WHERE guild_id=?",
+            (interaction.guild.id,)) as cur:
+            existing = await cur.fetchone()
+    final_winners = winners if winners is not None else (existing[0] if existing else 1)
+ 
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO mega_mega_config"
+                "(guild_id, ticket_divisor, payout_multiplier, winners) VALUES(?,?,?,?)",
+                (interaction.guild.id, ticket_divisor, payout_multiplier, final_winners))
+            await db.commit()
+ 
+    await interaction.response.send_message(
+        f"✅ Mega mega payout updated:\n"
+        f"`(total tickets ÷ {ticket_divisor}) × {mega_TICKET_PRICE} × {payout_multiplier} "
+        f"÷ {final_winners} winner(s)`\n"
+        f"Each winner receives an equal share of the computed total payout.")
+ 
+ 
+@bot.command(name="setmegapayout")
+async def pfx_setmegapayout(ctx, ticket_divisor: float, payout_multiplier: float, winners: int = None):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setmegapayout._callback(FakeInteraction(ctx), ticket_divisor, payout_multiplier, winners)
 
 # ── VIP Keys ──────────────────────────────────────────────────────────────────
 
@@ -8486,7 +8648,7 @@ async def cmd_removerarebox(ctx, box: str, prize_id: int):
     required_role   = "Role the user must have to redeem",
     balance         = "Coins to award on redeem",
     exp             = "EXP to award on redeem",
-    tickets         = "Raffle tickets to award on redeem",
+    tickets         = "mega tickets to award on redeem",
     gamble_tokens   = "Gamble Tokens to award on redeem",
     vip_keys        = "VIP Chest Keys to award on redeem",
     item            = "Item or box name to award on redeem",
@@ -8647,7 +8809,7 @@ async def cmd_listcodes(ctx):
 
 # ── Leaderboard stats ─────────────────────────────────────────────────────────
 
-_VALID_STATS = {"total_exp", "gifted_balance", "chests_opened", "raffle_tickets_bought"}
+_VALID_STATS = {"total_exp", "gifted_balance", "chests_opened", "mega_tickets_bought"}
 
 @bot.command(name="addleaderboardstat")
 async def cmd_addleaderboardstat(ctx, user: discord.Member, stat: str, amount: int):
@@ -9026,7 +9188,7 @@ _LOG_CHOICES = [
     app_commands.Choice(name="💰 Balance  — add/remove/gift/wins",        value="balance"),
     app_commands.Choice(name="⭐ EXP      — add/remove/chest spend",      value="exp"),
     app_commands.Choice(name="🎒 Items    — buy/use/give/take/keys",      value="item"),
-    app_commands.Choice(name="🎟 Raffle   — ticket purchases, daily draw",value="raffle"),
+    app_commands.Choice(name="🎟 mega   — ticket purchases, daily draw",value="mega"),
     app_commands.Choice(name="🎉 Giveaway — create/end/reroll",           value="giveaway"),
     app_commands.Choice(name="📦 Chests   — open results",                value="chest"),
     app_commands.Choice(name="🎁 Boxes    — open results",                value="box"),
@@ -9198,20 +9360,20 @@ async def _item_use_logged(interaction: discord.Interaction, name: str):
             User=interaction.user.mention, Item=name))
 item_use._callback = _item_use_logged
 
-# ── Raffle ────────────────────────────────────────────────────────────────────
+# ── mega ────────────────────────────────────────────────────────────────────
 
 _orig_buytickets = buytickets._callback
 async def _buytickets_logged(interaction: discord.Interaction, amount: int):
     # Pre-check: system on, positive amount, sufficient balance
-    price = amount * RAFFLE_TICKET_PRICE
+    price = amount * mega_TICKET_PRICE
     should_log = (
         amount > 0 and
-        await is_system_enabled(interaction.guild.id, "raffle") and
+        await is_system_enabled(interaction.guild.id, "mega") and
         await get_balance(interaction.guild.id, interaction.user.id) >= price
     )
     await _orig_buytickets(interaction, amount)
     if should_log:
-        await log_event(interaction.guild.id, "raffle", _log_embed(
+        await log_event(interaction.guild.id, "mega", _log_embed(
             "🎟 Tickets Purchased", discord.Color.gold(),
             User=interaction.user.mention, Tickets=str(amount),
             Cost=f"{price:,} coins"))
@@ -9603,7 +9765,7 @@ async def setprefix(interaction: discord.Interaction, prefix: str):
 _CP_CHOICES = [
     app_commands.Choice(name="Balance",              value="balance"),
     app_commands.Choice(name="EXP",                  value="exp"),
-    app_commands.Choice(name="Raffle Tickets",       value="tickets"),
+    app_commands.Choice(name="mega Tickets",       value="tickets"),
     app_commands.Choice(name="Gamble Tokens",        value="gamble_tokens"),
     app_commands.Choice(name="VIP Keys",             value="vip_keys"),
     app_commands.Choice(name="Item / Box",           value="item"),
@@ -9829,7 +9991,7 @@ async def pfx_activityrank(ctx, user: discord.Member = None):
 
 @bot.command(name="leaderboard")
 async def pfx_leaderboard(ctx, category: str = "balance", page: int = 1):
-    _valid = {"total_exp","current_exp","balance","raffle_tickets_bought",
+    _valid = {"total_exp","current_exp","balance","mega_tickets_bought",
               "current_tickets","chests_opened","gifted_balance"}
     if category not in _valid:
         await ctx.send(f"❌ Valid categories: {', '.join(sorted(_valid))}"); return
@@ -9839,9 +10001,9 @@ async def pfx_leaderboard(ctx, category: str = "balance", page: int = 1):
 async def pfx_buytickets(ctx, amount: int):
     await buytickets._callback(FakeInteraction(ctx), amount)
 
-@bot.command(name="rafflechance")
-async def pfx_rafflechance(ctx, user: discord.Member = None):
-    await rafflechance._callback(FakeInteraction(ctx), user)
+@bot.command(name="megachance")
+async def pfx_megachance(ctx, user: discord.Member = None):
+    await megachance._callback(FakeInteraction(ctx), user)
 
 @bot.command(name="chest")
 async def pfx_chest(ctx, amount: int = 1):
@@ -9974,15 +10136,15 @@ async def pfx_startgiveaways(ctx, interval_seconds: int, giveaway_duration_secon
 
 # ── Channel / config setup ───────────────────────────────────────────────────
 
-@bot.command(name="setrafflechannel")
-async def pfx_setrafflechannel(ctx, channel: discord.TextChannel):
+@bot.command(name="setmegachannel")
+async def pfx_setmegachannel(ctx, channel: discord.TextChannel):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
-    await setrafflechannel._callback(FakeInteraction(ctx), channel)
+    await setmegachannel._callback(FakeInteraction(ctx), channel)
 
-@bot.command(name="setraffleinfochannel")
-async def pfx_setraffleinfochannel(ctx, channel: discord.TextChannel):
+@bot.command(name="setmegainfochannel")
+async def pfx_setmegainfochannel(ctx, channel: discord.TextChannel):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
-    await setraffleinfochannel._callback(FakeInteraction(ctx), channel)
+    await setmegainfochannel._callback(FakeInteraction(ctx), channel)
 
 @bot.command(name="setraredropchannel")
 async def pfx_setraredropchannel(ctx, channel: discord.TextChannel):
@@ -10228,12 +10390,12 @@ async def transfer(interaction: discord.Interaction,
                         ["guild_id","user_id","amount","timestamp","is_bonus"])
             await _copy(db, "user_stats",
                         ["guild_id","user_id","total_exp","gifted_balance",
-                         "chests_opened","raffle_tickets_bought"])
+                         "chests_opened","mega_tickets_bought"])
             await _copy(db, "inventory",
                         ["guild_id","user_id","item_name","quantity"])
             await _copy(db, "item_store",
                         ["guild_id","item_name","price","role_id","description"])
-            await _copy(db, "raffle",
+            await _copy(db, "mega",
                         ["guild_id","user_id","tickets"])
             await _copy(db, "giveaway_roles",
                         ["guild_id","role_id"])
@@ -10241,9 +10403,9 @@ async def transfer(interaction: discord.Interaction,
                         ["guild_id","flag_name","enabled"])
             await _copy(db, "rare_drop_config",
                         ["guild_id","channel_id"])
-            await _copy(db, "raffle_config",
+            await _copy(db, "mega_config",
                         ["guild_id","channel_id"])
-            await _copy(db, "raffle_info_config",
+            await _copy(db, "mega_info_config",
                         ["guild_id","channel_id","message_id"])
             await _copy(db, "game_config",
                         ["guild_id","channel_id","answer_time","interval_seconds","hint_delays"])
@@ -10328,18 +10490,18 @@ async def transfer(interaction: discord.Interaction,
                     "VALUES(?,?,?,?,?,?)", (gid_to, *r[1:]))
             copied['counting_special_prizes'] = len(rows)
 
-            # raffle_history
-            await db.execute("DELETE FROM raffle_history WHERE guild_id=?", (gid_to,))
+            # mega_history
+            await db.execute("DELETE FROM mega_history WHERE guild_id=?", (gid_to,))
             async with db.execute(
                 "SELECT guild_id,draw_timestamp,winner_id,winner_tickets,total_tickets,top_json "
-                "FROM raffle_history WHERE guild_id=?", (gid_from,)) as cur:
+                "FROM mega_history WHERE guild_id=?", (gid_from,)) as cur:
                 rows = await cur.fetchall()
             for r in rows:
                 await db.execute(
-                    "INSERT INTO raffle_history(guild_id,draw_timestamp,winner_id,"
+                    "INSERT INTO mega_history(guild_id,draw_timestamp,winner_id,"
                     "winner_tickets,total_tickets,top_json) VALUES(?,?,?,?,?,?)",
                     (gid_to, *r[1:]))
-            copied['raffle_history'] = len(rows)
+            copied['mega_history'] = len(rows)
 
             # chest_prizes (referenced by rare_chest_config by NAME, not ID — no mapping needed)
             await db.execute("DELETE FROM chest_prizes WHERE guild_id=?", (gid_to,))
@@ -10451,7 +10613,7 @@ _RESET_TYPE_CHOICES = [
     app_commands.Choice(name="Balance",                                      value="balance"),
     app_commands.Choice(name="EXP (all history — rank + usable)",            value="exp"),
     app_commands.Choice(name="Inventory (items, boxes, keys, tokens)",        value="inventory"),
-    app_commands.Choice(name="Raffle Tickets",                               value="tickets"),
+    app_commands.Choice(name="mega Tickets",                               value="tickets"),
     app_commands.Choice(name="Leaderboard Stats (total EXP stat, chests…)",  value="stats"),
     app_commands.Choice(name="Everything (all of the above)",                value="all"),
 ]
@@ -10551,19 +10713,19 @@ async def _get_broken_refs(guild: discord.Guild) -> dict[str, list[str]]:
                 if cid not in vc:
                     note("📋 Log Channels", f"`{lt}` → channel `{cid}`")
  
-        # ── raffle_config ─────────────────────────────────────────────────────
+        # ── mega_config ─────────────────────────────────────────────────────
         async with db.execute(
-            "SELECT channel_id FROM raffle_config WHERE guild_id=?", (gid,)) as cur:
+            "SELECT channel_id FROM mega_config WHERE guild_id=?", (gid,)) as cur:
             row = await cur.fetchone()
             if row and row[0] not in vc:
-                note("🎟 Raffle Channel", f"channel `{row[0]}`")
+                note("🎟 mega Channel", f"channel `{row[0]}`")
  
-        # ── raffle_info_config ────────────────────────────────────────────────
+        # ── mega_info_config ────────────────────────────────────────────────
         async with db.execute(
-            "SELECT channel_id FROM raffle_info_config WHERE guild_id=?", (gid,)) as cur:
+            "SELECT channel_id FROM mega_info_config WHERE guild_id=?", (gid,)) as cur:
             row = await cur.fetchone()
             if row and row[0] not in vc:
-                note("🎟 Raffle Info Board", f"channel `{row[0]}`")
+                note("🎟 mega Info Board", f"channel `{row[0]}`")
  
         # ── rare_drop_config ──────────────────────────────────────────────────
         async with db.execute(
@@ -10772,24 +10934,24 @@ async def _execute_cleanup(guild: discord.Guild) -> dict[str, int]:
                         (gid, lt))
                     inc("📋 Log Channels removed")
  
-            # ── raffle_config ─────────────────────────────────────────────────
+            # ── mega_config ─────────────────────────────────────────────────
             async with db.execute(
-                "SELECT channel_id FROM raffle_config WHERE guild_id=?", (gid,)) as cur:
+                "SELECT channel_id FROM mega_config WHERE guild_id=?", (gid,)) as cur:
                 row = await cur.fetchone()
             if row and row[0] not in vc:
                 await db.execute(
-                    "DELETE FROM raffle_config WHERE guild_id=?", (gid,))
-                inc("🎟 Raffle Channel removed")
+                    "DELETE FROM mega_config WHERE guild_id=?", (gid,))
+                inc("🎟 mega Channel removed")
  
-            # ── raffle_info_config ────────────────────────────────────────────
+            # ── mega_info_config ────────────────────────────────────────────
             async with db.execute(
-                "SELECT channel_id FROM raffle_info_config WHERE guild_id=?",
+                "SELECT channel_id FROM mega_info_config WHERE guild_id=?",
                 (gid,)) as cur:
                 row = await cur.fetchone()
             if row and row[0] not in vc:
                 await db.execute(
-                    "DELETE FROM raffle_info_config WHERE guild_id=?", (gid,))
-                inc("🎟 Raffle Info Board removed")
+                    "DELETE FROM mega_info_config WHERE guild_id=?", (gid,))
+                inc("🎟 mega Info Board removed")
  
             # ── rare_drop_config ──────────────────────────────────────────────
             async with db.execute(
