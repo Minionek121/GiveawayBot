@@ -3371,7 +3371,7 @@ async def pfx_power_stop(ctx):
  
 @pfx_powergiveaway.command(name="status")
 async def pfx_power_status(ctx):
-    await power_status._callback(FakeInteraction(ctx)
+    await power_status._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
 # RAFFLE SYSTEM
