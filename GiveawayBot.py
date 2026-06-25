@@ -456,6 +456,42 @@ async def setup_database():
                 reset_after INTEGER,
                 PRIMARY KEY(guild_id, user_id, reset_type))""")
 
+                await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_config(
+                    guild_id INTEGER PRIMARY KEY,
+                    prize TEXT,
+                    winners INTEGER DEFAULT 1,
+                    interval_seconds INTEGER DEFAULT 3600,
+                    embed_channel_id INTEGER DEFAULT 0,
+                    winners_channel_id INTEGER DEFAULT 0,
+                    default_entries INTEGER DEFAULT 0,
+                    reward_balance INTEGER DEFAULT 0,
+                    reward_exp INTEGER DEFAULT 0,
+                    reward_tickets INTEGER DEFAULT 0,
+                    reward_gamble_tokens INTEGER DEFAULT 0,
+                    reward_vip_keys INTEGER DEFAULT 0,
+                    reward_role_id INTEGER DEFAULT 0,
+                    reward_item TEXT,
+                    reward_item_qty INTEGER DEFAULT 1,
+                    running INTEGER DEFAULT 0,
+                embed_message_id INTEGER DEFAULT 0,
+                next_roll_time INTEGER DEFAULT 0)""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_role_entries(
+                guild_id INTEGER, role_id INTEGER, entries INTEGER,
+                PRIMARY KEY(guild_id, role_id))""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_channel_rates(
+                guild_id INTEGER, channel_id INTEGER, entries_per_message REAL,
+                PRIMARY KEY(guild_id, channel_id))""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_role_boosts(
+                guild_id INTEGER, role_id INTEGER, multiplier REAL,
+                PRIMARY KEY(guild_id, role_id))""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS power_giveaway_user_entries(
+                guild_id INTEGER, user_id INTEGER, entries REAL DEFAULT 0,
+                PRIMARY KEY(guild_id, user_id))""")
+                
             # Migration: add message requirement to auto-entry roles
             try:
                 await db.execute(
@@ -1371,6 +1407,7 @@ async def on_message(message):
                 if "event" in session:
                     session["event"].set()
         await _process_counting(message)
+        await _process_power_giveaway_message(message)
     now = datetime.now().timestamp()
     key = (message.guild.id, message.author.id)
     last_time = last_message_exp.get(key, 0)
@@ -2254,7 +2291,7 @@ async def on_ready():
 
     for task_fn in [raffle_loop, giveaway_watcher, raffle_info_loop,
                     game_loop, daily_key_loop, daily_gamble_loop,
-                    _msg_count_flush_loop, auto_reset_loop]:
+                    _msg_count_flush_loop, auto_reset_loop, power_giveaway_loop]:
         bot.loop.create_task(task_fn())
 
 @bot.event
@@ -2785,6 +2822,556 @@ async def startgiveaways(interaction: discord.Interaction,
     await interaction.response.send_message(
         f"✅ Automatic giveaways started in {target.mention}!\n"
         f"Interval: **{interval_seconds}s** | Duration: **{giveaway_duration_seconds}s**")
+
+# =======================================================
+# POWER GIVEAWAY
+# =======================================================
+
+def _weighted_sample_without_replacement(items_weights: list, k: int) -> list:
+    """
+    Pick up to k unique items from [(item, weight), ...] without replacement,
+    weighted by `weight`. Efficient for any realistic guild size.
+    """
+    pool = [(it, w) for it, w in items_weights if w > 0]
+    chosen = []
+    for _ in range(min(k, len(pool))):
+        total = sum(w for _, w in pool)
+        if total <= 0:
+            break
+        r = random.uniform(0, total)
+        upto = 0.0
+        for i, (it, w) in enumerate(pool):
+            upto += w
+            if upto >= r:
+                chosen.append(it)
+                pool.pop(i)
+                break
+    return chosen
+ 
+ 
+async def _process_power_giveaway_message(message: discord.Message):
+    """Award chat-based power-giveaway entries for a qualifying message."""
+    if not message.guild:
+        return
+    if message.content.startswith(_BOT_PREFIX):
+        return
+    gid = message.guild.id
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT running FROM power_giveaway_config WHERE guild_id=?", (gid,)) as cur:
+            cfg = await cur.fetchone()
+    if not cfg or not cfg[0]:
+        return
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT entries_per_message FROM power_giveaway_channel_rates "
+            "WHERE guild_id=? AND channel_id=?", (gid, message.channel.id)) as cur:
+            rate_row = await cur.fetchone()
+    if not rate_row or rate_row[0] == 0:
+        return
+    base_gain = rate_row[0]
+ 
+    bonus = 0.0
+    if isinstance(message.author, discord.Member):
+        role_ids = {r.id for r in message.author.roles}
+        if role_ids:
+            placeholders = ",".join("?" * len(role_ids))
+            async with get_db() as db:
+                async with db.execute(
+                    f"SELECT multiplier FROM power_giveaway_role_boosts "
+                    f"WHERE guild_id=? AND role_id IN ({placeholders})",
+                    (gid, *role_ids)) as cur:
+                    boost_rows = await cur.fetchall()
+            bonus = sum(max(0.0, m - 1) for (m,) in boost_rows)
+ 
+    final_gain = base_gain * (1 + bonus)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO power_giveaway_user_entries(guild_id,user_id,entries) "
+                "VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,user_id) DO UPDATE SET entries=entries+excluded.entries",
+                (gid, message.author.id, final_gain))
+            await db.commit()
+ 
+ 
+async def _compute_power_entries(guild: discord.Guild, default_entries: int) -> dict[int, float]:
+    """Total entries (role + default + chat) for every non-bot member, >0 only."""
+    gid = guild.id
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id, entries FROM power_giveaway_role_entries WHERE guild_id=?",
+            (gid,)) as cur:
+            role_entry_map = dict(await cur.fetchall())
+        async with db.execute(
+            "SELECT user_id, entries FROM power_giveaway_user_entries WHERE guild_id=?",
+            (gid,)) as cur:
+            chan_entries = dict(await cur.fetchall())
+ 
+    totals: dict[int, float] = {}
+    for member in guild.members:
+        if member.bot:
+            continue
+        total = float(default_entries)
+        for role in member.roles:
+            if role.id in role_entry_map:
+                total += role_entry_map[role.id]
+        total += chan_entries.get(member.id, 0.0)
+        if total > 0:
+            totals[member.id] = total
+    return totals
+ 
+ 
+async def _run_power_giveaway_roll(guild: discord.Guild, cfg: tuple):
+    (gid, prize, winners_count, interval_seconds, embed_ch_id, winners_ch_id,
+     default_entries, rb, re_, rt, rgt, rvk, rrole, ritem, riqty,
+     running, embed_msg_id, next_roll) = cfg
+ 
+    totals = await _compute_power_entries(guild, default_entries)
+    winners_ch = bot.get_channel(winners_ch_id)
+ 
+    if not totals:
+        if winners_ch:
+            try:
+                await winners_ch.send(
+                    f"🔄 The recurring giveaway for **{prize}** rolled, but nobody "
+                    f"currently has any entries — no winners this round.")
+            except Exception:
+                pass
+    else:
+        winner_ids = _weighted_sample_without_replacement(list(totals.items()), winners_count)
+        winner_members = [m for m in (guild.get_member(uid) for uid in winner_ids) if m]
+ 
+        meta = {
+            "label": prize, "balance": rb, "exp": re_,
+            "tickets": rt, "gamble_tokens": rgt, "vip_keys": rvk,
+            "role_id": rrole, "item": ritem, "item_qty": riqty if ritem else 0,
+        }
+        if winner_members:
+            await distribute_prizes(guild, winner_members, meta)
+ 
+        if winners_ch and winner_members:
+            mentions   = ", ".join(m.mention for m in winner_members)
+            reward_str = build_reward_summary(meta, guild)
+            embed = discord.Embed(
+                title="🎊 Recurring Giveaway Winners!",
+                description=f"**Prize:** {prize}\n**Reward:** {reward_str}\n**Winner(s):** {mentions}",
+                color=discord.Color.gold())
+            try:
+                await winners_ch.send(embed=embed)
+            except Exception:
+                pass
+ 
+        await log_event(gid, "giveaway", _log_embed(
+            "🎊 Recurring Giveaway Rolled", discord.Color.gold(),
+            Prize=prize, Winners=str(len(winner_members))))
+ 
+    # Reset chat-based entries for the next round (role entries always recompute fresh)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM power_giveaway_user_entries WHERE guild_id=?", (gid,))
+            await db.commit()
+ 
+ 
+async def _build_power_giveaway_embed(guild: discord.Guild, cfg: tuple) -> discord.Embed:
+    (gid, prize, winners_count, interval_seconds, embed_ch_id, winners_ch_id,
+     default_entries, rb, re_, rt, rgt, rvk, rrole, ritem, riqty,
+     running, embed_msg_id, next_roll) = cfg
+ 
+    meta = {"balance": rb, "exp": re_, "tickets": rt, "gamble_tokens": rgt,
+            "vip_keys": rvk, "role_id": rrole, "item": ritem,
+            "item_qty": riqty if ritem else 0}
+    reward_str = build_reward_summary(meta, guild)
+ 
+    totals       = await _compute_power_entries(guild, default_entries)
+    pool_total   = sum(totals.values())
+    participants = len(totals)
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id, entries FROM power_giveaway_role_entries "
+            "WHERE guild_id=? ORDER BY entries DESC", (gid,)) as cur:
+            role_rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT channel_id, entries_per_message FROM power_giveaway_channel_rates "
+            "WHERE guild_id=?", (gid,)) as cur:
+            chan_rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT role_id, multiplier FROM power_giveaway_role_boosts WHERE guild_id=?",
+            (gid,)) as cur:
+            boost_rows = await cur.fetchall()
+ 
+    embed = discord.Embed(
+        title="🔥 Recurring Giveaway",
+        description=f"**Prize:** {prize}\n**Reward:** {reward_str}\n**Winners:** {winners_count}",
+        color=discord.Color.red())
+    embed.add_field(
+        name="⏰ Next Roll",
+        value=f"<t:{next_roll}:R>" if running else "⏸ Stopped",
+        inline=False)
+    embed.add_field(
+        name="🎟 Current Pool",
+        value=f"{pool_total:,.1f} entries across {participants:,} participant(s)",
+        inline=False)
+    if default_entries:
+        embed.add_field(name="👤 Base Entries",
+                        value=f"Everyone starts with **{default_entries}**", inline=False)
+    if role_rows:
+        lines = [f"• {r.mention} — **+{ent}** entries"
+                 for rid, ent in role_rows if (r := guild.get_role(rid))]
+        if lines:
+            embed.add_field(name="🎭 Role Entries", value="\n".join(lines), inline=False)
+    if chan_rows:
+        lines = [f"• {c.mention} — **+{rate}** per message"
+                 for cid, rate in chan_rows if (c := guild.get_channel(cid))]
+        if lines:
+            embed.add_field(name="💬 Chat Entries", value="\n".join(lines), inline=False)
+    if boost_rows:
+        lines = [f"• {r.mention} — **×{mult}** chat entries"
+                 for rid, mult in boost_rows if (r := guild.get_role(rid))]
+        if lines:
+            embed.add_field(name="🚀 Entry Boosts", value="\n".join(lines), inline=False)
+    embed.set_footer(text="Everyone is automatically entered — no action needed!")
+    return embed
+ 
+ 
+async def _refresh_power_giveaway_embed(guild: discord.Guild, cfg: tuple):
+    gid          = cfg[0]
+    embed_ch_id  = cfg[4]
+    embed_msg_id = cfg[16]
+    channel = bot.get_channel(embed_ch_id)
+    if not channel:
+        return
+    embed = await _build_power_giveaway_embed(guild, cfg)
+    if embed_msg_id:
+        try:
+            msg = await channel.fetch_message(embed_msg_id)
+            await msg.edit(embed=embed)
+            return
+        except discord.NotFound:
+            pass
+    new_msg = await channel.send(embed=embed)
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE power_giveaway_config SET embed_message_id=? WHERE guild_id=?",
+                (new_msg.id, gid))
+            await db.commit()
+ 
+ 
+async def power_giveaway_loop():
+    """Scans all guilds every 30s — refreshes the embed and rolls when due."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            async with get_db() as db:
+                async with db.execute(
+                    "SELECT guild_id, prize, winners, interval_seconds, embed_channel_id, "
+                    "winners_channel_id, default_entries, reward_balance, reward_exp, "
+                    "reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role_id, "
+                    "reward_item, reward_item_qty, running, embed_message_id, next_roll_time "
+                    "FROM power_giveaway_config WHERE running=1") as cur:
+                    configs = await cur.fetchall()
+ 
+            now = int(datetime.now(UTC).timestamp())
+            for cfg in configs:
+                gid   = cfg[0]
+                guild = bot.get_guild(gid)
+                if not guild:
+                    continue
+                try:
+                    if now >= cfg[17]:
+                        await _run_power_giveaway_roll(guild, cfg)
+                        new_next = now + cfg[3]
+                        async with db_lock:
+                            async with get_db() as db:
+                                await db.execute(
+                                    "UPDATE power_giveaway_config SET next_roll_time=? WHERE guild_id=?",
+                                    (new_next, gid))
+                                await db.commit()
+                        cfg = cfg[:17] + (new_next,)
+                    await _refresh_power_giveaway_embed(guild, cfg)
+                except Exception as e:
+                    print(f"[PowerGiveaway] guild {gid}: {e}")
+        except Exception as e:
+            print(f"[PowerGiveaway] loop error: {e}")
+        await asyncio.sleep(30)
+ 
+ 
+# ── Slash command group ───────────────────────────────────────────────────
+ 
+power_group = app_commands.Group(
+    name="powergiveaway",
+    description="Recurring role/activity-based giveaway — everyone is always entered")
+bot.tree.add_command(power_group)
+  
+@power_group.command(name="setup",
+                     description="Configure the recurring giveaway's prize, winners, timing, and channels")
+@app_commands.describe(
+    prize="Prize description", winners="Number of winners per roll",
+    interval_seconds="Seconds between each roll",
+    embed_channel="Channel where the live info embed is posted",
+    winners_channel="Channel where winners are announced",
+    default_entries="Entries every member starts with (default 0)",
+    reward_balance="Coins per winner", reward_exp="EXP per winner",
+    reward_tickets="Raffle tickets per winner", reward_gamble_tokens="Gamble tokens per winner",
+    reward_vip_keys="VIP keys per winner", reward_role="Role given to each winner",
+    reward_item="Item/box per winner", reward_item_qty="Quantity of item (default 1)")
+async def power_setup(interaction: discord.Interaction, prize: str, winners: int,
+                       interval_seconds: int, embed_channel: discord.TextChannel,
+                       winners_channel: discord.TextChannel, default_entries: int = 0,
+                       reward_balance: int = 0, reward_exp: int = 0, reward_tickets: int = 0,
+                       reward_gamble_tokens: int = 0, reward_vip_keys: int = 0,
+                       reward_role: discord.Role = None, reward_item: str = None,
+                       reward_item_qty: int = 1):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if winners < 1 or interval_seconds < 30:
+        await interaction.response.send_message(
+            "❌ Winners must be ≥ 1 and interval ≥ 30 seconds.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO power_giveaway_config(guild_id,prize,winners,interval_seconds,"
+                "embed_channel_id,winners_channel_id,default_entries,reward_balance,reward_exp,"
+                "reward_tickets,reward_gamble_tokens,reward_vip_keys,reward_role_id,reward_item,"
+                "reward_item_qty,running,embed_message_id,next_roll_time) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,0) "
+                "ON CONFLICT(guild_id) DO UPDATE SET "
+                "prize=excluded.prize, winners=excluded.winners, "
+                "interval_seconds=excluded.interval_seconds, "
+                "embed_channel_id=excluded.embed_channel_id, "
+                "winners_channel_id=excluded.winners_channel_id, "
+                "default_entries=excluded.default_entries, "
+                "reward_balance=excluded.reward_balance, reward_exp=excluded.reward_exp, "
+                "reward_tickets=excluded.reward_tickets, "
+                "reward_gamble_tokens=excluded.reward_gamble_tokens, "
+                "reward_vip_keys=excluded.reward_vip_keys, "
+                "reward_role_id=excluded.reward_role_id, reward_item=excluded.reward_item, "
+                "reward_item_qty=excluded.reward_item_qty",
+                (interaction.guild.id, prize, winners, interval_seconds,
+                 embed_channel.id, winners_channel.id, default_entries,
+                 reward_balance, reward_exp, reward_tickets, reward_gamble_tokens,
+                 reward_vip_keys, reward_role.id if reward_role else 0,
+                 reward_item, reward_item_qty))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Recurring giveaway configured: **{prize}**, {winners} winner(s) every "
+        f"{interval_seconds}s.\nUse `/powergiveaway start` to begin.")
+ 
+ 
+@power_group.command(name="setrole", description="Set how many entries a role gives")
+@app_commands.describe(role="Role to configure",
+                       entries="Fixed entries this role grants (stacks across multiple qualifying roles)")
+async def power_setrole(interaction: discord.Interaction, role: discord.Role, entries: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if entries < 0:
+        await interaction.response.send_message("❌ Entries must be ≥ 0.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO power_giveaway_role_entries(guild_id,role_id,entries) VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,role_id) DO UPDATE SET entries=excluded.entries",
+                (interaction.guild.id, role.id, entries))
+            await db.commit()
+    await interaction.response.send_message(f"✅ {role.mention} now grants **{entries}** entries.")
+ 
+ 
+@power_group.command(name="removerole", description="Remove a role's fixed entries")
+async def power_removerole(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM power_giveaway_role_entries WHERE guild_id=? AND role_id=?",
+                (interaction.guild.id, role.id))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 {role.mention} no longer grants entries.")
+ 
+ 
+@power_group.command(name="setchannel", description="Set how many entries chatting in a channel gives")
+@app_commands.describe(channel="Channel to configure",
+                       entries="Entries per message (decimals allowed, can be negative as a penalty)")
+async def power_setchannel(interaction: discord.Interaction,
+                            channel: discord.TextChannel, entries: float):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO power_giveaway_channel_rates(guild_id,channel_id,entries_per_message) "
+                "VALUES(?,?,?) ON CONFLICT(guild_id,channel_id) "
+                "DO UPDATE SET entries_per_message=excluded.entries_per_message",
+                (interaction.guild.id, channel.id, entries))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ {channel.mention} now grants **{entries}** entries per message.")
+ 
+ 
+@power_group.command(name="removechannel", description="Remove a channel's entry rate")
+async def power_removechannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM power_giveaway_channel_rates WHERE guild_id=? AND channel_id=?",
+                (interaction.guild.id, channel.id))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 {channel.mention} no longer grants entries.")
+ 
+ 
+@power_group.command(name="setboost",
+                     description="Give a role a multiplier on chat-earned entries")
+@app_commands.describe(role="Role to boost",
+                       multiplier="e.g. 2.0 = double chat entries. Must be > 0.")
+async def power_setboost(interaction: discord.Interaction, role: discord.Role, multiplier: float):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if multiplier <= 0:
+        await interaction.response.send_message("❌ Multiplier must be > 0.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO power_giveaway_role_boosts(guild_id,role_id,multiplier) VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,role_id) DO UPDATE SET multiplier=excluded.multiplier",
+                (interaction.guild.id, role.id, multiplier))
+            await db.commit()
+    await interaction.response.send_message(f"✅ {role.mention} now earns **×{multiplier}** chat entries.")
+ 
+ 
+@power_group.command(name="removeboost", description="Remove a role's entry boost")
+async def power_removeboost(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM power_giveaway_role_boosts WHERE guild_id=? AND role_id=?",
+                (interaction.guild.id, role.id))
+            await db.commit()
+    await interaction.response.send_message(f"🗑 {role.mention} no longer has an entry boost.")
+ 
+ 
+@power_group.command(name="start", description="Start the recurring giveaway")
+async def power_start(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    gid = interaction.guild.id
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT interval_seconds FROM power_giveaway_config WHERE guild_id=?", (gid,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await interaction.response.send_message(
+            "❌ Run `/powergiveaway setup` first.", ephemeral=True); return
+    now = int(datetime.now(UTC).timestamp())
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE power_giveaway_config SET running=1, next_roll_time=? WHERE guild_id=?",
+                (now + row[0], gid))
+            await db.commit()
+    await interaction.response.send_message("✅ Recurring giveaway started!")
+ 
+ 
+@power_group.command(name="stop", description="Stop the recurring giveaway")
+async def power_stop(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE power_giveaway_config SET running=0 WHERE guild_id=?",
+                (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("🛑 Recurring giveaway stopped.")
+ 
+ 
+@power_group.command(name="status", description="View the full configuration and current pool")
+async def power_status(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT guild_id, prize, winners, interval_seconds, embed_channel_id, "
+            "winners_channel_id, default_entries, reward_balance, reward_exp, "
+            "reward_tickets, reward_gamble_tokens, reward_vip_keys, reward_role_id, "
+            "reward_item, reward_item_qty, running, embed_message_id, next_roll_time "
+            "FROM power_giveaway_config WHERE guild_id=?", (gid,)) as cur:
+            cfg = await cur.fetchone()
+    if not cfg:
+        await interaction.response.send_message(
+            "❌ Not configured yet — use `/powergiveaway setup`.", ephemeral=True); return
+    embed = await _build_power_giveaway_embed(interaction.guild, cfg)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+ 
+ 
+# ── Prefix mirror group ────────────────────────────────────────────────────
+ 
+@bot.group(name="powergiveaway", invoke_without_command=True)
+async def pfx_powergiveaway(ctx):
+    p = _BOT_PREFIX
+    await ctx.send(
+        f"Use `{p}powergiveaway setup/setrole/removerole/setchannel/removechannel/"
+        f"setboost/removeboost/start/stop/status`.")
+ 
+@pfx_powergiveaway.command(name="setup")
+async def pfx_power_setup(ctx, prize: str, winners: int, interval_seconds: int,
+                          embed_channel: discord.TextChannel, winners_channel: discord.TextChannel,
+                          default_entries: int = 0, reward_balance: int = 0, reward_exp: int = 0):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_setup._callback(FakeInteraction(ctx), prize, winners, interval_seconds,
+                                embed_channel, winners_channel, default_entries,
+                                reward_balance, reward_exp, 0, 0, 0, None, None, 1)
+ 
+@pfx_powergiveaway.command(name="setrole")
+async def pfx_power_setrole(ctx, role: discord.Role, entries: int):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_setrole._callback(FakeInteraction(ctx), role, entries)
+ 
+@pfx_powergiveaway.command(name="removerole")
+async def pfx_power_removerole(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_removerole._callback(FakeInteraction(ctx), role)
+ 
+@pfx_powergiveaway.command(name="setchannel")
+async def pfx_power_setchannel(ctx, channel: discord.TextChannel, entries: float):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_setchannel._callback(FakeInteraction(ctx), channel, entries)
+ 
+@pfx_powergiveaway.command(name="removechannel")
+async def pfx_power_removechannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_removechannel._callback(FakeInteraction(ctx), channel)
+ 
+@pfx_powergiveaway.command(name="setboost")
+async def pfx_power_setboost(ctx, role: discord.Role, multiplier: float):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_setboost._callback(FakeInteraction(ctx), role, multiplier)
+ 
+@pfx_powergiveaway.command(name="removeboost")
+async def pfx_power_removeboost(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_removeboost._callback(FakeInteraction(ctx), role)
+ 
+@pfx_powergiveaway.command(name="start")
+async def pfx_power_start(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_start._callback(FakeInteraction(ctx))
+ 
+@pfx_powergiveaway.command(name="stop")
+async def pfx_power_stop(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await power_stop._callback(FakeInteraction(ctx))
+ 
+@pfx_powergiveaway.command(name="status")
+async def pfx_power_status(ctx):
+    await power_status._callback(FakeInteraction(ctx)
 
 # ═══════════════════════════════════════════════════════
 # RAFFLE SYSTEM
@@ -7164,6 +7751,35 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
         ("listautoresetrules",
          "Show all auto-reset rules, their delays, and how many resets are currently pending.",
          "/listautoresetrules  or  !listautoresetrules"),
+    ]),
+    "powergiveaway": ("🔥", "Recurring Giveaway", [
+        ("powergiveaway setup",
+         "Configure prize, winners, interval, and channels for the recurring giveaway. "
+         "Everyone is always entered — nobody needs to react or opt in.",
+         "/powergiveaway setup <prize> <winners> <interval_seconds> <embed_channel> "
+         "<winners_channel> [default_entries] [reward_balance] [reward_exp] …"),
+        ("powergiveaway setrole",
+         "Give a role fixed entries (stacks if a member qualifies for several roles).",
+         "/powergiveaway setrole <role> <entries>"),
+        ("powergiveaway removerole", "Remove a role's fixed entries.",
+         "/powergiveaway removerole <role>"),
+        ("powergiveaway setchannel",
+         "Set how many entries chatting in a channel earns per message.",
+         "/powergiveaway setchannel <channel> <entries>"),
+        ("powergiveaway removechannel", "Remove a channel's entry rate.",
+         "/powergiveaway removechannel <channel>"),
+        ("powergiveaway setboost",
+         "Give a role a multiplier on entries earned from chatting (e.g. 2.0 = double).",
+         "/powergiveaway setboost <role> <multiplier>"),
+        ("powergiveaway removeboost", "Remove a role's entry boost.",
+         "/powergiveaway removeboost <role>"),
+        ("powergiveaway start", "Start the recurring giveaway loop.",
+         "/powergiveaway start"),
+        ("powergiveaway stop", "Stop the recurring giveaway loop.",
+         "/powergiveaway stop"),
+        ("powergiveaway status",
+         "View the full configuration and current entry pool.",
+         "/powergiveaway status"),
     ]),
 }
  
