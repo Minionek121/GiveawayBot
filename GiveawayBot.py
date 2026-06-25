@@ -1303,7 +1303,7 @@ def _weighted_sample_without_replacement(items_weights: list, k: int) -> list:
                 break
     return chosen
  
- async def _process_mega_ticket_message(message: discord.Message):
+async def _process_mega_ticket_message(message: discord.Message):
     """Award 1 mega ticket for any 3+ word message (not a command)."""
     if not message.guild:
         return
