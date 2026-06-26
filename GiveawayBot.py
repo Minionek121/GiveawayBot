@@ -511,6 +511,16 @@ async def setup_database():
             await db.execute("""CREATE TABLE IF NOT EXISTS balance_ranks(
                 guild_id INTEGER, role_id INTEGER, threshold INTEGER,
                 PRIMARY KEY(guild_id, role_id))""")
+
+            await db.execute("""CREATE TABLE IF NOT EXISTS auto_entry_threshold(
+                guild_id INTEGER PRIMARY KEY,
+                min_prize_balance INTEGER DEFAULT 0,
+                recent_message_window INTEGER DEFAULT 0)""")
+ 
+            await db.execute("""CREATE TABLE IF NOT EXISTS giveaway_game_notify_config(
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER)""")
+
             
             # Migration: add message requirement to auto-entry roles
             try:
@@ -1590,6 +1600,203 @@ async def pfx_listbalanceranks(ctx):
 async def pfx_refreshbalanceranks(ctx):
     if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
     await refreshbalanceranks._callback(FakeInteraction(ctx))
+
+# --- AUTO ENTERABLE GWS AND GWS CHANNEL HELPERS --------
+
+async def _is_auto_enterable(guild_id: int, reward_balance: int) -> bool:
+    """True if this giveaway's per-winner coin reward meets the configured minimum
+    (or if no minimum has been configured at all — backward compatible default)."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT min_prize_balance FROM auto_entry_threshold WHERE guild_id=?",
+            (guild_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return True
+    return reward_balance >= row[0]
+ 
+ 
+async def _get_recent_message_window(guild_id: int) -> int:
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT recent_message_window FROM auto_entry_threshold WHERE guild_id=?",
+            (guild_id,)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else 0
+ 
+ 
+async def _get_eligible_giveaway_participants(channel, reaction, required_role: int, meta: dict) -> list:
+    """
+    Shared by end_giveaway() and cmd_reroll().
+    Big-enough giveaways (per Feature 4's threshold): unchanged behavior —
+    reaction users + opted-in auto-entry users/roles, no recency check.
+    Small giveaways: auto-entry is skipped entirely, and reaction users are
+    filtered down to only those among the last N messages in the channel.
+    """
+    guild = channel.guild
+    reward_balance = int(meta.get("balance", 0))
+    big_enough = await _is_auto_enterable(guild.id, reward_balance)
+ 
+    users = []
+    async for user in reaction.users():
+        if user.bot: continue
+        member = guild.get_member(user.id)
+        if not member: continue
+        if required_role and required_role not in {r.id for r in member.roles}: continue
+        users.append(user)
+ 
+    if not big_enough:
+        window = await _get_recent_message_window(guild.id)
+        if window > 0:
+            try:
+                recent_authors = set()
+                async for hist_msg in channel.history(limit=window):
+                    if not hist_msg.author.bot:
+                        recent_authors.add(hist_msg.author.id)
+                users = [u for u in users if u.id in recent_authors]
+            except Exception as e:
+                print(f"[GiveawayEligibility] history fetch failed: {e}")
+        return users   # auto-entry intentionally NOT merged for small-prize giveaways
+ 
+    # Big enough → merge in opted-in auto-entry users (existing behavior)
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT user_id FROM auto_entry_users WHERE guild_id=? AND enabled=1",
+            (guild.id,)) as cur:
+            auto_uids = {r[0] for r in await cur.fetchall()}
+        async with db.execute(
+            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?",
+            (guild.id,)) as cur:
+            auto_role_ids = {r[0] for r in await cur.fetchall()}
+    existing_uids = {u.id for u in users}
+    for auid in auto_uids:
+        if auid in existing_uids:
+            continue
+        ae_member = guild.get_member(auid)
+        if not ae_member or ae_member.bot:
+            continue
+        member_rids = {r.id for r in ae_member.roles}
+        if auto_role_ids and not (auto_role_ids & member_rids):
+            continue
+        if required_role and required_role not in member_rids:
+            continue
+        users.append(ae_member)
+    return users
+ 
+ 
+async def _send_giveaway_game_notify(guild_id: int, prize_text: str, channel) -> None:
+    """Posts a minimal prize+channel notification, if a notify channel is configured."""
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT channel_id FROM giveaway_game_notify_config WHERE guild_id=?",
+            (guild_id,)) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return
+    notify_ch = bot.get_channel(row[0])
+    if not notify_ch:
+        return
+    try:
+        await notify_ch.send(f"🎉 **{prize_text}**\n📍 {channel.mention}")
+    except Exception as e:
+        print(f"[NotifyChannel] {e}")
+
+# --- COMMANDS ------------------------------------------
+
+@bot.tree.command(name="setautoentrythreshold",
+                  description="Set the minimum prize for auto-entry, and the recent-message "
+                               "window for smaller giveaways")
+@app_commands.describe(
+    min_prize_balance="Minimum coin reward (per winner) for a giveaway to be fully open",
+    recent_message_window="For giveaways below the minimum: only users among the last N "
+                          "messages in the channel can join (auto-entry is disabled)")
+@command_enabled()
+async def setautoentrythreshold(interaction: discord.Interaction,
+                                 min_prize_balance: int, recent_message_window: int):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if min_prize_balance < 0 or recent_message_window < 1:
+        await interaction.response.send_message(
+            "❌ min_prize_balance must be ≥ 0 and recent_message_window must be ≥ 1.",
+            ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_entry_threshold"
+                "(guild_id, min_prize_balance, recent_message_window) VALUES(?,?,?)",
+                (interaction.guild.id, min_prize_balance, recent_message_window))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Giveaways with a per-winner reward of **{min_prize_balance:,}+ coins** are now "
+        f"fully open (anyone can join, auto-entry works).\n"
+        f"Giveaways below that: auto-entry is disabled, and only users among the "
+        f"**last {recent_message_window}** messages in the giveaway's channel can join.")
+ 
+ 
+@bot.tree.command(name="removeautoentrythreshold",
+                  description="Remove the min-prize restriction — all giveaways become fully open again")
+@command_enabled()
+async def removeautoentrythreshold(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("DELETE FROM auto_entry_threshold WHERE guild_id=?",
+                             (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("🗑 Auto-entry threshold removed — all giveaways are now fully open.")
+ 
+ 
+@bot.tree.command(name="setnotifychannel",
+                  description="Set the channel for giveaway and game start notifications")
+@app_commands.describe(channel="Channel to post notifications in")
+@command_enabled()
+async def setnotifychannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO giveaway_game_notify_config(guild_id, channel_id) VALUES(?,?)",
+                (interaction.guild.id, channel.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"✅ Giveaway/game notifications → {channel.mention}\n"
+        f"ℹ️ Only fully-open (auto-enterable) giveaways trigger a notification; games always do.")
+ 
+ 
+@bot.tree.command(name="removenotifychannel", description="Disable giveaway/game start notifications")
+@command_enabled()
+async def removenotifychannel(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute("DELETE FROM giveaway_game_notify_config WHERE guild_id=?",
+                             (interaction.guild.id,))
+            await db.commit()
+    await interaction.response.send_message("🔒 Giveaway/game notifications disabled.")
+ 
+ 
+@bot.command(name="setautoentrythreshold")
+async def pfx_setautoentrythreshold(ctx, min_prize_balance: int, recent_message_window: int):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setautoentrythreshold._callback(FakeInteraction(ctx), min_prize_balance, recent_message_window)
+ 
+@bot.command(name="removeautoentrythreshold")
+async def pfx_removeautoentrythreshold(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removeautoentrythreshold._callback(FakeInteraction(ctx))
+ 
+@bot.command(name="setnotifychannel")
+async def pfx_setnotifychannel(ctx, channel: discord.TextChannel):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await setnotifychannel._callback(FakeInteraction(ctx), channel)
+ 
+@bot.command(name="removenotifychannel")
+async def pfx_removenotifychannel(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removenotifychannel._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
 # ACTIVE GAME SESSIONS
@@ -2716,6 +2923,9 @@ async def giveaway(
              int(end_time.timestamp()), required_role.id if required_role else 0, template, 0))
         await db.commit()
 
+    if await _is_auto_enterable(interaction.guild.id, reward_balance):
+        await _send_giveaway_game_notify(interaction.guild.id, prize, target_channel)
+
     await interaction.response.send_message("✅ Giveaway created.", ephemeral=True)
     asyncio.create_task(giveaway_timer(message.id, seconds))
 
@@ -2807,37 +3017,8 @@ async def end_giveaway(message_id, reroll=False):
     if not reaction:
         await channel.send("❌ Giveaway reaction was missing."); return
 
-    users = []
-    async for user in reaction.users():
-        if user.bot: continue
-        member = channel.guild.get_member(user.id)
-        if not member: continue
-        if required_role and required_role not in {r.id for r in member.roles}: continue
-        users.append(user)
-    # ── Auto-entry: include opted-in users (re-validates role at draw time) ──────
-    async with get_db() as db:
-        async with db.execute(
-            "SELECT user_id FROM auto_entry_users WHERE guild_id=? AND enabled=1",
-            (channel.guild.id,)) as cur:
-            auto_uids = {r[0] for r in await cur.fetchall()}
-        async with db.execute(
-            "SELECT role_id FROM auto_entry_roles WHERE guild_id=?",
-            (channel.guild.id,)) as cur:
-            auto_role_ids = {r[0] for r in await cur.fetchall()}
-    existing_uids = {u.id for u in users}
-    for auid in auto_uids:
-        if auid in existing_uids:
-            continue
-        ae_member = channel.guild.get_member(auid)
-        if not ae_member or ae_member.bot:
-            continue
-        member_rids = {r.id for r in ae_member.roles}
-        if auto_role_ids and not (auto_role_ids & member_rids):
-            continue  # Lost the eligible role since they enabled auto-entry
-        if required_role and required_role not in member_rids:
-            continue
-        users.append(ae_member)
-        
+    users = await _get_eligible_giveaway_participants(channel, reaction, required_role, meta)
+ 
     if not users:
         await channel.send("No valid participants."); return
 
@@ -2953,6 +3134,8 @@ async def auto_giveaway_loop(guild_id: int):
         else:
             msg = await channel.send(embed=embed)
         await msg.add_reaction("🎉")
+        if await _is_auto_enterable(guild_id, rb):
+            await _send_giveaway_game_notify(guild_id, prize, channel)
 
         prize_meta = json.dumps({
             "label": prize, "balance": rb, "exp": re,
@@ -7557,6 +7740,8 @@ async def guild_game_loop(guild_id: int):
             embed.add_field(name="🏆 Winner gets", value=" + ".join(reward_parts), inline=False)
         embed.set_footer(text=f"Answer within {answer_time} seconds!")
         await channel.send(embed=embed)
+        notify_prize = " + ".join(reward_parts) if reward_parts else game["name"]
+        await _send_giveaway_game_notify(guild_id, notify_prize, channel)
 
         answered_event = asyncio.Event()
         active_game_sessions[guild_id] = {
@@ -8280,25 +8465,21 @@ async def cmd_reroll(ctx, message_id: str):
     except discord.NotFound: await ctx.send("❌ Message not found."); return
     reaction = discord.utils.get(message.reactions, emoji="🎉")
     if not reaction: await ctx.send("❌ Reaction not found."); return
-    users = []
-    async for user in reaction.users():
-        if user.bot: continue
-        member = channel.guild.get_member(user.id)
-        if not member: continue
-        if required_role and required_role not in [r.id for r in member.roles]: continue
-        users.append(user)
-    if not users: await ctx.send("❌ No participants."); return
-    weighted = []
-    for user in users:
-        lvl = await get_level(ctx.guild.id, user.id)
-        weighted.extend([user] * random.randint(1, max(1, lvl // 4)))
-    new_winner = random.choice(weighted)
+ 
     try:
         _parsed = json.loads(prize_raw)
         meta = _parsed if isinstance(_parsed, dict) else {"label": str(prize_raw), "balance": legacy_reward}
         prize_label = meta.get("label", prize_raw)
     except Exception:
         meta = {"label": str(prize_raw), "balance": legacy_reward}; prize_label = str(prize_raw)
+ 
+    users = await _get_eligible_giveaway_participants(channel, reaction, required_role, meta)
+    if not users: await ctx.send("❌ No participants."); return
+    weighted = []
+    for user in users:
+        lvl = await get_level(ctx.guild.id, user.id)
+        weighted.extend([user] * random.randint(1, max(1, lvl // 4)))
+    new_winner = random.choice(weighted)
     async with db_lock:
         async with get_db() as db:
             await db.execute("INSERT OR REPLACE INTO giveaway_winners VALUES(?,?,?)",
