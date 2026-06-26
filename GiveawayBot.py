@@ -508,7 +508,10 @@ async def setup_database():
             except aiosqlite.OperationalError:
                 pass
 
-                
+            await db.execute("""CREATE TABLE IF NOT EXISTS balance_ranks(
+                guild_id INTEGER, role_id INTEGER, threshold INTEGER,
+                PRIMARY KEY(guild_id, role_id))""")
+            
             # Migration: add message requirement to auto-entry roles
             try:
                 await db.execute(
@@ -578,6 +581,7 @@ async def add_balance(guild_id: int, user_id: int, amount: int):
                 "UPDATE balances SET balance=0 WHERE guild_id=? AND user_id=? AND balance<0",
                 (guild_id, user_id))
             await db.commit()
+    await _update_balance_rank(guild_id, user_id)
 
 # ═══════════════════════════════════════════════════════
 # STATS  (now guild-scoped)
@@ -1407,6 +1411,185 @@ def _build_exp_boost_embeds(guild, rows: list) -> list:
             embed.set_footer(text=f"{len(rows)} boost(s) total")
         embeds.append(embed)
     return embeds
+
+# --- BALANCE RANK HELPERS ------------------------------------------
+
+async def _update_balance_rank(guild_id: int, user_id: int):
+    """
+    Re-evaluate which balance-rank role (if any) a user should hold,
+    based on their CURRENT balance, and swap roles if needed.
+    Safe to call frequently — it's a no-op if nothing changed.
+    """
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id, threshold FROM balance_ranks "
+            "WHERE guild_id=? ORDER BY threshold DESC", (guild_id,)) as cur:
+            ranks = await cur.fetchall()
+    if not ranks:
+        return
+ 
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    member = guild.get_member(user_id)
+    if not member:
+        return
+ 
+    bal = await get_balance(guild_id, user_id)
+    target_role_id = None
+    for role_id, threshold in ranks:          # already sorted highest-first
+        if bal >= threshold:
+            target_role_id = role_id
+            break
+ 
+    rank_role_ids      = {r[0] for r in ranks}
+    member_rank_roles  = {r.id for r in member.roles if r.id in rank_role_ids}
+    target_set         = {target_role_id} if target_role_id else set()
+    if member_rank_roles == target_set:
+        return   # already correct — nothing to do
+ 
+    to_remove = [r for rid in (member_rank_roles - target_set) if (r := guild.get_role(rid))]
+    to_add    = [r for rid in (target_set - member_rank_roles) if (r := guild.get_role(rid))]
+ 
+    try:
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Balance rank update")
+        if to_add:
+            await member.add_roles(*to_add, reason="Balance rank update")
+    except Exception as e:
+        print(f"[BalanceRank] {member}: {e}")
+        return
+ 
+    if to_add:
+        await log_event(guild_id, "admin", _log_embed(
+            "📈 Balance Rank Updated", discord.Color.gold(),
+            User=member.mention, New_Rank=to_add[0].mention, Balance=f"{bal:,}"))
+    elif to_remove and not to_add:
+        await log_event(guild_id, "admin", _log_embed(
+            "📉 Balance Rank Lost", discord.Color.orange(),
+            User=member.mention, Lost_Rank=to_remove[0].mention, Balance=f"{bal:,}"))
+ 
+ 
+@bot.tree.command(name="addbalancerank", description="Add or update a balance rank role")
+@app_commands.describe(threshold="Balance required to receive this role", role="Role granted at this balance")
+@command_enabled()
+async def addbalancerank(interaction: discord.Interaction, threshold: int, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    if threshold < 0:
+        await interaction.response.send_message("❌ Threshold must be ≥ 0.", ephemeral=True); return
+ 
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id FROM balance_ranks WHERE guild_id=? AND threshold=? AND role_id!=?",
+            (interaction.guild.id, threshold, role.id)) as cur:
+            dup = await cur.fetchone()
+ 
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "INSERT INTO balance_ranks(guild_id,role_id,threshold) VALUES(?,?,?) "
+                "ON CONFLICT(guild_id,role_id) DO UPDATE SET threshold=excluded.threshold",
+                (interaction.guild.id, role.id, threshold))
+            await db.commit()
+ 
+    warn = ""
+    if dup:
+        other = interaction.guild.get_role(dup[0])
+        warn = (f"\n⚠️ Note: {other.mention if other else dup[0]} already uses threshold "
+                f"{threshold:,} — ties are broken arbitrarily.")
+    await interaction.response.send_message(
+        f"✅ {role.mention} is now the balance rank for **{threshold:,}+** coins.{warn}\n"
+        f"ℹ️ Run `/refreshbalanceranks` to apply this to members with existing balances.")
+ 
+ 
+@bot.tree.command(name="removebalancerank", description="Remove a balance rank role")
+@command_enabled()
+async def removebalancerank(interaction: discord.Interaction, role: discord.Role):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    async with db_lock:
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM balance_ranks WHERE guild_id=? AND role_id=?",
+                (interaction.guild.id, role.id))
+            await db.commit()
+    await interaction.response.send_message(
+        f"🗑 {role.mention} removed from balance ranks. "
+        f"Members who already have it keep it until manually removed.")
+ 
+ 
+@bot.tree.command(name="listbalanceranks", description="List all balance rank thresholds")
+@command_enabled()
+async def listbalanceranks(interaction: discord.Interaction):
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT role_id, threshold FROM balance_ranks WHERE guild_id=? ORDER BY threshold ASC",
+            (interaction.guild.id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("❌ No balance ranks configured."); return
+    embed = discord.Embed(title="📈 Balance Ranks", color=discord.Color.gold())
+    lines = []
+    for rid, threshold in rows:
+        r = interaction.guild.get_role(rid)
+        lines.append(f"**{threshold:,}+** coins → {r.mention if r else f'<deleted role {rid}>'}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="A member only ever holds ONE balance rank role — "
+                          "the highest they currently qualify for.")
+    await interaction.response.send_message(embed=embed)
+ 
+ 
+@bot.tree.command(name="refreshbalanceranks",
+                  description="Re-evaluate balance ranks for every member with a balance "
+                               "(use right after setting up ranks for the first time)")
+@command_enabled()
+async def refreshbalanceranks(interaction: discord.Interaction):
+    if not await is_allowed_to_giveaway(interaction):
+        await interaction.response.send_message("❌ No permission.", ephemeral=True); return
+    await interaction.response.defer()
+    gid = interaction.guild.id
+    async with get_db() as db:
+        async with db.execute("SELECT DISTINCT user_id FROM balances WHERE guild_id=?", (gid,)) as cur:
+            user_ids = [r[0] for r in await cur.fetchall()]
+    updated = 0
+    for uid in user_ids:
+        try:
+            member = interaction.guild.get_member(uid)
+            if not member:
+                continue
+            before_roles = {r.id for r in member.roles}
+            await _update_balance_rank(gid, uid)
+            member2 = interaction.guild.get_member(uid)
+            if member2 and {r.id for r in member2.roles} != before_roles:
+                updated += 1
+        except Exception as e:
+            print(f"[RefreshBalanceRanks] {uid}: {e}")
+    await interaction.followup.send(
+        f"✅ Refreshed balance ranks for **{len(user_ids)}** member(s) with a balance — "
+        f"**{updated}** role change(s) made.")
+ 
+ 
+# ── Prefix wrappers ────────────────────────────────────────────────────────
+ 
+@bot.command(name="addbalancerank")
+async def pfx_addbalancerank(ctx, threshold: int, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await addbalancerank._callback(FakeInteraction(ctx), threshold, role)
+ 
+@bot.command(name="removebalancerank")
+async def pfx_removebalancerank(ctx, role: discord.Role):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await removebalancerank._callback(FakeInteraction(ctx), role)
+ 
+@bot.command(name="listbalanceranks")
+async def pfx_listbalanceranks(ctx):
+    await listbalanceranks._callback(FakeInteraction(ctx))
+ 
+@bot.command(name="refreshbalanceranks")
+async def pfx_refreshbalanceranks(ctx):
+    if not await _is_allowed_ctx(ctx): await ctx.send("❌ No permission."); return
+    await refreshbalanceranks._callback(FakeInteraction(ctx))
 
 # ═══════════════════════════════════════════════════════
 # ACTIVE GAME SESSIONS
@@ -7542,6 +7725,19 @@ _HELP_CATS: dict[str, tuple[str, str, list[tuple[str, str, str]]]] = {
          "!addleaderboardstat @user <stat> <amount>"),
         ("removeleaderboardstat","Admin: directly subtract from a leaderboard stat.",
          "!removeleaderboardstat @user <stat> <amount>"),
+        ("addbalancerank",
+         "Admin: add/update a balance rank role. A member always holds exactly the ONE "
+         "rank role matching their current balance — it goes up or down automatically "
+         "as their balance changes (spending/trading away coins can demote you).",
+         "/addbalancerank <threshold> <role>  or  !addbalancerank <threshold> @role"),
+        ("removebalancerank",
+         "Admin: remove a balance rank. Existing holders keep the role until manually removed.",
+         "/removebalancerank <role>  or  !removebalancerank @role"),
+        ("listbalanceranks", "List all configured balance rank thresholds.",
+         "/listbalanceranks  or  !listbalanceranks"),
+        ("refreshbalanceranks",
+         "Admin: re-evaluate every member's balance rank — use right after first setting up ranks.",
+         "/refreshbalanceranks  or  !refreshbalanceranks"),
     ]),
     "mega": ("🎟", "Mega", [
         ("buytickets",
