@@ -1551,8 +1551,7 @@ async def listbalanceranks(interaction: discord.Interaction):
  
  
 @bot.tree.command(name="refreshbalanceranks",
-                  description="Re-evaluate balance ranks for every member with a balance "
-                               "(use right after setting up ranks for the first time)")
+                  description="Re-evaluate balance ranks for every member with a balance ")
 @command_enabled()
 async def refreshbalanceranks(interaction: discord.Interaction):
     if not await is_allowed_to_giveaway(interaction):
